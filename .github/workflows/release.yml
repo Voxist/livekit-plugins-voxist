@@ -1,0 +1,44 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
+            CHANGES=$(git log --pretty=format:"- %s" $PREV_TAG..${{ github.ref_name }} --no-merges)
+          else
+            echo "First release, showing all commits"
+            CHANGES=$(git log --pretty=format:"- %s" --no-merges)
+          fi
+
+          # Write to file to handle multiline
+          echo "$CHANGES" > /tmp/changes.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: /tmp/changes.txt
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

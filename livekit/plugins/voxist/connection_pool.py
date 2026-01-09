@@ -130,7 +130,7 @@ class ConnectionPool:
         self._reconnect_times: list[float] = []  # Timestamps of recent reconnects
         self._max_reconnects_per_minute = 30  # Global rate limit
 
-        logger.info(
+        logger.debug(
             f"ConnectionPool created: pool_size={pool_size}, "
             f"base_url={base_url}"
         )
@@ -155,7 +155,7 @@ class ConnectionPool:
             logger.debug("Pool already initialized")
             return
 
-        logger.info(f"Initializing connection pool with {self.pool_size} connections")
+        logger.debug(f"Initializing connection pool with {self.pool_size} connections")
 
         # Create shared aiohttp session
         self._session = aiohttp.ClientSession()
@@ -202,7 +202,7 @@ class ConnectionPool:
                 f"Completed: {len(done)}/{self.pool_size}"
             )
 
-        logger.info(
+        logger.debug(
             f"Connection pool initialized: {successful}/{self.pool_size} successful"
         )
 
@@ -318,7 +318,7 @@ class ConnectionPool:
                     self._ws_token_url = token_url
                     self._token_expires_at = current_time + 3600  # 1 hour
 
-                logger.info("WebSocket token obtained successfully")
+                logger.debug("WebSocket token obtained successfully")
 
                 # Add language and sample_rate params (SEC-002: use sanitized params)
                 if "?" in token_url:
@@ -378,7 +378,7 @@ class ConnectionPool:
             conn.last_heartbeat = time.time()
             conn.retry_count = 0
 
-            logger.info(f"Connection {conn.id} established successfully")
+            logger.debug(f"Connection {conn.id} established successfully")
             return True
 
         except asyncio.TimeoutError:
@@ -503,7 +503,7 @@ class ConnectionPool:
                 # This prevents multiple callers from spawning duplicate reconnection tasks
                 if conn_to_reconnect.state in (ConnectionState.FAILED, ConnectionState.CLOSED):
                     conn_to_reconnect.state = ConnectionState.RECONNECTING
-                    logger.info(f"Triggering reconnection for connection {conn_to_reconnect.id}")
+                    logger.debug(f"Triggering reconnection for connection {conn_to_reconnect.id}")
                     asyncio.create_task(self._reconnect(conn_to_reconnect, state_already_set=True))
 
                 # Don't wait for reconnection, fail fast
@@ -648,7 +648,7 @@ class ConnectionPool:
             jitter = random.uniform(0, 0.1 * backoff)  # 0-10% jitter
             total_wait = backoff + jitter
 
-            logger.info(
+            logger.debug(
                 f"Reconnecting connection {conn.id} in {total_wait:.1f}s "
                 f"(attempt {conn.retry_count}/{self.max_reconnect_attempts})"
             )
@@ -667,7 +667,7 @@ class ConnectionPool:
                 success = await self._connect(conn, self.language, self.sample_rate)
 
                 if success:
-                    logger.info(f"Connection {conn.id} reconnected successfully")
+                    logger.debug(f"Connection {conn.id} reconnected successfully")
                     conn.retry_count = 0  # Reset on success
                 else:
                     # Retry again if not at max attempts
@@ -700,7 +700,7 @@ class ConnectionPool:
         - Detect stale connections (no heartbeat in 90s)
         - Trigger reconnection for failed connections
         """
-        logger.info("Heartbeat monitoring started")
+        logger.debug("Heartbeat monitoring started")
 
         while not self._closing:
             try:
@@ -737,14 +737,14 @@ class ConnectionPool:
                     logger.debug(f"Pool health: {self._get_pool_status()}")
 
             except asyncio.CancelledError:
-                logger.info("Heartbeat monitoring cancelled")
+                logger.debug("Heartbeat monitoring cancelled")
                 break
 
             except Exception as e:
                 logger.error(f"Heartbeat loop error: {e}")
                 # Continue running despite errors
 
-        logger.info("Heartbeat monitoring stopped")
+        logger.debug("Heartbeat monitoring stopped")
 
     def _get_pool_status(self) -> str:
         """
@@ -773,7 +773,7 @@ class ConnectionPool:
             return
 
         self._closing = True
-        logger.info("Closing connection pool")
+        logger.debug("Closing connection pool")
 
         # Stop heartbeat monitoring
         if self._heartbeat_task and not self._heartbeat_task.done():
@@ -799,7 +799,7 @@ class ConnectionPool:
         if self._session and not self._session.closed:
             await self._session.close()
 
-        logger.info(f"Connection pool closed: {len(self.connections)} connections")
+        logger.debug(f"Connection pool closed: {len(self.connections)} connections")
 
     def get_pool_health(self) -> dict[str, int | float]:
         """

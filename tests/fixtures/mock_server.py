@@ -3,6 +3,7 @@
 import asyncio
 import json
 from collections.abc import Callable
+from typing import Optional
 
 import aiohttp
 from aiohttp import web
@@ -40,8 +41,8 @@ class MockVoxistServer:
         transcription_confidence: float = 0.95,
         send_interim: bool = True,
         interim_delay_ms: int = 25,
-        error_mode: str | None = None,
-        on_audio_received: Callable | None = None,
+        error_mode: Optional[str] = None,
+        on_audio_received: Optional[Callable] = None,
     ):
         """
         Initialize mock Voxist server.
@@ -71,8 +72,8 @@ class MockVoxistServer:
 
         self.app = web.Application()
         self.app.router.add_get("/ws", self.websocket_handler)
-        self.runner: web.AppRunner | None = None
-        self.site: web.TCPSite | None = None
+        self.runner: Optional[web.AppRunner] = None
+        self.site: Optional[web.TCPSite] = None
 
         self.connections_count = 0
         self.audio_frames_received = 0
@@ -253,8 +254,8 @@ class ConfigurableMockServer(MockVoxistServer):
         self,
         port: int = 8765,
         *,
-        responses: list[dict] | None = None,
-        disconnect_after: int | None = None,
+        responses: Optional[list[dict]] = None,
+        disconnect_after: Optional[int] = None,
         variable_latency: bool = False,
         **kwargs
     ):

@@ -1,17 +1,18 @@
 """Unit tests for ConnectionPool."""
 
-import pytest
 import asyncio
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
 import aiohttp
+import pytest
 
 from livekit.plugins.voxist.connection_pool import ConnectionPool
-from livekit.plugins.voxist.models import Connection, ConnectionState
 from livekit.plugins.voxist.exceptions import (
+    AuthenticationError,
     ConnectionError,
     ConnectionPoolExhaustedError,
-    AuthenticationError,
 )
+from livekit.plugins.voxist.models import Connection, ConnectionState
 
 
 @pytest.fixture
@@ -591,7 +592,6 @@ class TestRaceConditions:
             pool_basic.connections[1].buffered_amount = 0
 
             # Simulate state change during wait - connection fails after wait starts
-            original_wait_for_ready = pool_basic._wait_for_ready
 
             async def simulated_wait(conn):
                 # Simulate the connection failing during the wait
@@ -690,7 +690,6 @@ class TestRaceConditions:
 
             # Track reconnection task spawns
             reconnect_calls = []
-            original_reconnect = pool_basic._reconnect
 
             async def tracked_reconnect(conn, state_already_set=False):
                 reconnect_calls.append(conn.id)

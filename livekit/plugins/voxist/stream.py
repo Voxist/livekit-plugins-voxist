@@ -1,5 +1,3 @@
-"""VoxistSTTStream - Streaming recognition interface."""
-
 from __future__ import annotations
 
 import asyncio
@@ -26,6 +24,8 @@ from .models import Connection
 if TYPE_CHECKING:
     from .connection_pool import ConnectionPool
     from .stt import VoxistSTT
+
+"""VoxistSTTStream - Streaming recognition interface."""
 
 
 class VoxistSTTStream(RecognizeStream):

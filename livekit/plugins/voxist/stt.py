@@ -1,5 +1,3 @@
-"""Main VoxistSTT plugin class."""
-
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +19,8 @@ from .exceptions import (
 from .log import logger
 from .models import SUPPORTED_LANGUAGES, validate_language_format
 from .stream import VoxistSTTStream
+
+"""Main VoxistSTT plugin class."""
 
 
 class InitializationState(Enum):

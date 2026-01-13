@@ -1,9 +1,10 @@
 """Tests for MockVoxistServer."""
 
-import pytest
-import aiohttp
 import asyncio
+
+import aiohttp
 import numpy as np
+import pytest
 
 from .fixtures.mock_server import MockVoxistServer
 
@@ -131,7 +132,7 @@ class TestMockServerBasics:
         await server.start()
 
         async with aiohttp.ClientSession() as session:
-            url = f"ws://localhost:8767/ws?api_key=test"
+            url = "ws://localhost:8767/ws?api_key=test"
 
             async with session.ws_connect(url) as ws:
                 await ws.receive()  # Connection confirmation
@@ -160,7 +161,7 @@ class TestMockServerBasics:
 
         async def connect_and_send():
             async with aiohttp.ClientSession() as session:
-                url = f"ws://localhost:8768/ws?api_key=test"
+                url = "ws://localhost:8768/ws?api_key=test"
                 async with session.ws_connect(url) as ws:
                     await ws.receive()  # Confirmation
                     audio = np.random.rand(1600).astype(np.float32)
@@ -194,7 +195,7 @@ class TestMockServerErrorSimulation:
         await server.start()
 
         async with aiohttp.ClientSession() as session:
-            url = f"ws://localhost:8769/ws?api_key=any_key"
+            url = "ws://localhost:8769/ws?api_key=any_key"
 
             async with session.ws_connect(url) as ws:
                 # Should close with auth error
@@ -225,7 +226,7 @@ class TestMockServerProtocolCompliance:
                 await ws.send_json({"config": {"lang": "fr", "sample_rate": 16000}})
 
                 # Step 3: Send binary audio (Float32)
-                for i in range(5):
+                for _i in range(5):
                     audio = np.random.rand(1600).astype(np.float32)
                     await ws.send_bytes(audio.tobytes())
                     await asyncio.sleep(0.02)
@@ -265,7 +266,7 @@ class TestMockServerProtocolCompliance:
         await server.start()
 
         async with aiohttp.ClientSession() as session:
-            url = f"ws://localhost:8770/ws?api_key=test"
+            url = "ws://localhost:8770/ws?api_key=test"
 
             async with session.ws_connect(url) as ws:
                 await ws.receive()  # Confirmation

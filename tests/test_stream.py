@@ -1,15 +1,15 @@
 """Unit tests for VoxistSTTStream class with focus on VUL-003 ownership validation."""
 
-import pytest
 import asyncio
-import numpy as np
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, Mock
 
-from livekit.plugins.voxist.stream import VoxistSTTStream
+import numpy as np
+import pytest
+
 from livekit.plugins.voxist.connection_pool import ConnectionPool
-from livekit.plugins.voxist.models import Connection, ConnectionState
-from livekit.plugins.voxist.audio_processor import AudioProcessor
 from livekit.plugins.voxist.exceptions import OwnershipViolationError
+from livekit.plugins.voxist.models import Connection, ConnectionState
+from livekit.plugins.voxist.stream import VoxistSTTStream
 
 
 class TestStreamOwnership:
@@ -535,7 +535,6 @@ class TestBackpressureWithOwnership:
             return val
 
         # Override _get_write_buffer_size to use our mock values
-        original_method = stream._get_write_buffer_size
         stream._get_write_buffer_size = Mock(side_effect=get_buffer)
 
         audio_int16 = np.zeros(160, dtype=np.int16)
@@ -557,7 +556,6 @@ class TestBackpressureWithOwnership:
         # No transport available (triggers fallback)
         connection.ws.get_transport = Mock(return_value=None)
 
-        initial_buffered = connection.buffered_amount
 
         # Create test audio
         audio_int16 = np.zeros(160, dtype=np.int16)
@@ -568,7 +566,7 @@ class TestBackpressureWithOwnership:
 
         # Verify buffered_amount was updated (with decay)
         # Formula: buffered_amount += len - len//2 = len//2
-        expected_change = audio_bytes_len // 2
+        audio_bytes_len // 2
         assert connection.buffered_amount >= 0
 
     @pytest.mark.asyncio

@@ -1,9 +1,11 @@
 """Pytest configuration and shared fixtures."""
 
-import pytest
 import asyncio
-import numpy as np
 from unittest.mock import patch
+
+import numpy as np
+import pytest
+
 from .fixtures.mock_server import MockVoxistServer
 
 

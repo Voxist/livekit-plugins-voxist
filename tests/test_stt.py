@@ -1,11 +1,13 @@
 """Unit tests for VoxistSTT main plugin class."""
 
-import pytest
-import os
 import asyncio
-from unittest.mock import Mock, AsyncMock, patch, MagicMock
-import logging
+import os
+from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
+from livekit.agents.stt import STTCapabilities
+from livekit.agents.types import NOT_GIVEN, APIConnectOptions
 from livekit.plugins.voxist import VoxistSTT
 from livekit.plugins.voxist.exceptions import (
     ConfigurationError,
@@ -13,11 +15,9 @@ from livekit.plugins.voxist.exceptions import (
 )
 from livekit.plugins.voxist.models import (
     SUPPORTED_LANGUAGES,
-    validate_language_format,
     sanitize_url_param,
+    validate_language_format,
 )
-from livekit.agents.stt import STTCapabilities
-from livekit.agents.types import NOT_GIVEN, APIConnectOptions
 
 
 class TestVoxistSTTInitialization:
@@ -309,7 +309,7 @@ class TestVoxistSTTIntegration:
         loop = asyncio.get_running_loop()
 
         with patch.object(loop, 'create_task') as mock_create_task:
-            stt = VoxistSTT(api_key="test")
+            VoxistSTT(api_key="test")
 
             # Should have created task for pool initialization
             mock_create_task.assert_called_once()
@@ -641,7 +641,7 @@ class TestQUAL002InitializationState:
     @pytest.mark.asyncio
     async def test_check_initialization_raises_on_failure(self):
         """Test check_initialization raises InitializationError if failed."""
-        from livekit.plugins.voxist import InitializationState, InitializationError
+        from livekit.plugins.voxist import InitializationError, InitializationState
 
         stt = VoxistSTT(api_key="test")
         stt._init_state = InitializationState.FAILED
@@ -715,7 +715,7 @@ class TestQUAL002InitializationState:
     @pytest.mark.asyncio
     async def test_aenter_raises_on_init_failure(self):
         """Test __aenter__ raises InitializationError if init fails."""
-        from livekit.plugins.voxist import InitializationState, InitializationError
+        from livekit.plugins.voxist import InitializationError, InitializationState
 
         stt = VoxistSTT(api_key="test")
         stt._init_state = InitializationState.NOT_STARTED

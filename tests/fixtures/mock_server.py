@@ -2,10 +2,10 @@
 
 import asyncio
 import json
-import struct
-from typing import Optional, Callable
-from aiohttp import web
+from collections.abc import Callable
+
 import aiohttp
+from aiohttp import web
 
 
 class MockVoxistServer:
@@ -40,8 +40,8 @@ class MockVoxistServer:
         transcription_confidence: float = 0.95,
         send_interim: bool = True,
         interim_delay_ms: int = 25,
-        error_mode: Optional[str] = None,
-        on_audio_received: Optional[Callable] = None,
+        error_mode: str | None = None,
+        on_audio_received: Callable | None = None,
     ):
         """
         Initialize mock Voxist server.
@@ -71,8 +71,8 @@ class MockVoxistServer:
 
         self.app = web.Application()
         self.app.router.add_get("/ws", self.websocket_handler)
-        self.runner: Optional[web.AppRunner] = None
-        self.site: Optional[web.TCPSite] = None
+        self.runner: web.AppRunner | None = None
+        self.site: web.TCPSite | None = None
 
         self.connections_count = 0
         self.audio_frames_received = 0
@@ -125,8 +125,8 @@ class MockVoxistServer:
                         # Config message
                         if "config" in data:
                             config_received = True
-                            lang = data["config"].get("lang", "fr")
-                            sample_rate = data["config"].get("sample_rate", 16000)
+                            data["config"].get("lang", "fr")
+                            data["config"].get("sample_rate", 16000)
 
                             # Log config (useful for debugging tests)
                             # Could send acknowledgment if needed
@@ -216,7 +216,7 @@ class MockVoxistServer:
         if self.runner:
             await self.runner.cleanup()
 
-        print(f"Mock Voxist server stopped")
+        print("Mock Voxist server stopped")
 
     def get_stats(self) -> dict:
         """
@@ -253,8 +253,8 @@ class ConfigurableMockServer(MockVoxistServer):
         self,
         port: int = 8765,
         *,
-        responses: Optional[list[dict]] = None,
-        disconnect_after: Optional[int] = None,
+        responses: list[dict] | None = None,
+        disconnect_after: int | None = None,
         variable_latency: bool = False,
         **kwargs
     ):
@@ -299,7 +299,7 @@ class ConfigurableMockServer(MockVoxistServer):
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     # Handle JSON or "Done"
                     try:
-                        data = json.loads(msg.data)
+                        json.loads(msg.data)
                         # Config received
                     except json.JSONDecodeError:
                         if "Done" in msg.data:

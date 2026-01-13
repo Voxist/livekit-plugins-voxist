@@ -1,3 +1,5 @@
+"""VoxistSTTStream - Streaming recognition interface."""
+
 from __future__ import annotations
 
 import asyncio
@@ -6,8 +8,6 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 import numpy as np
-
-from livekit import rtc  # type: ignore[attr-defined]
 from livekit.agents import utils
 from livekit.agents.stt import (
     RecognizeStream,
@@ -15,6 +15,8 @@ from livekit.agents.stt import (
     SpeechEvent,
     SpeechEventType,
 )
+
+from livekit import rtc  # type: ignore[attr-defined]
 
 from .audio_processor import AudioProcessor
 from .exceptions import OwnershipViolationError
@@ -24,8 +26,6 @@ from .models import Connection
 if TYPE_CHECKING:
     from .connection_pool import ConnectionPool
     from .stt import VoxistSTT
-
-"""VoxistSTTStream - Streaming recognition interface."""
 
 
 class VoxistSTTStream(RecognizeStream):

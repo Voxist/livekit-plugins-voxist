@@ -84,7 +84,7 @@ class AudioProcessor:
         self.needs_resampling = abs(self.resample_ratio - 1.0) > 0.01
 
         if self.needs_resampling:
-            logger.info(
+            logger.debug(
                 f"Resampling enabled: {sample_rate}Hz -> {target_sample_rate}Hz "
                 f"(ratio={self.resample_ratio:.2f})"
             )
@@ -325,7 +325,7 @@ class AudioProcessor:
 
             # Log audio levels for debugging
             if len(chunk) > 0:
-                logger.info(
+                logger.debug(
                     f"Audio chunk stats: min={chunk.min()}, max={chunk.max()}, "
                     f"rms={np.sqrt(np.mean(chunk.astype(np.float32)**2)):.1f}"
                 )

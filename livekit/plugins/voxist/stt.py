@@ -7,6 +7,7 @@ import os
 from enum import Enum
 
 import aiohttp
+
 from livekit.agents.stt import STT, STTCapabilities
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions, NotGivenOr
 
@@ -241,7 +242,7 @@ class VoxistSTT(STT):
         try:
             await self._pool.initialize()
             self._init_state = InitializationState.COMPLETED
-            logger.info("Connection pool pre-warming complete (state: COMPLETED)")
+            logger.debug("Connection pool pre-warming complete (state: COMPLETED)")
         except AuthenticationError as e:
             # Store and re-raise critical errors - never swallow auth failures
             self._init_error = e

@@ -1,8 +1,10 @@
 """Unit tests for AudioProcessor."""
 
-import pytest
-import numpy as np
 import time
+
+import numpy as np
+import pytest
+
 from livekit.plugins.voxist.audio_processor import AudioProcessor
 
 
@@ -151,7 +153,7 @@ class TestAudioProcessor:
         # Total: 2400 samples → should produce 1 chunk (1600 samples)
         # with remaining buffer (2400 - 1280 advance = 1120 samples)
         all_chunks = []
-        for i in range(3):
+        for _i in range(3):
             int16_audio = np.random.randint(-32768, 32767, size=800, dtype=np.int16)
             frame_data = int16_audio.tobytes()
             chunks = processor.process_audio_frame(frame_data)
@@ -682,7 +684,7 @@ class TestRingBufferOptimization:
         # Get bytecode of process_audio_frame
         bytecode_output = io.StringIO()
         dis.dis(processor.process_audio_frame, file=bytecode_output)
-        bytecode = bytecode_output.getvalue()
+        bytecode_output.getvalue()
 
         # The hot path should not contain concatenate calls
         # (Note: This is a simple check - concatenate may still be used in

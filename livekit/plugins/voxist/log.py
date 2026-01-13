@@ -4,9 +4,9 @@ import logging
 import re
 
 
-class SanitizingFormatter(logging.Formatter):
+class SanitizingFilter(logging.Filter):
     """
-    Log formatter that sanitizes sensitive information from log messages.
+    Log filter that sanitizes sensitive information from log messages.
 
     SEC-007 FIX: Prevents credential leakage in log output by redacting:
     - API keys (api_key=..., voxist_... patterns)
@@ -16,48 +16,45 @@ class SanitizingFormatter(logging.Formatter):
     CWE-532: Insertion of Sensitive Information into Log File
 
     Example:
-        >>> formatter = SanitizingFormatter(fmt="%(message)s")
+        >>> logger = logging.getLogger("test")
+        >>> logger.addFilter(SanitizingFilter())
         >>> # "api_key=secret123" becomes "api_key=***REDACTED***"
         >>> # "voxist_abc123xyz" becomes "voxist_***"
         >>> # "token=eyJhbG..." becomes "token=***"
     """
 
     # Patterns to sanitize: (regex_pattern, replacement)
-    # Order matters - more specific patterns first
+    # Order matters: more specific patterns before generic ones
     SANITIZE_PATTERNS: list[tuple[str, str]] = [
         # API key in URL parameter
-        (r'api_key=([^&\s"\']+)', r'api_key=***REDACTED***'),
+        (r"api_key=([^&\s'\"]+)", r"api_key=***REDACTED***"),
         # Voxist API key format (voxist_xxx or VOXIST_xxx)
-        (r'[Vv]oxist_[a-zA-Z0-9_-]+', 'voxist_***'),
-        # Bearer tokens
-        (r'Bearer\s+[a-zA-Z0-9_\-\.]+', 'Bearer ***'),
-        # JWT tokens in URL (token=eyJ...)
-        (r'token=eyJ[a-zA-Z0-9_\-\.]+', 'token=***'),
+        (r"[Vv]oxist_[a-zA-Z0-9_-]+", "voxist_***"),
+        # JWT tokens in URL (token=eyJ...) - must precede generic token pattern
+        (r"token=eyJ[a-zA-Z0-9_.-]+", "token=***"),
         # Generic token parameter
-        (r'token=([^&\s"\']+)', r'token=***'),
+        (r"token=([^&\s'\"]+)", r"token=***"),
+        # Bearer tokens
+        (r"Bearer\s+[a-zA-Z0-9_.-]+", "Bearer ***"),
         # X-API-Key header value (may appear in debug logs)
-        (r'X-API-Key["\']?\s*:\s*["\']?([^"\'}\s,]+)', 'X-API-Key: ***'),
+        (r'X-API-Key["\']?\s*:\s*["\']?[^"\'}\s,]+', "X-API-Key: ***"),
     ]
 
-    def format(self, record: logging.LogRecord) -> str:
+    def filter(self, record: logging.LogRecord) -> bool:
         """
-        Format log record with sensitive data sanitization.
+        Sanitize log message by removing sensitive information.
 
         Args:
-            record: The log record to format
+            record: The log record to sanitize
 
         Returns:
-            Formatted and sanitized log message
+            True (always allows the log record after sanitization)
         """
-        # Format the message first using parent
-        original = super().format(record)
-
-        # Apply sanitization patterns
-        sanitized = original
+        msg = str(record.msg)
         for pattern, replacement in self.SANITIZE_PATTERNS:
-            sanitized = re.sub(pattern, replacement, sanitized)
-
-        return sanitized
+            msg = re.sub(pattern, replacement, msg)
+        record.msg = msg
+        return True
 
 
 # Create logger for Voxist plugin
@@ -66,24 +63,11 @@ logger = logging.getLogger("livekit.plugins.voxist")
 # Default to INFO level, can be overridden by application
 logger.setLevel(logging.INFO)
 
-# Create console handler with formatting
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
+# Enable propagation to root logger for monitoring integrations
+logger.propagate = True
 
-# Format: timestamp - name - level - message
-# SEC-007 FIX: Use SanitizingFormatter to prevent credential leakage
-formatter = SanitizingFormatter(
-    fmt="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-console_handler.setFormatter(formatter)
-
-# Add handler if not already added
-if not logger.handlers:
-    logger.addHandler(console_handler)
-
-# Prevent propagation to root logger
-logger.propagate = False
+# Add sanitizing filter to prevent credential leakage in logs
+logger.addFilter(SanitizingFilter())
 
 
 def set_log_level(level: str) -> None:

@@ -115,7 +115,7 @@ class VoxistSTTStream(RecognizeStream):
             target_sample_rate=16000,  # Voxist expects 16kHz audio
         )
 
-        logger.info(
+        logger.debug(
             f"Stream {self._session_id} created: "
             f"language={language}, sample_rate={config['sample_rate']}, "
             f"chunk_duration_ms={config['chunk_duration_ms']}"
@@ -136,7 +136,7 @@ class VoxistSTTStream(RecognizeStream):
         # Connection is IN_USE state - only this stream should access buffered_amount
         self._owns_connection = True
 
-        logger.info(
+        logger.debug(
             f"Stream {self._session_id} acquired connection {self._conn.id}"
         )
 
@@ -227,7 +227,7 @@ class VoxistSTTStream(RecognizeStream):
         reconnect_attempts = 0
         max_attempts = self._conn_options.max_retry
 
-        logger.info(f"Stream {self._session_id} starting")
+        logger.debug(f"Stream {self._session_id} starting")
 
         while reconnect_attempts <= max_attempts:
             try:
@@ -307,13 +307,13 @@ class VoxistSTTStream(RecognizeStream):
         Processes frames through AudioProcessor and sends as binary Float32 data.
         """
         try:
-            logger.info(f"Stream {self._session_id} send task started, waiting for frames...")
+            logger.debug(f"Stream {self._session_id} send task started, waiting for frames...")
             frame_count = 0
 
             async for data in self._input_ch:
                 frame_count += 1
                 if frame_count % 100 == 0:
-                    logger.info(f"Stream {self._session_id} processing frame {frame_count}")
+                    logger.debug(f"Stream {self._session_id} processing frame {frame_count}")
                 # Check for flush sentinel
                 if isinstance(data, self._FlushSentinel):
                     logger.debug(f"Stream {self._session_id} flushing audio")
@@ -477,7 +477,9 @@ class VoxistSTTStream(RecognizeStream):
 
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     # Parse JSON message
-                    logger.info(f"Stream {self._session_id} received from Voxist: {msg.data[:200]}")
+                    logger.debug(
+                        f"Stream {self._session_id} received from Voxist: {msg.data[:200]}"
+                    )
                     try:
                         data = json.loads(msg.data)
                         await self._process_result(data)
@@ -499,7 +501,7 @@ class VoxistSTTStream(RecognizeStream):
                     raise ConnectionError("WebSocket connection error occurred")
 
                 elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    logger.info(f"Stream {self._session_id} WebSocket closed by server")
+                    logger.debug(f"Stream {self._session_id} WebSocket closed by server")
                     break
 
                 elif msg.type == aiohttp.WSMsgType.CLOSING:

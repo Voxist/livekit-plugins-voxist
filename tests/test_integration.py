@@ -1,13 +1,15 @@
 """Integration tests for complete LiveKit plugin pipeline."""
 
-import pytest
 import asyncio
-import numpy as np
 import time
 
+import numpy as np
+import pytest
+
 from livekit import rtc
-from livekit.plugins.voxist import VoxistSTT
 from livekit.agents.stt import SpeechEventType
+from livekit.plugins.voxist import VoxistSTT
+
 from .fixtures.mock_server import MockVoxistServer
 
 
@@ -186,7 +188,7 @@ class TestMultiLanguage:
 
         stt = VoxistSTT(
             api_key="test",
-            base_url=f"ws://localhost:8771/ws",
+            base_url="ws://localhost:8771/ws",
             language="fr",
         )
 
@@ -229,7 +231,7 @@ class TestMultiLanguage:
 
         stt = VoxistSTT(
             api_key="test",
-            base_url=f"ws://localhost:8772/ws",
+            base_url="ws://localhost:8772/ws",
             language="fr-medical",
         )
 
@@ -273,7 +275,7 @@ class TestConnectionPool:
 
         stt = VoxistSTT(
             api_key="test",
-            base_url=f"ws://localhost:8773/ws",
+            base_url="ws://localhost:8773/ws",
             connection_pool_size=2,
         )
 
@@ -323,7 +325,7 @@ class TestConnectionPool:
 
         stt = VoxistSTT(
             api_key="test",
-            base_url=f"ws://localhost:8774/ws",
+            base_url="ws://localhost:8774/ws",
             connection_pool_size=2,
         )
 
@@ -504,7 +506,7 @@ class TestErrorHandling:
             stream.push_frame(frame)
             stream.end_input()
 
-            async for event in stream:
+            async for _event in stream:
                 pass
 
         await stt.aclose()

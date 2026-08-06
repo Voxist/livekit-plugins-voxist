@@ -254,7 +254,10 @@ class TestMultiLanguage:
         async for event in stream:
             if event.type == SpeechEventType.FINAL_TRANSCRIPT:
                 final_text = event.alternatives[0].text
-                assert event.alternatives[0].language == "fr-medical"
+                # livekit normalizes the code to BCP-47 on SpeechData, which
+                # uppercases the subtag: "fr-medical" is emitted "fr-MEDICAL".
+                # Compare case-insensitively - the exact casing is livekit's.
+                assert event.alternatives[0].language.lower() == "fr-medical"
                 break
 
         await stt.aclose()

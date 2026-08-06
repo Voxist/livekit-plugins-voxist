@@ -106,6 +106,14 @@ check_untyped_defs = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
+# numpy's bundled stubs use `type X = ...` statements, which mypy only parses
+# under python_version >= 3.12. Skip following them rather than raise the
+# python_version above the package's actual 3.10 floor.
+module = "numpy.*"
+follow_imports = "skip"
+follow_imports_for_stubs = true
+
+[[tool.mypy.overrides]]
 module = "livekit.*"
 ignore_missing_imports = true
 

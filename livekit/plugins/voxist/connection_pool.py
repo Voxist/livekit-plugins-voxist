@@ -292,7 +292,10 @@ class ConnectionPool:
                 http_url,
                 headers=headers,
                 params=params,
-                ssl=self._ssl_context,
+                # True means "use aiohttp's default verification". Passing None
+                # is not part of the documented ssl type; it happens to behave
+                # like True today, but relying on that is fragile.
+                ssl=self._ssl_context if self._ssl_context is not None else True,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 401 or resp.status == 403:

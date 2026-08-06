@@ -968,3 +968,84 @@ class TestTransportAccessorAgainstRealAiohttp:
                     assert 0 <= conn.buffered_amount < VoxistSTTStream.HIGH_WATER_MARK
         finally:
             await runner.cleanup()
+
+
+class TestLanguageCodeHandling:
+    """
+    The code sent to Voxist stays raw; the code emitted to livekit is normalized.
+
+    livekit's SpeechData declares `language: LanguageCode` and coerces a plain
+    str in __post_init__. LanguageCode normalizes to BCP-47, which uppercases
+    the subtag - so "fr-medical" is emitted as "fr-MEDICAL". Voxist routes
+    engines on the exact code, so the value used for the connection must not be
+    normalized. These tests pin both halves of that split.
+    """
+
+    async def _stream(self, language):
+        from livekit.agents.types import APIConnectOptions
+
+        stt = Mock()
+        stt._config = {
+            "sample_rate": 16000,
+            "chunk_duration_ms": 100,
+            "stride_overlap_ms": 20,
+            "interim_results": True,
+        }
+        stt._api_key = "k"
+        stream = VoxistSTTStream(
+            stt=stt,
+            pool=AsyncMock(spec=ConnectionPool),
+            config=stt._config,
+            language=language,
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
+        )
+        stream._task.cancel()
+        try:
+            await stream._task
+        except asyncio.CancelledError:
+            pass
+        return stream
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("language", ["fr", "fr-medical", "fr-FR", "en-US", "nl"])
+    async def test_raw_language_preserved_for_voxist(self, language):
+        """_language must stay byte-identical - it is sent to the backend."""
+        stream = await self._stream(language)
+        assert stream._language == language
+
+    @pytest.mark.asyncio
+    async def test_medical_language_normalized_for_emitted_events(self):
+        """Document the normalization applied to the emitted language code."""
+        stream = await self._stream("fr-medical")
+
+        # Normalized form differs only in case
+        assert str(stream._speech_language) == "fr-MEDICAL"
+        assert str(stream._speech_language).lower() == "fr-medical"
+        # ...while the code sent to Voxist is untouched
+        assert stream._language == "fr-medical"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("language", ["fr", "fr-FR", "en-US", "nl", "sv"])
+    async def test_plain_language_codes_round_trip(self, language):
+        """Ordinary codes are unchanged by normalization."""
+        stream = await self._stream(language)
+        assert str(stream._speech_language) == language
+
+    @pytest.mark.asyncio
+    async def test_emitted_event_carries_normalized_language(self):
+        """An end-to-end check that _process_result emits the normalized code."""
+        stream = await self._stream("fr-medical")
+
+        # Collect emitted events directly: the real channel is closed once the
+        # stream task is cancelled, which would mask what _process_result sends.
+        stream._event_ch = Mock()
+
+        await stream._process_result({"type": "final", "text": "bonjour"})
+
+        languages = [
+            call.args[0].alternatives[0].language
+            for call in stream._event_ch.send_nowait.call_args_list
+            if call.args and call.args[0].alternatives
+        ]
+        assert languages, "no transcription event emitted"
+        assert all(str(lang).lower() == "fr-medical" for lang in languages)

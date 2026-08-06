@@ -84,7 +84,12 @@ class Connection:
         buffered_amount: Estimated buffered bytes (for backpressure)
     """
     id: int
-    ws: aiohttp.ClientWebSocketResponse | None = None
+    # Parameterized explicitly: aiohttp >= 3.14 makes ClientWebSocketResponse
+    # generic over the autoping flag, and a bare reference resolves to the
+    # narrower ClientWebSocketResponse[Literal[True]], which ws_connect() does
+    # not return. Safe on older aiohttp too - `from __future__ import
+    # annotations` keeps this a string at runtime.
+    ws: aiohttp.ClientWebSocketResponse[bool] | None = None
     state: ConnectionState = ConnectionState.CLOSED
     retry_count: int = 0
     last_heartbeat: float = 0.0

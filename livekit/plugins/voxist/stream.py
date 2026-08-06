@@ -16,6 +16,11 @@ from livekit.agents.stt import (
     SpeechEventType,
 )
 
+try:  # livekit-agents >= 1.x
+    from livekit.agents import LanguageCode
+except ImportError:  # pragma: no cover - older livekit-agents has no such type
+    LanguageCode = str  # type: ignore[assignment, misc]
+
 from livekit import rtc  # type: ignore[attr-defined]
 
 from .audio_processor import AudioProcessor
@@ -100,6 +105,13 @@ class VoxistSTTStream(RecognizeStream):
         self._pool = pool
         self._config = config
         self._language = language
+        # Language reported on emitted SpeechData. livekit normalizes this to
+        # BCP-47, which uppercases the subtag: "fr-medical" is emitted as
+        # "fr-MEDICAL". Normalizing once here makes that visible instead of
+        # leaving it an implicit side effect inside SpeechData.__post_init__.
+        # self._language stays raw - it is what Voxist receives, and the
+        # backend routes engines on the exact code.
+        self._speech_language = LanguageCode(language)
         self._enable_metrics = enable_metrics
 
         self._session_id = utils.shortuuid()
@@ -628,7 +640,7 @@ class VoxistSTTStream(RecognizeStream):
                     request_id=self._session_id,
                     alternatives=[
                         SpeechData(
-                            language=self._language,
+                            language=self._speech_language,
                             text=text,
                             confidence=data.get("confidence", 1.0),
                         )
@@ -646,7 +658,7 @@ class VoxistSTTStream(RecognizeStream):
                     request_id=self._session_id,
                     alternatives=[
                         SpeechData(
-                            language=self._language,
+                            language=self._speech_language,
                             text=text,
                             confidence=data.get("confidence", 1.0),
                         )

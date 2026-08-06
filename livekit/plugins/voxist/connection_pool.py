@@ -6,6 +6,7 @@ import asyncio
 import random
 import ssl
 import time
+from typing import cast
 
 import aiohttp
 
@@ -139,6 +140,47 @@ class ConnectionPool:
     def is_initialized(self) -> bool:
         """Check if the connection pool has been initialized."""
         return self._initialized
+
+    def _select_round_robin(self, ready_conns: list[Connection]) -> Connection:
+        """
+        Pick the next ready connection, rotating across the pool.
+
+        Selection used to be min(buffered_amount), which only rotated because
+        that field accumulated every byte ever sent - it ranked connections by
+        lifetime usage, not current load. Now that buffered_amount is a
+        post-send measurement (~0 on every healthy connection, and 0 whenever
+        the transport cannot be measured), min() would tie on every call and
+        always return connections[0], so `current_index` - present but never
+        read - does the rotation explicitly.
+
+        Caller must hold self._lock.
+
+        Args:
+            ready_conns: Non-empty list of READY connections
+
+        Returns:
+            The selected connection.
+        """
+        self.current_index = (self.current_index + 1) % len(ready_conns)
+        return ready_conns[self.current_index]
+
+    def _ssl_param(self) -> ssl.SSLContext | bool:
+        """
+        SSL argument for aiohttp calls, shared by every request this pool makes.
+
+        Single source of truth on purpose: the token exchange and the WebSocket
+        connect previously computed this separately and disagreed, so one
+        verified certificates while the other silently skipped verification for
+        the same configuration.
+
+        `True` means aiohttp's default verification. It is the right fallback
+        even when no context was built (non-wss:// base_url), because
+        _get_ws_token() returns a server-supplied URL that may itself be
+        wss:// - and for a genuinely plaintext URL the argument is ignored.
+        """
+        if self._ssl_context is not None:
+            return self._ssl_context
+        return True
 
     async def initialize(self) -> None:
         """
@@ -292,10 +334,7 @@ class ConnectionPool:
                 http_url,
                 headers=headers,
                 params=params,
-                # True means "use aiohttp's default verification". Passing None
-                # is not part of the documented ssl type; it happens to behave
-                # like True today, but relying on that is fragile.
-                ssl=self._ssl_context if self._ssl_context is not None else True,
+                ssl=self._ssl_param(),
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status == 401 or resp.status == 403:
@@ -365,16 +404,27 @@ class ConnectionPool:
 
             # Connect with timeout and SSL context
             assert self._session is not None  # Initialized in initialize()
-            # ssl parameter: SSLContext for wss://, False for ws:// (None not allowed)
-            ssl_param = self._ssl_context if self._ssl_context is not None else False
-            conn.ws = await asyncio.wait_for(
-                self._session.ws_connect(
-                    ws_url,
-                    heartbeat=self.heartbeat_interval,
-                    autoping=True,  # Automatic ping/pong
-                    ssl=ssl_param,  # Explicit SSL/TLS validation
+            # Same SSL policy as every other call this pool makes. Never False:
+            # _get_ws_token() may hand back a wss:// URL even when base_url was
+            # not wss://, and disabling verification on it would expose the JWT
+            # and all audio to a man-in-the-middle.
+            ssl_param = self._ssl_param()
+            # cast: aiohttp >= 3.14 parameterizes ClientWebSocketResponse over
+            # its text-decoding flag, so ws_connect() returns [bool] while a
+            # bare annotation resolves to the narrower [Literal[True]]. Writing
+            # the parameter into Connection.ws instead would not type-check at
+            # all on aiohttp 3.10-3.13, which the dependency floor allows.
+            conn.ws = cast(
+                "aiohttp.ClientWebSocketResponse",
+                await asyncio.wait_for(
+                    self._session.ws_connect(
+                        ws_url,
+                        heartbeat=self.heartbeat_interval,
+                        autoping=True,  # Automatic ping/pong
+                        ssl=ssl_param,  # Explicit SSL/TLS validation
+                    ),
+                    timeout=self.connection_timeout
                 ),
-                timeout=self.connection_timeout
             )
 
             conn.state = ConnectionState.READY
@@ -441,8 +491,7 @@ class ConnectionPool:
             ]
 
             if ready_conns:
-                # Select connection with lowest buffered data (best for latency)
-                conn = min(ready_conns, key=lambda c: c.buffered_amount)
+                conn = self._select_round_robin(ready_conns)
                 conn.state = ConnectionState.IN_USE
                 logger.debug(
                     f"Acquired connection {conn.id} "
@@ -488,7 +537,7 @@ class ConnectionPool:
                             if c.state == ConnectionState.READY
                         ]
                         if ready_conns:
-                            conn = min(ready_conns, key=lambda c: c.buffered_amount)
+                            conn = self._select_round_robin(ready_conns)
                             conn.state = ConnectionState.IN_USE
                             logger.debug(f"Fallback to connection {conn.id}")
                             return conn
@@ -532,14 +581,37 @@ class ConnectionPool:
         Args:
             conn: Connection to release
         """
+        needs_reconnect = False
+
         async with self._lock:
             if conn.state == ConnectionState.IN_USE:
-                conn.state = ConnectionState.READY
-                # Clear the backpressure snapshot: it describes the departing
-                # stream's transport state, and a stale non-zero value would
-                # skew the least-loaded selection in get_connection().
+                # Diagnostic snapshot from the departing stream - it describes a
+                # transport that is no longer in use.
                 conn.buffered_amount = 0
-                logger.debug(f"Released connection {conn.id}")
+
+                if conn.ws is None or conn.ws.closed:
+                    # Never hand a dead socket back to the pool. A stream whose
+                    # connection died mid-session would otherwise return it to
+                    # READY, and the next stream would send every chunk into a
+                    # closed WebSocket and finish with zero transcripts, no
+                    # error, and no reconnect.
+                    conn.state = ConnectionState.CLOSED
+                    needs_reconnect = True
+                    logger.debug(
+                        f"Connection {conn.id} released with a closed WebSocket, "
+                        "scheduling reconnect instead of returning it to the pool"
+                    )
+                else:
+                    conn.state = ConnectionState.READY
+                    # An active stream is proof of life, but only the stream
+                    # refreshes last_heartbeat. Stamp it here too so a long call
+                    # cannot hand back a connection that the heartbeat loop then
+                    # judges stale and tears down.
+                    conn.last_heartbeat = time.time()
+                    logger.debug(f"Released connection {conn.id}")
+
+        if needs_reconnect:
+            asyncio.create_task(self._reconnect(conn))
 
     async def _wait_for_ready(self, conn: Connection) -> None:
         """
@@ -719,7 +791,11 @@ class ConnectionPool:
                 current_time = time.time()
 
                 for conn in self.connections:
-                    # Check for stale READY connections
+                    # Only READY connections are staleness-checked. An IN_USE
+                    # connection belongs to a live stream, which refreshes
+                    # last_heartbeat on every message received and has its own
+                    # RECEIVE_TIMEOUT_SECONDS watchdog; judging it stale here
+                    # would tear down a socket that is actively carrying audio.
                     if conn.state == ConnectionState.READY:
                         time_since_heartbeat = current_time - conn.last_heartbeat
 

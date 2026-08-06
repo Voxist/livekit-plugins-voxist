@@ -1,6 +1,7 @@
 """Unit tests for VoxistSTTStream class with focus on VUL-003 ownership validation."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, Mock
 
 import numpy as np
@@ -16,11 +17,12 @@ def install_fake_transport(connection, buffer_size):
     """
     Wire a fake transport into the real aiohttp attribute chain.
 
-    _get_write_buffer_size() reaches the transport via
-    ws._response.connection.transport, because aiohttp exposes no public
-    accessor. Tests must populate that same chain: mocking a ws.get_transport()
-    method instead would assert against an API aiohttp does not have, which is
-    precisely how the indefinite-backpressure bug shipped with a green suite.
+    _get_transport() prefers a public ws.get_transport() when the installed
+    aiohttp has one, and otherwise walks ws._response.connection.transport.
+    Current aiohttp has no public accessor, so tests populate that chain. They
+    must not invent a ws.get_transport() method on a mock and assert through it:
+    doing so tests an API aiohttp does not have, which is precisely how the
+    indefinite-backpressure bug shipped with a green suite.
 
     Args:
         connection: Connection whose ws should expose the transport
@@ -245,10 +247,10 @@ class TestStreamOwnership:
         stream._conn = mock_connection
         stream._owns_connection = True
 
-        # Mock get_transport() to return low buffer size
-        mock_transport = Mock()
-        mock_transport.get_write_buffer_size = Mock(return_value=0)
-        mock_connection.ws.get_transport = Mock(return_value=mock_transport)
+        # Buffer readings come from the real attribute chain, never from a
+        # ws.get_transport() method - the fixture deletes that attribute so no
+        # implementation can depend on an API aiohttp does not have.
+        install_fake_transport(mock_connection, 0)
 
         # Create test audio (using int16 as expected by _send_audio_chunk)
         audio_int16 = np.zeros(160, dtype=np.int16)  # 10ms at 16kHz
@@ -290,6 +292,7 @@ class TestStreamLifecycle:
         If get_connection raises, _owns_connection should remain False.
         """
         from livekit.agents.types import APIConnectOptions
+
         from livekit.plugins.voxist.exceptions import ConnectionPoolExhaustedError
 
         mock_pool.get_connection.side_effect = ConnectionPoolExhaustedError("No connections")
@@ -364,16 +367,11 @@ class TestStreamLifecycle:
         assert stream2._owns_connection is True
 
 
-class TestBackpressureWithOwnership:
-    """
-    Test CRIT-001 backpressure handling with ownership validation.
-
-    Verifies high/low water mark pattern prevents buffer overflow.
-    """
+class TestSendPathWithOwnership:
+    """Send-path behaviour: ownership, early exits, and the send timeout."""
 
     @pytest.fixture
     def mock_stt(self):
-        """Create mock VoxistSTT instance."""
         stt = Mock()
         stt._config = {
             "sample_rate": 16000,
@@ -386,13 +384,10 @@ class TestBackpressureWithOwnership:
 
     @pytest.fixture
     def mock_pool(self):
-        """Create mock connection pool."""
-        pool = AsyncMock(spec=ConnectionPool)
-        return pool
+        return AsyncMock(spec=ConnectionPool)
 
     @pytest.fixture
     def mock_connection(self):
-        """Create mock connection with WebSocket."""
         conn = Connection(id=0, state=ConnectionState.IN_USE)
         conn.ws = AsyncMock()
         conn.ws.closed = False
@@ -401,30 +396,20 @@ class TestBackpressureWithOwnership:
         # Default to an unreachable transport, matching a real aiohttp
         # WebSocket. Tests that need a size call install_fake_transport().
         conn.ws._response = None
-        # Real aiohttp WebSockets have no get_transport(); make the mock raise
-        # AttributeError like the real object so no future implementation can
-        # quietly depend on a method that does not exist.
-        del conn.ws.get_transport
+        del conn.ws.get_transport  # real aiohttp (<=3.14) has no such method
         return conn
 
     async def _create_stream_with_connection(self, mock_stt, mock_pool, mock_connection):
         """Create a stream with proper ownership setup (async helper)."""
         from livekit.agents.types import APIConnectOptions
 
-        conn_options = APIConnectOptions(
-            max_retry=3,
-            retry_interval=1.0,
-            timeout=10.0,
-        )
-
         stream = VoxistSTTStream(
             stt=mock_stt,
             pool=mock_pool,
             config=mock_stt._config,
             language="fr",
-            conn_options=conn_options,
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
         )
-
         # Cancel the auto-started task to prevent race with direct method calls
         stream._task.cancel()
         try:
@@ -434,259 +419,241 @@ class TestBackpressureWithOwnership:
 
         stream._conn = mock_connection
         stream._owns_connection = True
-
         return stream, mock_connection
 
     @pytest.mark.asyncio
-    async def test_backpressure_constants_defined(self):
-        """Test CRIT-001 backpressure constants are properly defined."""
-        assert hasattr(VoxistSTTStream, 'HIGH_WATER_MARK')
-        assert hasattr(VoxistSTTStream, 'LOW_WATER_MARK')
-        assert hasattr(VoxistSTTStream, 'BACKPRESSURE_CHECK_INTERVAL')
+    async def test_timeout_constants_are_ordered(self):
+        """
+        The send timeout must sit well below the receive watchdog.
 
-        # HIGH_WATER_MARK must be greater than LOW_WATER_MARK
-        assert VoxistSTTStream.HIGH_WATER_MARK > VoxistSTTStream.LOW_WATER_MARK
-
-        # Marks are compared against the real asyncio transport write buffer,
-        # which pauses at its own 64KB high-water mark. They must sit above
-        # that (so the transport's own flow control acts first) but low enough
-        # to still be reachable - marks in the megabytes would never trigger.
-        transport_default_high_water = 64 * 1024
-        assert VoxistSTTStream.HIGH_WATER_MARK > transport_default_high_water
-        assert VoxistSTTStream.HIGH_WATER_MARK <= 1 * 1024 * 1024
-        assert VoxistSTTStream.LOW_WATER_MARK >= 16 * 1024
-
-        # Check interval is reasonable (1-100ms)
-        assert VoxistSTTStream.BACKPRESSURE_CHECK_INTERVAL >= 0.001
-        assert VoxistSTTStream.BACKPRESSURE_CHECK_INTERVAL <= 0.1
-
-        # The backpressure wait must be bounded: an unbounded wait starves the
-        # stream of audio until the Voxist WebSocket times out.
-        assert VoxistSTTStream.BACKPRESSURE_MAX_WAIT > 0
-        assert VoxistSTTStream.BACKPRESSURE_MAX_WAIT <= 30.0
+        If a stalled send could outlast RECEIVE_TIMEOUT_SECONDS, the receive
+        task would tear the stream down first and a local send stall would be
+        misreported as a server-side stall - the original ASR-disconnect
+        symptom. An earlier version of this test only bounded the send-side
+        constant by 30.0, which is exactly the watchdog value, so it permitted
+        the failure it was meant to prevent.
+        """
+        assert VoxistSTTStream.SEND_TIMEOUT_SECONDS > 0
+        assert VoxistSTTStream.RECEIVE_TIMEOUT_SECONDS > 0
+        assert (
+            VoxistSTTStream.SEND_TIMEOUT_SECONDS
+            <= VoxistSTTStream.RECEIVE_TIMEOUT_SECONDS / 2
+        ), "a stalled send must be detected well before the receive watchdog fires"
 
     @pytest.mark.asyncio
-    async def test_backpressure_sends_normally_when_buffer_low(self, mock_stt, mock_pool, mock_connection):
-        """Test audio is sent immediately when buffer is below HIGH_WATER_MARK."""
-        stream, connection = await self._create_stream_with_connection(mock_stt, mock_pool, mock_connection)
+    async def test_no_water_mark_thresholds(self):
+        """
+        The plugin must not compare the write buffer against its own thresholds.
 
-        # Transport reporting a low buffer
-        install_fake_transport(connection, 1000)  # 1KB - low
+        Absolute byte marks cannot be calibrated once: a plain socket pauses at
+        64KB while asyncio's SSL transport pauses at 512KB and only relieves to
+        128KB. Marks chosen for one make the release condition unreachable on
+        the other. Backpressure belongs to aiohttp, which follows the
+        transport's own pause state.
+        """
+        for removed in (
+            "HIGH_WATER_MARK",
+            "LOW_WATER_MARK",
+            "BACKPRESSURE_MAX_WAIT",
+            "BACKPRESSURE_CHECK_INTERVAL",
+        ):
+            assert not hasattr(VoxistSTTStream, removed), (
+                f"{removed} reintroduces threshold-based flow control; "
+                "transport limits differ between plain and TLS sockets"
+            )
 
-        audio_int16 = np.zeros(160, dtype=np.int16)
+    @pytest.mark.asyncio
+    async def test_sends_immediately_when_buffer_measurable(
+        self, mock_stt, mock_pool, mock_connection
+    ):
+        """A measurable buffer must not delay the send - it is diagnostic only."""
+        stream, connection = await self._create_stream_with_connection(
+            mock_stt, mock_pool, mock_connection
+        )
+        install_fake_transport(connection, 400 * 1024)  # far above any old mark
 
-        # Should send immediately without waiting
-        import time
-        start = time.time()
-        await stream._send_audio_chunk(audio_int16)
-        elapsed = time.time() - start
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await stream._send_audio_chunk(np.zeros(160, dtype=np.int16))
+        elapsed = loop.time() - start
 
-        # Should only wait for the chunk duration (100ms) not additional backpressure
-        assert elapsed < 0.2  # 200ms max (100ms chunk + overhead)
+        assert elapsed < 0.2, "a large buffer reading must not throttle the send"
         connection.ws.send_bytes.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_backpressure_waits_when_buffer_high(self, mock_stt, mock_pool, mock_connection):
-        """
-        CRIT-001: Test backpressure wait when buffer exceeds HIGH_WATER_MARK.
-
-        When buffer is above HIGH_WATER_MARK, _send_audio_chunk should wait
-        until buffer drains to LOW_WATER_MARK.
-        """
-        stream, connection = await self._create_stream_with_connection(mock_stt, mock_pool, mock_connection)
-
-        # Track buffer size changes to simulate draining
-        buffer_sizes = [
-            VoxistSTTStream.HIGH_WATER_MARK + 1000,  # Initial - above high
-            VoxistSTTStream.LOW_WATER_MARK + 5000,   # Still draining
-            VoxistSTTStream.LOW_WATER_MARK - 1000,   # Below low - can send
-        ]
-        buffer_index = [0]
-
-        def get_buffer_size():
-            idx = min(buffer_index[0], len(buffer_sizes) - 1)
-            buffer_index[0] += 1
-            return buffer_sizes[idx]
-
-        mock_transport = install_fake_transport(connection, get_buffer_size)
-
-        audio_int16 = np.zeros(160, dtype=np.int16)
-
-        # Should wait for buffer to drain
-        await stream._send_audio_chunk(audio_int16)
-
-        # Buffer was checked multiple times until it dropped below LOW_WATER_MARK
-        assert mock_transport.get_write_buffer_size.call_count >= 2
-        connection.ws.send_bytes.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_backpressure_exits_on_connection_close_during_wait(self, mock_stt, mock_pool, mock_connection):
-        """
-        CRIT-001: Test graceful exit when connection closes during backpressure wait.
-
-        If the connection closes while waiting for buffer to drain,
-        _send_audio_chunk should return without sending.
-        """
-        stream, connection = await self._create_stream_with_connection(mock_stt, mock_pool, mock_connection)
-
-        # Start with high buffer, then simulate connection close
-        call_count = [0]
-
-        def get_buffer_and_close():
-            call_count[0] += 1
-            if call_count[0] > 1:
-                connection.ws.closed = True  # Simulate close during wait
-            return VoxistSTTStream.HIGH_WATER_MARK + 1000
-
-        install_fake_transport(connection, get_buffer_and_close)
-
-        audio_int16 = np.zeros(160, dtype=np.int16)
-
-        # Should return early without sending
-        await stream._send_audio_chunk(audio_int16)
-
-        # Send was NOT called due to connection close
-        connection.ws.send_bytes.assert_not_called()
+        assert connection.buffered_amount == 400 * 1024  # recorded, not acted on
 
     @pytest.mark.asyncio
     async def test_sends_normally_when_buffer_unmeasurable(
         self, mock_stt, mock_pool, mock_connection
     ):
-        """
-        Test sending proceeds when the transport size cannot be measured.
-
-        aiohttp exposes no public accessor for the write buffer, so this is the
-        common production case. It must never throttle: `await send_bytes()`
-        applies real backpressure by draining when the transport pauses.
-        """
-        stream, connection = await self._create_stream_with_connection(mock_stt, mock_pool, mock_connection)
-
+        """The common production case: no public accessor, so no measurement."""
+        stream, connection = await self._create_stream_with_connection(
+            mock_stt, mock_pool, mock_connection
+        )
         remove_transport(connection)
 
         assert stream._get_write_buffer_size() == 0
 
-        audio_int16 = np.zeros(160, dtype=np.int16)
-        await stream._send_audio_chunk(audio_int16)
-
+        await stream._send_audio_chunk(np.zeros(160, dtype=np.int16))
         connection.ws.send_bytes.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_backpressure_waits_then_sends_when_measured_high(
-        self, mock_stt, mock_pool, mock_connection
+    async def test_stalled_send_raises_connection_error(
+        self, mock_stt, mock_pool, mock_connection, monkeypatch
     ):
-        """Test backpressure engages on a measured high buffer, then releases."""
-        stream, connection = await self._create_stream_with_connection(mock_stt, mock_pool, mock_connection)
+        """
+        A send that never completes must fail fast, not block forever.
 
-        buffer_values = [
-            VoxistSTTStream.HIGH_WATER_MARK + 1000,
-            VoxistSTTStream.LOW_WATER_MARK - 1000,
-        ]
-        buffer_idx = [0]
+        aiohttp's drain inside send_bytes has no timeout of its own, so without
+        this bound the send task blocks indefinitely while livekit keeps
+        enqueuing frames - the same silent stall, one layer down.
+        """
+        stream, connection = await self._create_stream_with_connection(
+            mock_stt, mock_pool, mock_connection
+        )
+        monkeypatch.setattr(VoxistSTTStream, "SEND_TIMEOUT_SECONDS", 0.2)
 
-        def get_buffer():
-            idx = min(buffer_idx[0], len(buffer_values) - 1)
-            val = buffer_values[idx]
-            buffer_idx[0] += 1
-            return val
+        async def never_completes(_data):
+            await asyncio.Event().wait()
 
-        transport = install_fake_transport(connection, get_buffer)
+        connection.ws.send_bytes = AsyncMock(side_effect=never_completes)
 
-        audio_int16 = np.zeros(160, dtype=np.int16)
-        await stream._send_audio_chunk(audio_int16)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        with pytest.raises(ConnectionError, match="send timeout"):
+            await asyncio.wait_for(
+                stream._send_audio_chunk(np.zeros(160, dtype=np.int16)), timeout=5.0
+            )
+        elapsed = loop.time() - start
+        assert 0.2 <= elapsed < 3.0
 
-        # Should have checked buffer multiple times
-        assert transport.get_write_buffer_size.call_count >= 2
-        connection.ws.send_bytes.assert_called_once()
+    @pytest.mark.asyncio
+    async def test_stalled_send_marks_connection_failed(
+        self, mock_stt, mock_pool, mock_connection, monkeypatch
+    ):
+        """
+        A stalled connection must not go back into the pool as healthy.
+
+        A stalled socket is not a closed socket, so release_connection() would
+        see ws.closed == False and hand it straight to the next stream, which
+        would stall too. Marking it FAILED routes it to the pool's reconnect
+        path instead.
+        """
+        stream, connection = await self._create_stream_with_connection(
+            mock_stt, mock_pool, mock_connection
+        )
+        monkeypatch.setattr(VoxistSTTStream, "SEND_TIMEOUT_SECONDS", 0.1)
+
+        async def never_completes(_data):
+            await asyncio.Event().wait()
+
+        connection.ws.send_bytes = AsyncMock(side_effect=never_completes)
+        assert connection.state == ConnectionState.IN_USE
+
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(
+                stream._send_audio_chunk(np.zeros(160, dtype=np.int16)), timeout=5.0
+            )
+
+        assert connection.state == ConnectionState.FAILED, (
+            "a stalled connection was left in a state the pool treats as usable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stalled_send_aborts_the_transport(
+        self, mock_stt, mock_pool, mock_connection, monkeypatch
+    ):
+        """
+        The transport is aborted, because a cancelled send left a frame mid-flight.
+
+        asyncio.wait_for cancels the inner send_bytes; aiohttp may already have
+        written part of a frame, so the connection is no longer safe to write to.
+        """
+        stream, connection = await self._create_stream_with_connection(
+            mock_stt, mock_pool, mock_connection
+        )
+        monkeypatch.setattr(VoxistSTTStream, "SEND_TIMEOUT_SECONDS", 0.1)
+        transport = install_fake_transport(connection, 1024)
+        transport.abort = Mock()
+
+        async def never_completes(_data):
+            await asyncio.Event().wait()
+
+        connection.ws.send_bytes = AsyncMock(side_effect=never_completes)
+
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(
+                stream._send_audio_chunk(np.zeros(160, dtype=np.int16)), timeout=5.0
+            )
+
+        transport.abort.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_buffered_amount_records_measurement_with_ownership(
         self, mock_stt, mock_pool, mock_connection
     ):
-        """
-        Test buffered_amount records the measured buffer, not a running total.
-
-        The pool load-balances on this value, so it must be a snapshot of the
-        current transport buffer. Accumulating here is what caused streams to
-        pause permanently after ~100s of audio.
-        """
-        stream, connection = await self._create_stream_with_connection(mock_stt, mock_pool, mock_connection)
-
+        """buffered_amount is a snapshot, never a running total."""
+        stream, connection = await self._create_stream_with_connection(
+            mock_stt, mock_pool, mock_connection
+        )
         install_fake_transport(connection, 8192)
 
-        audio_int16 = np.zeros(160, dtype=np.int16)
-        await stream._send_audio_chunk(audio_int16)
-
+        chunk = np.zeros(160, dtype=np.int16)
+        await stream._send_audio_chunk(chunk)
         assert connection.buffered_amount == 8192
 
-        # A second send records the new measurement rather than adding to it
-        await stream._send_audio_chunk(audio_int16)
+        await stream._send_audio_chunk(chunk)
         assert connection.buffered_amount == 8192
 
     @pytest.mark.asyncio
-    async def test_backpressure_no_connection_returns_early(self, mock_stt, mock_pool):
+    async def test_no_connection_returns_early(self, mock_stt, mock_pool):
         """Test _send_audio_chunk returns early with no connection."""
         from livekit.agents.types import APIConnectOptions
-
-        conn_options = APIConnectOptions(
-            max_retry=3,
-            retry_interval=1.0,
-            timeout=10.0,
-        )
 
         stream = VoxistSTTStream(
             stt=mock_stt,
             pool=mock_pool,
             config=mock_stt._config,
             language="fr",
-            conn_options=conn_options,
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
         )
-
         stream._task.cancel()
         try:
             await stream._task
         except asyncio.CancelledError:
             pass
 
-        # No connection set
         stream._conn = None
-
-        audio_int16 = np.zeros(160, dtype=np.int16)
-
-        # Should return without error
-        await stream._send_audio_chunk(audio_int16)
+        await stream._send_audio_chunk(np.zeros(160, dtype=np.int16))
 
     @pytest.mark.asyncio
-    async def test_backpressure_closed_ws_returns_early(self, mock_stt, mock_pool, mock_connection):
+    async def test_closed_ws_returns_early(self, mock_stt, mock_pool, mock_connection):
         """Test _send_audio_chunk returns early with closed WebSocket."""
-        stream, connection = await self._create_stream_with_connection(mock_stt, mock_pool, mock_connection)
-
-        # Mark WebSocket as closed
+        stream, connection = await self._create_stream_with_connection(
+            mock_stt, mock_pool, mock_connection
+        )
         connection.ws.closed = True
 
-        audio_int16 = np.zeros(160, dtype=np.int16)
-
-        # Should return without sending
-        await stream._send_audio_chunk(audio_int16)
+        await stream._send_audio_chunk(np.zeros(160, dtype=np.int16))
         connection.ws.send_bytes.assert_not_called()
 
 
 class TestBackpressureLiveness:
     """
-    Regression tests for the indefinite-backpressure outage.
+    Regression tests for the two indefinite-stall bugs in the send path.
 
-    Symptom: after roughly 90-110 seconds of audio the plugin stopped sending
-    to Voxist entirely and the WebSocket timed out.
+    First bug: _get_write_buffer_size() called a non-existent aiohttp method,
+    silently fell back to a counter that added half of every chunk ever sent and
+    never decayed, and the drain loop it fed had no time bound - so after ~100s
+    of audio the stream paused forever and the WebSocket timed out.
 
-    Cause: _get_write_buffer_size() called a non-existent aiohttp method
-    (ws.get_transport()), silently fell back to a counter that added half of
-    every chunk ever sent and never decayed, and the drain loop that counter
-    fed had no time bound. Once the counter passed HIGH_WATER_MARK the loop
-    re-read the same frozen value forever.
+    Second bug: the replacement compared the real buffer against marks
+    calibrated for a plain socket. Over wss:// the low mark sat below the level
+    asyncio's SSL transport relieves to, making the release condition
+    unreachable and throttling the stream to one chunk per timeout.
 
-    These tests pin the three properties that make that impossible:
-      1. sending stays live over far more audio than the old trip point,
-      2. buffered_amount is a measurement, never an accumulator,
-      3. any backpressure wait is time-bounded.
+    Both are prevented by the same property: nothing in the send path gates on
+    a byte count the plugin chose. These tests pin that, plus the bounds that
+    replace it.
     """
 
     @pytest.fixture
@@ -740,12 +707,12 @@ class TestBackpressureLiveness:
         self, mock_stt, mock_pool, mock_connection
     ):
         """
-        Sending must not stall after a sustained run of audio.
+        Sending must not stall over a sustained run of audio.
 
-        The old accounting tripped at 2MB, reached after ~106s of 16kHz audio.
-        This drives more than three times that volume and requires every chunk
-        to reach the WebSocket. Each send is individually timed out, so a
-        reintroduced infinite wait fails fast instead of hanging the suite.
+        The first bug tripped at 2MB, reached after ~106s of 16kHz audio. This
+        drives more than three times that volume and requires every chunk to
+        reach the WebSocket. Each send is individually timed out, so a
+        reintroduced stall fails fast instead of hanging the suite.
         """
         stream, connection = await self._stream(mock_stt, mock_pool, mock_connection)
 
@@ -758,16 +725,45 @@ class TestBackpressureLiveness:
             await asyncio.wait_for(stream._send_audio_chunk(chunk), timeout=1.0)
 
         assert connection.ws.send_bytes.await_count == chunk_count
-        total_sent = chunk_count * chunk_bytes
-        assert total_sent > 3 * old_trip_point - chunk_bytes
-        # Nothing accumulated along the way
         assert connection.buffered_amount == 0
+
+    @pytest.mark.asyncio
+    async def test_no_stall_when_buffer_sits_in_the_ssl_band(
+        self, mock_stt, mock_pool, mock_connection
+    ):
+        """
+        A buffer parked in the SSL transport's 128KB-512KB band must not stall.
+
+        This is the exact condition that broke the previous fix: over wss://,
+        asyncio's SSL transport pauses at 512KB and relieves only to 128KB, so
+        a buffer resting at, say, 300KB is above the old 256KB high mark and can
+        never reach the old 64KB low mark. Every chunk burned the full wait.
+        """
+        stream, connection = await self._stream(mock_stt, mock_pool, mock_connection)
+
+        ssl_low_water = 128 * 1024
+        ssl_high_water = 512 * 1024
+        parked = (ssl_low_water + ssl_high_water) // 2  # 320KB, never relieved
+        install_fake_transport(connection, parked)
+
+        chunk = np.zeros(1600, dtype=np.int16)
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        for _ in range(20):
+            await asyncio.wait_for(stream._send_audio_chunk(chunk), timeout=1.0)
+        elapsed = loop.time() - start
+
+        assert connection.ws.send_bytes.await_count == 20
+        assert elapsed < 1.0, (
+            f"20 sends took {elapsed:.2f}s with the buffer parked at "
+            f"{parked}B - the send path is gating on a byte threshold again"
+        )
 
     @pytest.mark.asyncio
     async def test_buffered_amount_never_accumulates(
         self, mock_stt, mock_pool, mock_connection
     ):
-        """buffered_amount must track the measured buffer, not sum of sends."""
+        """buffered_amount must track the measured buffer, not the sum of sends."""
         stream, connection = await self._stream(mock_stt, mock_pool, mock_connection)
 
         steady_buffer = 4096
@@ -782,58 +778,10 @@ class TestBackpressureLiveness:
         assert connection.ws.send_bytes.await_count == 500
 
     @pytest.mark.asyncio
-    async def test_backpressure_wait_is_time_bounded(
-        self, mock_stt, mock_pool, mock_connection, monkeypatch
-    ):
-        """
-        A permanently full buffer must not pause the stream forever.
-
-        This is the exact shape of the outage: the measured buffer never drops
-        below LOW_WATER_MARK. The wait must expire and the chunk must still be
-        sent, deferring to aiohttp's own transport flow control.
-        """
-        stream, connection = await self._stream(mock_stt, mock_pool, mock_connection)
-
-        monkeypatch.setattr(VoxistSTTStream, "BACKPRESSURE_MAX_WAIT", 0.3)
-        install_fake_transport(connection, VoxistSTTStream.HIGH_WATER_MARK * 10)
-
-        chunk = np.zeros(1600, dtype=np.int16)
-        loop = asyncio.get_running_loop()
-        start = loop.time()
-        await asyncio.wait_for(stream._send_audio_chunk(chunk), timeout=5.0)
-        elapsed = loop.time() - start
-
-        # It waited, gave up at the cap, and still delivered the audio
-        assert elapsed >= 0.3
-        assert elapsed < 3.0
-        connection.ws.send_bytes.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_repeated_sends_under_permanent_backpressure_still_flow(
-        self, mock_stt, mock_pool, mock_connection, monkeypatch
-    ):
-        """Even with the buffer stuck full, audio keeps flowing chunk after chunk."""
-        stream, connection = await self._stream(mock_stt, mock_pool, mock_connection)
-
-        monkeypatch.setattr(VoxistSTTStream, "BACKPRESSURE_MAX_WAIT", 0.05)
-        install_fake_transport(connection, VoxistSTTStream.HIGH_WATER_MARK * 10)
-
-        chunk = np.zeros(1600, dtype=np.int16)
-        for _ in range(10):
-            await asyncio.wait_for(stream._send_audio_chunk(chunk), timeout=2.0)
-
-        assert connection.ws.send_bytes.await_count == 10
-
-    @pytest.mark.asyncio
     async def test_unmeasurable_buffer_never_throttles(
         self, mock_stt, mock_pool, mock_connection
     ):
-        """
-        An unmeasurable transport must report 0, not a guess.
-
-        Guessing here is what broke production: any non-zero heuristic can
-        drift above the water marks and stop the stream.
-        """
+        """An unmeasurable transport reports 0 and never gates the send."""
         stream, connection = await self._stream(mock_stt, mock_pool, mock_connection)
 
         remove_transport(connection)
@@ -844,15 +792,23 @@ class TestBackpressureLiveness:
         connection.buffered_amount = 999_999_999
         assert stream._get_write_buffer_size() == 0
 
-        chunk = np.zeros(1600, dtype=np.int16)
-        await asyncio.wait_for(stream._send_audio_chunk(chunk), timeout=1.0)
+        await asyncio.wait_for(
+            stream._send_audio_chunk(np.zeros(1600, dtype=np.int16)), timeout=1.0
+        )
         connection.ws.send_bytes.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_closing_transport_treated_as_unmeasurable(
+    async def test_closing_transport_is_unmeasurable_but_send_proceeds(
         self, mock_stt, mock_pool, mock_connection
     ):
-        """A closing transport must not be read for a buffer size."""
+        """
+        A closing transport yields no measurement and does not divert the send.
+
+        Under the previous design this state produced a misleading "backpressure
+        released" log and then a raise from send_bytes. Now the measurement is
+        irrelevant to control flow, so the send follows its normal path and any
+        error surfaces from aiohttp itself.
+        """
         stream, connection = await self._stream(mock_stt, mock_pool, mock_connection)
 
         transport = install_fake_transport(connection, 123456)
@@ -860,6 +816,11 @@ class TestBackpressureLiveness:
 
         assert stream._get_transport() is None
         assert stream._get_write_buffer_size() == 0
+
+        await asyncio.wait_for(
+            stream._send_audio_chunk(np.zeros(1600, dtype=np.int16)), timeout=1.0
+        )
+        connection.ws.send_bytes.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_transport_errors_are_contained(
@@ -873,9 +834,151 @@ class TestBackpressureLiveness:
 
         assert stream._get_write_buffer_size() == 0
 
-        chunk = np.zeros(1600, dtype=np.int16)
-        await asyncio.wait_for(stream._send_audio_chunk(chunk), timeout=1.0)
+        await asyncio.wait_for(
+            stream._send_audio_chunk(np.zeros(1600, dtype=np.int16)), timeout=1.0
+        )
         connection.ws.send_bytes.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_unreachable_transport_is_reported_once(
+        self, mock_stt, mock_pool, mock_connection, caplog
+    ):
+        """
+        Losing the transport accessor must leave a trace, exactly once.
+
+        A silent permanent failure would hide the loss of every buffer metric
+        behind an aiohttp upgrade; a per-chunk log would flood at 10/s.
+        """
+        stream, connection = await self._stream(mock_stt, mock_pool, mock_connection)
+        remove_transport(connection)
+
+        with caplog.at_level(logging.DEBUG, logger="livekit.plugins.voxist"):
+            for _ in range(50):
+                stream._get_write_buffer_size()
+
+        matching = [r for r in caplog.records if "cannot reach the WebSocket" in r.message]
+        assert len(matching) == 1, f"expected exactly one report, got {len(matching)}"
+
+
+class TestInputBacklogBound:
+    """
+    CRIT-001: the unsent audio backlog must be bounded.
+
+    livekit's input channel is unbounded and push_frame() uses send_nowait, so
+    nothing upstream slows down when the uplink cannot keep up. Without an
+    explicit cap the backlog grows for the life of the call until the process
+    is OOM-killed. Dropping the oldest audio is the right policy for live
+    transcription: audio that far behind the speaker is already useless.
+    """
+
+    @pytest.fixture
+    def mock_stt(self):
+        stt = Mock()
+        stt._config = {
+            "sample_rate": 16000,
+            "chunk_duration_ms": 100,
+            "stride_overlap_ms": 20,
+            "interim_results": True,
+        }
+        stt._api_key = "test_key"
+        return stt
+
+    async def _stream(self, mock_stt):
+        from livekit.agents.types import APIConnectOptions
+
+        stream = VoxistSTTStream(
+            stt=mock_stt,
+            pool=AsyncMock(spec=ConnectionPool),
+            config=mock_stt._config,
+            language="fr",
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
+        )
+        stream._task.cancel()
+        try:
+            await stream._task
+        except asyncio.CancelledError:
+            pass
+        return stream
+
+    @pytest.mark.asyncio
+    async def test_backlog_cap_is_bounded_and_documented(self, mock_stt):
+        """The cap must exist and be a sane amount of audio."""
+        assert VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES > 0
+        # 10ms frames: keep at least 1s, no more than a minute of audio
+        assert 100 <= VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES <= 6000
+
+    @pytest.mark.asyncio
+    async def test_oldest_frames_dropped_above_cap(self, mock_stt, monkeypatch):
+        """Backlog above the cap is trimmed back down to it."""
+        stream = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 10)
+
+        for _ in range(35):
+            stream._input_ch.send_nowait(Mock(spec=[]))
+        assert stream._input_ch.qsize() == 35
+
+        stream._drop_stale_input()
+
+        assert stream._input_ch.qsize() == 10
+        assert stream._dropped_frames == 25
+
+    @pytest.mark.asyncio
+    async def test_backlog_below_cap_untouched(self, mock_stt, monkeypatch):
+        """Nothing is dropped while the backlog is within bounds."""
+        stream = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 10)
+
+        for _ in range(10):
+            stream._input_ch.send_nowait(Mock(spec=[]))
+
+        stream._drop_stale_input()
+
+        assert stream._input_ch.qsize() == 10
+        assert stream._dropped_frames == 0
+
+    @pytest.mark.asyncio
+    async def test_flush_sentinel_survives_dropping(self, mock_stt, monkeypatch):
+        """
+        A flush sentinel must never be discarded.
+
+        Dropping one would lose the end-of-utterance signal, so Voxist would
+        never be told to finalize and the caller would lose a transcript.
+        """
+        stream = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
+
+        # Sentinel sits inside the prefix that will be trimmed away.
+        stream._audio_processor = Mock()
+        stream._audio_processor.flush = Mock(return_value=[])
+
+        for _ in range(20):
+            stream._input_ch.send_nowait(Mock(spec=[]))
+        stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
+        for _ in range(20):
+            stream._input_ch.send_nowait(Mock(spec=[]))
+        assert stream._input_ch.qsize() == 41
+
+        stream._drop_stale_input()
+
+        # Trimmed to the cap, and the 36 removed items were 35 audio frames
+        # plus the sentinel - which was flushed rather than counted as dropped.
+        assert stream._input_ch.qsize() == 5
+        assert stream._dropped_frames == 35
+        assert stream._audio_processor.flush.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_drop_logs_a_warning(self, mock_stt, monkeypatch, caplog):
+        """Dropped audio must be visible, not silent."""
+        stream = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
+
+        for _ in range(30):
+            stream._input_ch.send_nowait(Mock(spec=[]))
+
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            stream._drop_stale_input()
+
+        assert any("dropped" in r.message for r in caplog.records)
 
 
 class TestTransportAccessorAgainstRealAiohttp:
@@ -893,14 +996,65 @@ class TestTransportAccessorAgainstRealAiohttp:
     """
 
     @pytest.mark.asyncio
-    async def test_ws_has_no_get_transport_method(self):
-        """Document why the private chain is necessary at all."""
-        import aiohttp
+    async def test_public_accessor_is_preferred_when_available(self):
+        """
+        _get_transport() must use a public accessor whenever aiohttp has one.
 
-        assert not hasattr(aiohttp.ClientWebSocketResponse, "get_transport"), (
-            "aiohttp now exposes get_transport(); prefer it over the private "
-            "ws._response.connection.transport chain in _get_transport()"
+        Deliberately not asserting that aiohttp *lacks* get_transport(): the day
+        upstream adds it, an absence assertion would turn every matrix job red
+        on a dependency bump while the plugin still worked. Instead this checks
+        the preference order, so gaining the public API is a silent improvement.
+        """
+        import aiohttp
+        from livekit.agents.types import APIConnectOptions
+
+        stt = Mock()
+        stt._config = {
+            "sample_rate": 16000,
+            "chunk_duration_ms": 100,
+            "stride_overlap_ms": 20,
+            "interim_results": True,
+        }
+        stt._api_key = "k"
+        stream = VoxistSTTStream(
+            stt=stt,
+            pool=AsyncMock(spec=ConnectionPool),
+            config=stt._config,
+            language="fr",
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
         )
+        stream._task.cancel()
+        try:
+            await stream._task
+        except asyncio.CancelledError:
+            pass
+
+        sentinel = Mock()
+        sentinel.is_closing = Mock(return_value=False)
+        sentinel.get_write_buffer_size = Mock(return_value=4242)
+
+        conn = Connection(id=0, state=ConnectionState.IN_USE)
+        conn.ws = Mock()
+        conn.ws.closed = False
+        conn.ws.get_transport = Mock(return_value=sentinel)
+        # Private chain also present, returning something different, so we can
+        # tell which one was consulted.
+        other = Mock()
+        other.is_closing = Mock(return_value=False)
+        other.get_write_buffer_size = Mock(return_value=1)
+        conn.ws._response = Mock()
+        conn.ws._response.connection = Mock()
+        conn.ws._response.connection.transport = other
+
+        stream._conn = conn
+        assert stream._get_write_buffer_size() == 4242, (
+            "the public accessor must win over the private attribute chain"
+        )
+
+        # Documented state of the currently installed aiohttp, as information
+        # rather than a constraint.
+        has_public = hasattr(aiohttp.ClientWebSocketResponse, "get_transport")
+        assert isinstance(has_public, bool)
 
     @pytest.mark.asyncio
     async def test_reads_real_transport_buffer_size(self):
@@ -965,11 +1119,21 @@ class TestTransportAccessorAgainstRealAiohttp:
 
                     # Sending real audio keeps the measurement sane and finite
                     await stream._send_audio_chunk(np.zeros(1600, dtype=np.int16))
-                    assert 0 <= conn.buffered_amount < VoxistSTTStream.HIGH_WATER_MARK
+                    assert conn.buffered_amount >= 0
         finally:
             await runner.cleanup()
 
 
+LANGUAGE_CODE_AVAILABLE = getattr(
+    __import__("livekit.agents", fromlist=["LanguageCode"]), "LanguageCode", None
+) is not None
+
+
+@pytest.mark.skipif(
+    not LANGUAGE_CODE_AVAILABLE,
+    reason="livekit-agents predates LanguageCode; stream.py falls back to str "
+    "and performs no normalization, so these expectations do not apply",
+)
 class TestLanguageCodeHandling:
     """
     The code sent to Voxist stays raw; the code emitted to livekit is normalized.

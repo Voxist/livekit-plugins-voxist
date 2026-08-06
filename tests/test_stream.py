@@ -1084,6 +1084,16 @@ class TestInputBacklogBound:
         monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
         monkeypatch.setattr(VoxistSTTStream, "DROP_LOG_INTERVAL_SECONDS", 3600.0)
 
+        # Simulate a freshly booted host: monotonic() has an arbitrary epoch, so
+        # a small value must not make the elapsed check suppress the first
+        # report. Using 0.0 as the "never reported" sentinel did exactly that,
+        # and only showed up on CI because a developer machine's uptime happens
+        # to exceed any plausible interval.
+        clock = iter([1.0 + i * 0.001 for i in range(5000)])
+        monkeypatch.setattr(
+            "livekit.plugins.voxist.stream.time.monotonic", lambda: next(clock)
+        )
+
         for _ in range(200):
             stream._input_ch.send_nowait(self._frame())
         stream._input_ch.close()

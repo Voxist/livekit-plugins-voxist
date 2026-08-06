@@ -148,9 +148,12 @@ class VoxistSTTStream(RecognizeStream):
         # Latch so an unreachable transport is reported once, not per chunk
         self._transport_lookup_failed = False
         # Count of frames dropped to keep the input backlog bounded, and when
-        # that was last reported (monotonic - only ever used for rate limiting)
+        # that was last reported. None means "not yet" - monotonic() has an
+        # arbitrary epoch (uptime on Linux), so 0.0 is not a usable sentinel:
+        # on a freshly booted host the elapsed check would suppress the first
+        # report for as long as the interval.
         self._dropped_frames = 0
-        self._last_drop_log = 0.0
+        self._last_drop_log: float | None = None
 
         # Audio processor for format conversion and chunking
         # Resample from input rate (e.g., 48kHz from LiveKit) to 16kHz for Voxist
@@ -432,7 +435,10 @@ class VoxistSTTStream(RecognizeStream):
         self._dropped_frames += 1
 
         now = time.monotonic()
-        if now - self._last_drop_log < self.DROP_LOG_INTERVAL_SECONDS:
+        if (
+            self._last_drop_log is not None
+            and now - self._last_drop_log < self.DROP_LOG_INTERVAL_SECONDS
+        ):
             return
         self._last_drop_log = now
 

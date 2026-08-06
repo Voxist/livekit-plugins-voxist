@@ -377,6 +377,9 @@ class ConnectionPool:
             conn.state = ConnectionState.READY
             conn.last_heartbeat = time.time()
             conn.retry_count = 0
+            # Fresh WebSocket means a fresh transport, so any buffer reading
+            # carried over from the previous socket is meaningless.
+            conn.buffered_amount = 0
 
             logger.debug(f"Connection {conn.id} established successfully")
             return True
@@ -529,6 +532,10 @@ class ConnectionPool:
         async with self._lock:
             if conn.state == ConnectionState.IN_USE:
                 conn.state = ConnectionState.READY
+                # Clear the backpressure snapshot: it describes the departing
+                # stream's transport state, and a stale non-zero value would
+                # skew the least-loaded selection in get_connection().
+                conn.buffered_amount = 0
                 logger.debug(f"Released connection {conn.id}")
 
     async def _wait_for_ready(self, conn: Connection) -> None:

@@ -209,6 +209,52 @@ class TestConnectionAcquisition:
             await pool_basic.close()
 
     @pytest.mark.asyncio
+    async def test_release_connection_clears_buffered_amount(self, pool_basic, mock_ws_connect):
+        """
+        Test release_connection clears the backpressure snapshot.
+
+        buffered_amount describes the departing stream's transport state and is
+        the key get_connection() load-balances on. A value left behind would
+        skew that selection, and historically it never got cleared at all - it
+        accumulated across streams until backpressure tripped permanently.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            pool_basic.connections[0].state = ConnectionState.READY
+            conn = await pool_basic.get_connection()
+            conn.buffered_amount = 750_000  # left over from streaming
+
+            await pool_basic.release_connection(conn)
+
+            assert conn.buffered_amount == 0
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_clears_stale_buffered_amount(self, pool_basic, mock_ws_connect):
+        """
+        Test a (re)connect clears any buffer reading from the old socket.
+
+        A reconnect replaces the WebSocket on the same Connection object, so a
+        carried-over reading describes a transport that no longer exists. Left
+        in place above HIGH_WATER_MARK it would make the reconnected connection
+        permanently unusable.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            conn = pool_basic.connections[0]
+            conn.buffered_amount = 5 * 1024 * 1024  # stale, far above HIGH_WATER_MARK
+
+            success = await pool_basic._connect(conn, pool_basic.language, pool_basic.sample_rate)
+
+            assert success is True
+            assert conn.buffered_amount == 0
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
     async def test_get_connection_exhausted_raises_error(self, pool_basic, mock_ws_connect):
         """Test get_connection raises when no connections available."""
         with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):

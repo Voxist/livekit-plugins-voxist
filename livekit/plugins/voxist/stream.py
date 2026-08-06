@@ -57,15 +57,17 @@ class VoxistSTTStream(RecognizeStream):
                 print(event.alternatives[0].text)
     """
 
-    # Backpressure thresholds for WebSocket write buffer (safety net only)
-    # Voxist backend handles streaming well, so these are set high to avoid
-    # unnecessary pauses. Only triggers in extreme network congestion.
-    # - 16kHz Int16 audio = 32KB/sec
-    # - HIGH_WATER_MARK = ~60 seconds of buffered audio (emergency brake)
-    # - LOW_WATER_MARK = ~30 seconds of buffered audio (resume after emergency)
-    HIGH_WATER_MARK = 2 * 1024 * 1024  # 2MB - emergency pause threshold
-    LOW_WATER_MARK = 1 * 1024 * 1024   # 1MB - resume after emergency
+    # Backpressure thresholds, measured against the real asyncio transport
+    # write buffer (safety net only). asyncio transports pause writing at their
+    # own high-water mark - 64KB by default - and aiohttp drains inside
+    # send_bytes() while paused, so that is the primary backpressure mechanism.
+    # These marks are a secondary brake for a transport backed up well past it.
+    HIGH_WATER_MARK = 256 * 1024  # 256KB - 4x the transport's own pause point
+    LOW_WATER_MARK = 64 * 1024    # 64KB - resume once back to normal range
     BACKPRESSURE_CHECK_INTERVAL = 0.05  # 50ms between buffer checks
+    # Hard cap on a single backpressure wait. Bounded on purpose: an unbounded
+    # wait starves the stream of audio and times out the Voxist WebSocket.
+    BACKPRESSURE_MAX_WAIT = 5.0  # seconds
 
     def __init__(
         self,
@@ -353,28 +355,115 @@ class VoxistSTTStream(RecognizeStream):
             logger.error(f"Stream {self._session_id} send task error: {e}")
             raise
 
-    def _get_write_buffer_size(self) -> int:
+    def _get_transport(self) -> asyncio.Transport | None:
         """
-        Get actual transport write buffer size for accurate backpressure detection.
+        Reach the asyncio transport underlying the WebSocket.
+
+        aiohttp exposes no public accessor for this: ClientWebSocketResponse
+        has no get_transport(), and get_extra_info("transport") returns None
+        because asyncio transports carry no "transport" extra-info key. The
+        transport is only reachable through the response's connection, so
+        every hop is guarded - this is not public API and may change.
 
         Returns:
-            Buffer size in bytes, or 0 if transport not available.
+            The transport, or None if it cannot be reached or is closing.
         """
         if not self._conn or not self._conn.ws:
+            return None
+
+        try:
+            connection = self._conn.ws._response.connection  # type: ignore[attr-defined]
+            if connection is None:
+                return None
+            transport = connection.transport
+        except (AttributeError, RuntimeError):
+            return None
+
+        if transport is None or transport.is_closing():
+            return None
+        return transport  # type: ignore[no-any-return]
+
+    def _get_write_buffer_size(self) -> int:
+        """
+        Measure the real transport write buffer size.
+
+        Returns 0 when the size cannot be measured. Returning 0 rather than a
+        guess is deliberate: `await ws.send_bytes()` already applies genuine
+        backpressure by draining when the transport pauses, so an unmeasurable
+        buffer must never throttle the stream on its own.
+
+        A previous heuristic here accumulated half of every chunk ever sent and
+        never decayed, so it crossed HIGH_WATER_MARK after ~100s of audio and
+        paused the stream permanently, timing out the Voxist WebSocket. Any
+        change here must keep this a *measurement*, never an accumulator.
+
+        Returns:
+            Buffer size in bytes, or 0 if it cannot be measured.
+        """
+        transport = self._get_transport()
+        if transport is None:
             return 0
 
         try:
-            # Access aiohttp's underlying transport for accurate buffer size
-            # This is the actual TCP write buffer, not an estimate
-            transport = self._conn.ws.get_transport()  # type: ignore[attr-defined]
-            if transport is not None:
-                return transport.get_write_buffer_size()  # type: ignore[no-any-return]
+            return int(transport.get_write_buffer_size())
         except (AttributeError, RuntimeError):
-            # Transport not available or closed
-            pass
+            return 0
 
-        # Fallback to tracked estimate
-        return self._conn.buffered_amount
+    async def _await_backpressure_relief(self) -> bool:
+        """
+        Wait for a badly backed-up transport to drain, with a hard time cap.
+
+        This is a secondary emergency brake. The primary backpressure is
+        aiohttp's own: it drains inside send_bytes() once the transport pauses
+        at its high-water mark (64KB by default). This brake only engages when
+        the transport is backed up far beyond that.
+
+        The wait is bounded by BACKPRESSURE_MAX_WAIT so a stream can never be
+        paused indefinitely - an unbounded wait here is what silently killed
+        streams by starving the WebSocket of audio until it timed out.
+
+        Returns:
+            True if sending should proceed, False if the connection was lost.
+        """
+        buffer_size = self._get_write_buffer_size()
+        if buffer_size <= self.HIGH_WATER_MARK:
+            return True
+
+        logger.warning(
+            f"Stream {self._session_id} backpressure triggered: "
+            f"buffer={buffer_size}B > HIGH_WATER_MARK={self.HIGH_WATER_MARK}B"
+        )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.BACKPRESSURE_MAX_WAIT
+
+        while buffer_size > self.LOW_WATER_MARK:
+            if loop.time() >= deadline:
+                # Give up waiting rather than starve the stream. aiohttp's
+                # transport-level flow control remains in force during send.
+                logger.warning(
+                    f"Stream {self._session_id} backpressure wait exceeded "
+                    f"{self.BACKPRESSURE_MAX_WAIT}s (buffer={buffer_size}B); "
+                    "resuming send and deferring to transport flow control"
+                )
+                return True
+
+            await asyncio.sleep(self.BACKPRESSURE_CHECK_INTERVAL)
+
+            # Re-check connection state during wait
+            if not self._conn or not self._conn.ws or self._conn.ws.closed:
+                logger.warning(
+                    f"Stream {self._session_id} connection lost during wait"
+                )
+                return False
+
+            buffer_size = self._get_write_buffer_size()
+
+        logger.debug(
+            f"Stream {self._session_id} backpressure released: "
+            f"buffer={buffer_size}B < LOW_WATER_MARK={self.LOW_WATER_MARK}B"
+        )
+        return True
 
     async def _send_audio_chunk(self, audio_int16: np.ndarray) -> None:
         """
@@ -400,47 +489,30 @@ class VoxistSTTStream(RecognizeStream):
             logger.warning(f"Stream {self._session_id} WebSocket closed, skipping chunk")
             return
 
-        # CRIT-001: Backpressure handling using transport write buffer
-        # Wait if buffer exceeds HIGH_WATER_MARK until it drains to LOW_WATER_MARK
-        buffer_size = self._get_write_buffer_size()
-        if buffer_size > self.HIGH_WATER_MARK:
-            logger.warning(
-                f"Stream {self._session_id} backpressure triggered: "
-                f"buffer={buffer_size}B > HIGH_WATER_MARK={self.HIGH_WATER_MARK}B"
-            )
-            # Wait for buffer to drain below LOW_WATER_MARK
-            while buffer_size > self.LOW_WATER_MARK:
-                await asyncio.sleep(self.BACKPRESSURE_CHECK_INTERVAL)
-                # Re-check connection state during wait
-                if not self._conn or not self._conn.ws or self._conn.ws.closed:
-                    logger.warning(
-                        f"Stream {self._session_id} connection lost during wait"
-                    )
-                    return
-                buffer_size = self._get_write_buffer_size()
+        # CRIT-001: Backpressure handling using transport write buffer.
+        # Time-bounded: never pause a stream indefinitely.
+        if not await self._await_backpressure_relief():
+            return
 
-            logger.debug(
-                f"Stream {self._session_id} backpressure released: "
-                f"buffer={buffer_size}B < LOW_WATER_MARK={self.LOW_WATER_MARK}B"
-            )
-
-        # Send as binary frame (raw Int16 PCM bytes)
+        # Send as binary frame (raw Int16 PCM bytes).
+        # This await is the primary backpressure point: aiohttp drains here
+        # when the transport is paused above its own high-water mark.
         audio_bytes = audio_int16.tobytes()
         await self._conn.ws.send_bytes(audio_bytes)
 
         logger.debug(f"Stream {self._session_id} sent {len(audio_bytes)} bytes to WebSocket")
 
-        # Update fallback estimate (used when transport not available)
+        # Record the current buffer level for pool load-balancing, which picks
+        # the connection with the smallest buffered_amount. This is a snapshot
+        # measurement, not a running total: accumulating here made the value
+        # grow without bound and permanently trip backpressure.
         # SECURITY: Validate exclusive ownership to prevent race condition (VUL-003)
-        # This read-modify-write is safe because only one stream owns the connection
         if not self._owns_connection:
             raise OwnershipViolationError(
                 f"Stream {self._session_id} updating buffered_amount without ownership - "
                 "potential race condition. This indicates a bug in stream lifecycle."
             )
-        self._conn.buffered_amount += len(audio_bytes)
-        # Decay estimate conservatively (assume ~half sent during await)
-        self._conn.buffered_amount = max(0, self._conn.buffered_amount - len(audio_bytes) // 2)
+        self._conn.buffered_amount = self._get_write_buffer_size()
 
     async def _recv_results_task(self) -> None:
         """

@@ -419,8 +419,14 @@ class VoxistSTTStream(RecognizeStream):
             except Exception:
                 break
             if isinstance(item, self._FlushSentinel):
-                # Keep the sentinel: process it now rather than discard it.
-                self._audio_processor.flush()
+                # Re-queue rather than discard. Dropping a sentinel would lose
+                # the end-of-utterance signal, so Voxist would never be told to
+                # finalize and the caller would lose a transcript. It lands
+                # after the audio we are keeping, which is where it belongs.
+                try:
+                    self._input_ch.send_nowait(item)
+                except Exception:
+                    pass
                 continue
             dropped += 1
 

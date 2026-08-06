@@ -948,9 +948,6 @@ class TestInputBacklogBound:
         monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
 
         # Sentinel sits inside the prefix that will be trimmed away.
-        stream._audio_processor = Mock()
-        stream._audio_processor.flush = Mock(return_value=[])
-
         for _ in range(20):
             stream._input_ch.send_nowait(Mock(spec=[]))
         stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
@@ -960,11 +957,18 @@ class TestInputBacklogBound:
 
         stream._drop_stale_input()
 
-        # Trimmed to the cap, and the 36 removed items were 35 audio frames
-        # plus the sentinel - which was flushed rather than counted as dropped.
-        assert stream._input_ch.qsize() == 5
-        assert stream._dropped_frames == 35
-        assert stream._audio_processor.flush.call_count == 1
+        remaining = []
+        while stream._input_ch.qsize():
+            remaining.append(stream._input_ch.recv_nowait())
+
+        sentinels = [r for r in remaining if isinstance(r, VoxistSTTStream._FlushSentinel)]
+        assert len(sentinels) == 1, "the end-of-utterance signal was dropped"
+        # Trimming 41 items to the cap of 5 removes 36; the sentinel is
+        # re-queued rather than removed, so all 36 are audio frames.
+        assert stream._dropped_frames == 36
+        assert len(remaining) == 5
+        # It now sits after the audio that was kept, which is where it belongs
+        assert isinstance(remaining[-1], VoxistSTTStream._FlushSentinel)
 
     @pytest.mark.asyncio
     async def test_drop_logs_a_warning(self, mock_stt, monkeypatch, caplog):

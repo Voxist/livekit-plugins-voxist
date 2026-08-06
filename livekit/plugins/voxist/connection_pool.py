@@ -161,8 +161,20 @@ class ConnectionPool:
         Returns:
             The selected connection.
         """
-        self.current_index = (self.current_index + 1) % len(ready_conns)
-        return ready_conns[self.current_index]
+        ready = {id(c) for c in ready_conns}
+        total = len(self.connections)
+
+        # Walk the pool from just past the cursor and take the first ready
+        # connection. Indexing the filtered list by a persistent counter would
+        # be unfair when the ready subset changes size between calls.
+        for offset in range(1, total + 1):
+            index = (self.current_index + offset) % total
+            candidate = self.connections[index]
+            if id(candidate) in ready:
+                self.current_index = index
+                return candidate
+
+        return ready_conns[0]  # not reachable while ready_conns is non-empty
 
     def _ssl_param(self) -> ssl.SSLContext | bool:
         """

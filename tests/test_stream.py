@@ -565,9 +565,9 @@ class TestBackpressureWithOwnership:
         await stream._send_audio_chunk(audio_int16)
 
         # Verify buffered_amount was updated (with decay)
-        # Formula: buffered_amount += len - len//2 = len//2
-        audio_bytes_len // 2
-        assert connection.buffered_amount >= 0
+        # Formula: buffered_amount += len, then decays by len//2
+        expected_change = audio_bytes_len - audio_bytes_len // 2
+        assert connection.buffered_amount == expected_change
 
     @pytest.mark.asyncio
     async def test_backpressure_no_connection_returns_early(self, mock_stt, mock_pool):

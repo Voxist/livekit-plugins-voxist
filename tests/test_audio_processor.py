@@ -684,12 +684,12 @@ class TestRingBufferOptimization:
         # Get bytecode of process_audio_frame
         bytecode_output = io.StringIO()
         dis.dis(processor.process_audio_frame, file=bytecode_output)
-        bytecode_output.getvalue()
+        bytecode = bytecode_output.getvalue()
 
-        # The hot path should not contain concatenate calls
-        # (Note: This is a simple check - concatenate may still be used in
-        # cold paths like initialization or edge cases, but not in the main loop)
-        # We'll verify through performance benchmarking instead
+        # The hot path must not reference concatenate: the ring buffer
+        # replaced np.concatenate here. Cold paths (e.g. flush) may still
+        # use it, but they are separate code objects not disassembled here.
+        assert "concatenate" not in bytecode
 
     @pytest.mark.benchmark
     def test_ring_buffer_performance_improvement(self):

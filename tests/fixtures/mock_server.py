@@ -12,19 +12,24 @@ class MockVoxistServer:
     """
     Mock WebSocket server simulating Voxist API protocol.
 
-    Simulates the complete Voxist WebSocket protocol:
-    1. WebSocket connection with API key authentication
-    2. Connection confirmation message
-    3. Configuration handshake
-    4. Binary Float32 audio reception
+    Simulates the complete Voxist protocol:
+    1. HTTP token exchange: API key -> short-lived WebSocket token (SEC-001)
+    2. WebSocket connection authenticated with that token
+    3. Connection confirmation message
+    4. Binary Int16 audio reception
     5. Partial and final transcription results
     6. Done signal handling
+
+    Both the token endpoint and the WebSocket route are served on the same
+    host/port, because ConnectionPool._get_http_base_url() derives the token
+    URL from base_url by swapping the scheme and dropping the "/ws" suffix.
 
     Example:
         server = MockVoxistServer(port=8765)
         await server.start()
 
-        # Server now accepting connections at ws://localhost:8765/ws
+        # Token exchange at http://localhost:8765/websocket
+        # WebSocket at ws://localhost:8765/ws
 
         await server.stop()
     """
@@ -42,6 +47,8 @@ class MockVoxistServer:
         interim_delay_ms: int = 25,
         error_mode: str | None = None,
         on_audio_received: Callable | None = None,
+        api_key_header: str = "X-LVL-KEY",
+        ws_token: str = "mock_jwt_token",
     ):
         """
         Initialize mock Voxist server.
@@ -57,10 +64,16 @@ class MockVoxistServer:
             interim_delay_ms: Delay before sending interim result
             error_mode: Error simulation mode (None, "auth_failure", "disconnect")
             on_audio_received: Callback when audio is received (for testing)
+            api_key_header: Header carrying the API key on the token exchange
+                            (must match ConnectionPool.api_key_header)
+            ws_token: Token handed out by the token endpoint and accepted by
+                      the WebSocket route
         """
         self.port = port
         self.host = host
         self.valid_api_key = valid_api_key
+        self.api_key_header = api_key_header
+        self.ws_token = ws_token
         self.processing_delay_ms = processing_delay_ms
         self.transcription_text = transcription_text
         self.transcription_confidence = transcription_confidence
@@ -70,13 +83,43 @@ class MockVoxistServer:
         self.on_audio_received = on_audio_received
 
         self.app = web.Application()
+        self.app.router.add_get("/websocket", self.token_handler)
         self.app.router.add_get("/ws", self.websocket_handler)
         self.runner: web.AppRunner | None = None
         self.site: web.TCPSite | None = None
 
         self.connections_count = 0
+        self.token_requests_count = 0
         self.audio_frames_received = 0
         self.total_audio_bytes = 0
+
+    async def token_handler(self, request: web.Request) -> web.Response:
+        """
+        Handle the SEC-001 token exchange: API key -> WebSocket URL with token.
+
+        Contract, from ConnectionPool._get_ws_token():
+        - GET {http_base}/websocket with the API key in the api_key_header
+          header and engine=voxist-rt as a query param
+        - 401/403 means the key is invalid and must not be retried
+        - any other non-200 is a transport failure
+        - a 200 body must carry a "url" field; the pool appends lang and
+          sample_rate to it and connects there
+
+        The pool reads nothing else from the body: it caches the URL for a
+        hard-coded hour rather than honouring a server-supplied expiry, so
+        expires_in below is returned for fidelity but has no effect.
+        """
+        self.token_requests_count += 1
+
+        api_key = request.headers.get(self.api_key_header)
+
+        if self.error_mode == "auth_failure" or api_key != self.valid_api_key:
+            return web.json_response({"error": "Invalid API key"}, status=401)
+
+        return web.json_response({
+            "url": f"ws://{self.host}:{self.port}/ws?token={self.ws_token}",
+            "expires_in": 3600,
+        })
 
     async def websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
         """
@@ -85,9 +128,8 @@ class MockVoxistServer:
         Implements Voxist protocol:
         1. Authenticate via query parameter
         2. Send connection confirmation
-        3. Receive config message
-        4. Process audio frames
-        5. Send transcription results
+        3. Process audio frames
+        4. Send transcription results
         """
         ws = web.WebSocketResponse()
         await ws.prepare(request)
@@ -95,15 +137,16 @@ class MockVoxistServer:
         self.connections_count += 1
 
         try:
-            # Authenticate via query parameter (support both api_key and token)
-            api_key = request.query.get("api_key") or request.query.get("token")
+            # Authenticate via query parameter. The plugin arrives with the
+            # token issued by /websocket; api_key is still accepted so tests
+            # can drive the WebSocket route directly.
+            credential = request.query.get("api_key") or request.query.get("token")
 
             if self.error_mode == "auth_failure":
                 await ws.close(code=1008, message=b"Invalid API key")
                 return ws
 
-            # For test tokens, accept mock_jwt_token as valid
-            is_valid = api_key == self.valid_api_key or api_key == "mock_jwt_token"
+            is_valid = credential in (self.valid_api_key, self.ws_token)
             if not is_valid:
                 await ws.close(code=1008, message=b"Invalid API key")
                 return ws
@@ -111,8 +154,10 @@ class MockVoxistServer:
             # Send connection confirmation (matches your backend)
             await ws.send_json({"status": "connected"})
 
-            # Track configuration
-            config_received = False
+            # SEC-002 moved lang/sample_rate onto the WebSocket URL, so a
+            # stream is configured at handshake time and the plugin sends no
+            # config message. The legacy message is still honoured below.
+            config_received = "lang" in request.query
             audio_buffer = []
 
             # Process messages
@@ -201,7 +246,10 @@ class MockVoxistServer:
         self.site = web.TCPSite(self.runner, self.host, self.port)
         await self.site.start()
 
-        print(f"Mock Voxist server started at ws://{self.host}:{self.port}/ws")
+        print(
+            f"Mock Voxist server started at ws://{self.host}:{self.port}/ws "
+            f"(token exchange at http://{self.host}:{self.port}/websocket)"
+        )
 
     async def stop(self):
         """Stop the mock WebSocket server."""
@@ -222,6 +270,7 @@ class MockVoxistServer:
         """
         return {
             "connections_count": self.connections_count,
+            "token_requests_count": self.token_requests_count,
             "audio_frames_received": self.audio_frames_received,
             "total_audio_bytes": self.total_audio_bytes,
         }
@@ -229,6 +278,7 @@ class MockVoxistServer:
     def reset_stats(self):
         """Reset server statistics."""
         self.connections_count = 0
+        self.token_requests_count = 0
         self.audio_frames_received = 0
         self.total_audio_bytes = 0
 
@@ -278,9 +328,9 @@ class ConfigurableMockServer(MockVoxistServer):
         self.connections_count += 1
 
         try:
-            # Authenticate
-            api_key = request.query.get("api_key")
-            if api_key != self.valid_api_key:
+            # Authenticate (token issued by /websocket, or a raw key)
+            credential = request.query.get("api_key") or request.query.get("token")
+            if credential not in (self.valid_api_key, self.ws_token):
                 await ws.close(code=1008, message=b"Invalid API key")
                 return ws
 

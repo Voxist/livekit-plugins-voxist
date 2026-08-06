@@ -337,7 +337,7 @@ class VoxistSTTStream(RecognizeStream):
                     chunks = self._audio_processor.process_audio_frame(frame_bytes)
 
                     if chunks:
-                        logger.info(
+                        logger.debug(
                             f"Stream {self._session_id} got {len(chunks)} chunks"
                         )
 

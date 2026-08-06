@@ -125,11 +125,6 @@ class MockVoxistServer:
                         # Config message
                         if "config" in data:
                             config_received = True
-                            data["config"].get("lang", "fr")
-                            data["config"].get("sample_rate", 16000)
-
-                            # Log config (useful for debugging tests)
-                            # Could send acknowledgment if needed
 
                     except json.JSONDecodeError:
                         # Handle "Done" string

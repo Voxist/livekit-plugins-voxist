@@ -1,6 +1,8 @@
 """Unit tests for logging configuration and SEC-007 sanitization."""
 
 import logging
+import re
+import sys
 
 import pytest
 
@@ -145,6 +147,103 @@ class TestSanitizingFilter:
         assert "Bearer ***" in record.msg
         assert "api_key=***REDACTED***" in record.msg
 
+    def test_sanitize_percent_style_string_args(self, log_filter):
+        """Test lazy %-style string arguments are sanitized (SEC-007)."""
+        record = logging.LogRecord(
+            name="test",
+            level=logging.ERROR,
+            pathname="test.py",
+            lineno=1,
+            msg="Handshake failed for %s (attempt %d)",
+            args=("wss://api.voxist.com/ws?api_key=secret123&lang=fr", 2),
+            exc_info=None,
+        )
+        log_filter.filter(record)
+        rendered = record.getMessage()
+        assert "secret123" not in rendered
+        assert "api_key=***REDACTED***" in rendered
+        assert "lang=fr" in rendered
+        assert "(attempt 2)" in rendered
+
+    def test_sanitize_mapping_args(self, log_filter):
+        """Test %(name)s-style mapping arguments are sanitized."""
+        record = logging.LogRecord(
+            name="test",
+            level=logging.ERROR,
+            pathname="test.py",
+            lineno=1,
+            msg="Connecting to %(url)s",
+            args=({"url": "ws://localhost/ws?token=abc123xyz"},),
+            exc_info=None,
+        )
+        log_filter.filter(record)
+        rendered = record.getMessage()
+        assert "abc123xyz" not in rendered
+        assert "token=***" in rendered
+
+    def test_sanitize_exception_traceback(self, log_filter):
+        """Test exc_info tracebacks are sanitized via exc_text (SEC-007)."""
+        try:
+            raise ValueError(
+                "handshake failed: ws://localhost/ws?token=eyJabc.def.ghi"
+            )
+        except ValueError:
+            exc_info = sys.exc_info()
+
+        record = logging.LogRecord(
+            name="test",
+            level=logging.ERROR,
+            pathname="test.py",
+            lineno=1,
+            msg="connection error",
+            args=(),
+            exc_info=exc_info,
+        )
+        log_filter.filter(record)
+
+        assert record.exc_text is not None
+        assert "eyJabc" not in record.exc_text
+        assert "token=***" in record.exc_text
+
+        # A standard Formatter must emit the sanitized traceback
+        formatted = logging.Formatter().format(record)
+        assert "eyJabc" not in formatted
+        assert "token=***" in formatted
+
+    def test_non_string_msg_preserved(self, log_filter):
+        """Test non-string msg objects are not coerced to str.
+
+        Structured-logging handlers (e.g. JSON formatters) may rely on
+        record.msg keeping its original type.
+        """
+        payload = {"event": "connected", "lang": "fr"}
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg=payload,
+            args=(),
+            exc_info=None,
+        )
+        log_filter.filter(record)
+        assert record.msg is payload
+
+    def test_non_string_args_preserved(self, log_filter):
+        """Test non-string args keep their types for %d/%f formatting."""
+        record = logging.LogRecord(
+            name="test",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg="Processed %d frames in %.2fs",
+            args=(42, 1.5),
+            exc_info=None,
+        )
+        log_filter.filter(record)
+        assert record.args == (42, 1.5)
+        assert record.getMessage() == "Processed 42 frames in 1.50s"
+
     def test_no_sanitization_needed(self, log_filter):
         """Test messages without sensitive data pass through unchanged."""
         record = logging.LogRecord(
@@ -180,17 +279,37 @@ class TestSanitizingFilter:
         assert hasattr(SanitizingFilter, "SANITIZE_PATTERNS")
         assert len(SanitizingFilter.SANITIZE_PATTERNS) >= 5
 
+    def test_sanitize_patterns_precompiled(self):
+        """Test patterns are compiled once, not re-parsed per record."""
+        for pattern, replacement in SanitizingFilter.SANITIZE_PATTERNS:
+            assert isinstance(pattern, re.Pattern)
+            assert isinstance(replacement, str)
+
 
 class TestLoggerConfiguration:
     """Test logger setup and configuration."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_fallback_handler(self):
+        """Remove any fallback handler set_log_level may have attached."""
+        yield
+        import livekit.plugins.voxist.log as log_module
+
+        if log_module._fallback_handler is not None:
+            logger.removeHandler(log_module._fallback_handler)
+            log_module._fallback_handler = None
 
     def test_logger_name(self):
         """Test logger has correct name."""
         assert logger.name == "livekit.plugins.voxist"
 
-    def test_logger_default_level(self):
-        """Test logger default level is INFO."""
-        assert logger.level == logging.INFO
+    def test_logger_level_defers_to_application(self):
+        """Test logger level is NOTSET so root-level config applies.
+
+        With NOTSET, logging.basicConfig(level=DEBUG) in the application
+        surfaces the plugin's debug logs without plugin-specific setup.
+        """
+        assert logger.level == logging.NOTSET
 
     def test_logger_has_sanitizing_filter(self):
         """Test logger has SanitizingFilter installed."""
@@ -204,10 +323,12 @@ class TestLoggerConfiguration:
         """Test logger propagates to root logger."""
         assert logger.propagate is True
 
-    def test_no_console_handler(self):
-        """Test logger does not have its own console handler."""
-        # Logger should not have direct handlers - logs propagate to root
-        assert len(logger.handlers) == 0
+    def test_only_null_handler_by_default(self):
+        """Test logger has no real handlers by default - logs propagate."""
+        assert all(
+            isinstance(handler, logging.NullHandler)
+            for handler in logger.handlers
+        )
 
     def test_set_log_level_valid(self):
         """Test set_log_level accepts valid levels."""
@@ -231,11 +352,53 @@ class TestLoggerConfiguration:
         with pytest.raises(ValueError, match="Invalid log level"):
             set_log_level("INVALID")
 
+    def test_set_log_level_attaches_fallback_when_unconfigured(self):
+        """Test set_log_level produces visible output without app config.
+
+        In an application that never configured logging, records would
+        otherwise be swallowed by logging.lastResort (WARNING+ only).
+        """
+        import livekit.plugins.voxist.log as log_module
+
+        root = logging.getLogger()
+        saved_root_handlers = root.handlers[:]
+        original_level = logger.level
+        root.handlers = []
+        try:
+            set_log_level("DEBUG")
+
+            fallback = log_module._fallback_handler
+            assert fallback is not None
+            assert fallback in logger.handlers
+            # The fallback handler must also sanitize (covers records
+            # propagated from child loggers, which skip logger filters)
+            assert any(
+                isinstance(f, SanitizingFilter) for f in fallback.filters
+            )
+        finally:
+            root.handlers = saved_root_handlers
+            logger.setLevel(original_level)
+
+    def test_set_log_level_no_fallback_when_app_configured(self):
+        """Test no duplicate handler is added when the app configured logging."""
+        import livekit.plugins.voxist.log as log_module
+
+        root = logging.getLogger()
+        saved_root_handlers = root.handlers[:]
+        original_level = logger.level
+        root.handlers = [logging.StreamHandler()]
+        try:
+            set_log_level("INFO")
+            assert log_module._fallback_handler is None
+        finally:
+            root.handlers = saved_root_handlers
+            logger.setLevel(original_level)
+
 
 class TestLogSanitizationIntegration:
     """Integration tests for log sanitization in real logging scenarios."""
 
-    def test_actual_log_message_sanitized(self, caplog):
+    def test_actual_log_message_sanitized(self):
         """Test that actual log output is sanitized."""
         import io
 
@@ -263,7 +426,7 @@ class TestLogSanitizationIntegration:
             logger.removeHandler(test_handler)
             logger.setLevel(original_level)
 
-    def test_debug_log_with_voxist_key_sanitized(self, caplog):
+    def test_debug_log_with_voxist_key_sanitized(self):
         """Test DEBUG level logs sanitize voxist keys."""
         import io
 
@@ -283,6 +446,58 @@ class TestLogSanitizationIntegration:
             output = string_buffer.getvalue()
             assert "voxist_test_key_12345" not in output
             assert "voxist_***" in output
+        finally:
+            logger.removeHandler(test_handler)
+            logger.setLevel(original_level)
+
+    def test_lazy_args_sanitized_end_to_end(self):
+        """Test %-style lazy formatting is sanitized in real log output."""
+        import io
+
+        string_buffer = io.StringIO()
+        test_handler = logging.StreamHandler(string_buffer)
+        test_handler.setLevel(logging.ERROR)
+
+        logger.addHandler(test_handler)
+        original_level = logger.level
+        logger.setLevel(logging.ERROR)
+
+        try:
+            logger.error(
+                "Handshake failed for %s",
+                "wss://api.voxist.com/ws?token=eyJhbGciOiJIUzI1NiJ9.p.s",
+            )
+
+            output = string_buffer.getvalue()
+            assert "eyJhbGciOiJIUzI1NiJ9" not in output
+            assert "token=***" in output
+        finally:
+            logger.removeHandler(test_handler)
+            logger.setLevel(original_level)
+
+    def test_exception_traceback_sanitized_end_to_end(self):
+        """Test exc_info tracebacks are sanitized in real log output."""
+        import io
+
+        string_buffer = io.StringIO()
+        test_handler = logging.StreamHandler(string_buffer)
+        test_handler.setLevel(logging.ERROR)
+
+        logger.addHandler(test_handler)
+        original_level = logger.level
+        logger.setLevel(logging.ERROR)
+
+        try:
+            try:
+                raise RuntimeError(
+                    "auth rejected for ws://test.com?api_key=supersecret99"
+                )
+            except RuntimeError:
+                logger.exception("Connection failed")
+
+            output = string_buffer.getvalue()
+            assert "supersecret99" not in output
+            assert "api_key=***REDACTED***" in output
         finally:
             logger.removeHandler(test_handler)
             logger.setLevel(original_level)

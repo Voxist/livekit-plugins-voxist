@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import ssl
 import time
+from base64 import urlsafe_b64decode
+from binascii import Error as BinasciiError
 from typing import cast
+from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
 
@@ -113,6 +117,8 @@ class ConnectionPool:
         self.connections: list[Connection] = []
         self.current_index = 0
         self._lock = asyncio.Lock()
+        # Strong references to in-flight reconnect tasks (see _spawn_reconnect)
+        self._reconnect_tasks: set[asyncio.Task] = set()
         self._initialized = False
         self._heartbeat_task: asyncio.Task | None = None
         self._session: aiohttp.ClientSession | None = None
@@ -140,6 +146,88 @@ class ConnectionPool:
     def is_initialized(self) -> bool:
         """Check if the connection pool has been initialized."""
         return self._initialized
+
+    async def mark_broken(self, conn: Connection) -> None:
+        """
+        Retire a connection a stream found unusable, and reconnect it.
+
+        Called when a send or receive stalled: the socket is not closed, so
+        nothing else can tell it apart from a healthy one, and returning it to
+        the pool would hand the stall to the next stream.
+
+        The stream must not set ConnectionState itself. Doing so made
+        release_connection() skip its IN_USE branch entirely, so no reconnect
+        was ever scheduled and recovery waited on the next heartbeat tick.
+
+        Args:
+            conn: The connection to retire
+        """
+        async with self._lock:
+            if conn.state == ConnectionState.CLOSED:
+                return  # already retired
+            conn.state = ConnectionState.CLOSED
+            conn.buffered_amount = 0
+            logger.warning(f"Connection {conn.id} marked broken, will reconnect")
+
+        self._spawn_reconnect(conn)
+
+    def _spawn_reconnect(
+        self, conn: Connection, state_already_set: bool = False
+    ) -> None:
+        """
+        Schedule a reconnect, unless the pool is shutting down.
+
+        Guarded on _closing: without it, a connection released during aclose()
+        starts a reconnect chain against an already-closed ClientSession, which
+        retries with backoff for minutes after shutdown returned. The task
+        reference is held so it is not garbage collected mid-flight.
+        """
+        if self._closing:
+            logger.debug(
+                f"Connection {conn.id} not reconnecting - pool is closing"
+            )
+            return
+
+        task = asyncio.create_task(
+            self._reconnect(conn, state_already_set=state_already_set)
+        )
+        self._reconnect_tasks.add(task)
+        task.add_done_callback(self._reconnect_tasks.discard)
+
+    def _usable_ready(self, reconnect_dead: bool) -> list[Connection]:
+        """
+        READY connections whose WebSocket is actually open.
+
+        Filtering on state alone was not enough: a pooled socket closed by the
+        server (or by aiohttp after a missed pong) stays READY until the
+        heartbeat loop notices, and handing one out produced a session that sent
+        every chunk into a closed socket, received nothing, and completed with no
+        transcripts, no exception and no reconnect.
+
+        Caller must hold self._lock.
+
+        Args:
+            reconnect_dead: Retire and reconnect the dead ones found. False when
+                called from a path that must not mutate state.
+
+        Returns:
+            The usable READY connections, in pool order.
+        """
+        usable = []
+        for conn in self.connections:
+            if conn.state != ConnectionState.READY:
+                continue
+            if conn.ws is None or conn.ws.closed:
+                if reconnect_dead:
+                    logger.warning(
+                        f"Connection {conn.id} was READY with a closed socket, "
+                        "retiring it instead of handing it out"
+                    )
+                    conn.state = ConnectionState.CLOSED
+                    self._spawn_reconnect(conn)
+                continue
+            usable.append(conn)
+        return usable
 
     def _select_round_robin(self, ready_conns: list[Connection]) -> Connection:
         """
@@ -286,6 +374,48 @@ class ConnectionPool:
 
         return url
 
+    @staticmethod
+    def _token_expiry_from_url(token_url: str, now: float) -> float:
+        """
+        Read the token's expiry from its JWT `exp` claim.
+
+        The token-exchange response carries only a `url`, so the expiry has to
+        come from the JWT embedded in it. Only the payload is decoded, purely to
+        schedule the refresh - this is not a security check and the signature is
+        deliberately not verified (the server enforces that).
+
+        Falls back to one hour when the claim cannot be read, which is the
+        current server-side lifetime.
+
+        Args:
+            token_url: WebSocket URL containing a `token` query parameter
+            now: Current timestamp to base the fallback on
+
+        Returns:
+            Absolute expiry timestamp.
+        """
+        fallback = now + 3600.0
+        try:
+            query = urlsplit(token_url).query
+            token = parse_qs(query).get("token", [""])[0]
+            payload_segment = token.split(".")[1]
+            # JWT uses base64url without padding
+            padded = payload_segment + "=" * (-len(payload_segment) % 4)
+            claims = json.loads(urlsafe_b64decode(padded))
+            exp = float(claims["exp"])
+        except (IndexError, KeyError, ValueError, TypeError, BinasciiError):
+            logger.debug(
+                "Could not read exp from the WebSocket token; assuming a "
+                "1 hour lifetime"
+            )
+            return fallback
+
+        if exp <= now:
+            logger.warning(
+                "WebSocket token is already expired according to its exp claim"
+            )
+        return exp
+
     async def _get_ws_token(self, language: str, sample_rate: int) -> str:
         """
         Exchange API key for short-lived WebSocket token via HTTPS.
@@ -370,7 +500,13 @@ class ConnectionPool:
                 # Cache the token URL (valid for 1 hour, we refresh 5 min early)
                 async with self._token_lock:
                     self._ws_token_url = token_url
-                    self._token_expires_at = current_time + 3600  # 1 hour
+                    # Use the expiry the server actually issued. The JWT's own
+                    # `exp` claim is authoritative; hard-coding an hour
+                    # duplicates a constant that lives in the backend, so a
+                    # shorter-lived token would be reused until it failed.
+                    self._token_expires_at = self._token_expiry_from_url(
+                        token_url, current_time
+                    )
 
                 logger.debug("WebSocket token obtained successfully")
 
@@ -497,10 +633,7 @@ class ConnectionPool:
         """
         # Phase 1: Quick check for ready connection (hold lock briefly)
         async with self._lock:
-            ready_conns = [
-                c for c in self.connections
-                if c.state == ConnectionState.READY
-            ]
+            ready_conns = self._usable_ready(reconnect_dead=True)
 
             if ready_conns:
                 conn = self._select_round_robin(ready_conns)
@@ -544,10 +677,7 @@ class ConnectionPool:
                             f"Connection {wait_conn.id} state changed to {wait_conn.state.value} "
                             f"during wait, checking for alternatives"
                         )
-                        ready_conns = [
-                            c for c in self.connections
-                            if c.state == ConnectionState.READY
-                        ]
+                        ready_conns = self._usable_ready(reconnect_dead=False)
                         if ready_conns:
                             conn = self._select_round_robin(ready_conns)
                             conn.state = ConnectionState.IN_USE
@@ -571,7 +701,7 @@ class ConnectionPool:
                 if conn_to_reconnect.state in (ConnectionState.FAILED, ConnectionState.CLOSED):
                     conn_to_reconnect.state = ConnectionState.RECONNECTING
                     logger.info(f"Triggering reconnection for connection {conn_to_reconnect.id}")
-                    asyncio.create_task(self._reconnect(conn_to_reconnect, state_already_set=True))
+                    self._spawn_reconnect(conn_to_reconnect, state_already_set=True)
 
                 # Don't wait for reconnection, fail fast
                 # Application can retry get_connection() in a moment
@@ -623,7 +753,7 @@ class ConnectionPool:
                     logger.debug(f"Released connection {conn.id}")
 
         if needs_reconnect:
-            asyncio.create_task(self._reconnect(conn))
+            self._spawn_reconnect(conn)
 
     async def _wait_for_ready(self, conn: Connection) -> None:
         """
@@ -766,7 +896,7 @@ class ConnectionPool:
                 else:
                     # Retry again if not at max attempts
                     if conn.retry_count < self.max_reconnect_attempts:
-                        asyncio.create_task(self._reconnect(conn))
+                        self._spawn_reconnect(conn)
                     else:
                         logger.error(f"Connection {conn.id} failed all reconnect attempts")
                         conn.state = ConnectionState.FAILED
@@ -781,7 +911,7 @@ class ConnectionPool:
                 logger.error(f"Connection {conn.id} reconnect error: {e}")
                 # Retry again if not at max attempts
                 if conn.retry_count < self.max_reconnect_attempts:
-                    asyncio.create_task(self._reconnect(conn))
+                    self._spawn_reconnect(conn)
                 else:
                     conn.state = ConnectionState.FAILED
 
@@ -803,32 +933,39 @@ class ConnectionPool:
                 current_time = time.time()
 
                 for conn in self.connections:
-                    # Only READY connections are staleness-checked. An IN_USE
-                    # connection belongs to a live stream, which refreshes
-                    # last_heartbeat on every message received and has its own
-                    # RECEIVE_TIMEOUT_SECONDS watchdog; judging it stale here
-                    # would tear down a socket that is actively carrying audio.
+                    # Reconnect idle connections whose socket has died.
+                    #
+                    # Liveness is judged on ws.closed, not on an elapsed-time
+                    # threshold. aiohttp already does the probing: `heartbeat`
+                    # sends pings and closes the WebSocket when a pong does not
+                    # arrive, so a dead peer surfaces as ws.closed. The previous
+                    # elapsed-time check could never fire - the branch that
+                    # refreshed last_heartbeat ran on every tick for any
+                    # connection whose ws was open, so the interval it compared
+                    # against never grew past one tick. It also compared
+                    # wall-clock stamps, so an NTP correction read as idle time
+                    # and tore down every connection at once.
+                    #
+                    # IN_USE connections are left alone: they belong to a live
+                    # stream with its own RECEIVE_TIMEOUT_SECONDS watchdog, which
+                    # retires the connection through mark_broken().
                     if conn.state == ConnectionState.READY:
-                        time_since_heartbeat = current_time - conn.last_heartbeat
-
-                        if time_since_heartbeat > 90:
-                            # No heartbeat in 90s (3x interval) - connection is stale
+                        if conn.ws is None or conn.ws.closed:
                             logger.warning(
-                                f"Connection {conn.id} stale "
-                                f"(no heartbeat for {time_since_heartbeat:.0f}s), reconnecting"
+                                f"Connection {conn.id} socket closed while idle, "
+                                "reconnecting"
                             )
-                            conn.state = ConnectionState.FAILED
-                            asyncio.create_task(self._reconnect(conn))
-
-                        elif conn.ws and not conn.ws.closed:
-                            # Update heartbeat timestamp (aiohttp handles ping/pong)
+                            conn.state = ConnectionState.CLOSED
+                            self._spawn_reconnect(conn)
+                        else:
+                            # Diagnostic only - nothing gates on this value.
                             conn.last_heartbeat = current_time
 
                     # Opportunistically reconnect failed connections
-                    elif conn.state == ConnectionState.FAILED:
+                    elif conn.state in (ConnectionState.FAILED, ConnectionState.CLOSED):
                         if conn.retry_count < self.max_reconnect_attempts:
                             logger.debug(f"Heartbeat triggering reconnect for connection {conn.id}")
-                            asyncio.create_task(self._reconnect(conn))
+                            self._spawn_reconnect(conn)
 
                 # Log pool health periodically
                 if logger.isEnabledFor(10):  # DEBUG level

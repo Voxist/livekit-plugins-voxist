@@ -5,9 +5,9 @@ import time
 
 import numpy as np
 import pytest
+from livekit.agents.stt import SpeechEventType
 
 from livekit import rtc
-from livekit.agents.stt import SpeechEventType
 from livekit.plugins.voxist import VoxistSTT
 
 from .fixtures.mock_server import MockVoxistServer

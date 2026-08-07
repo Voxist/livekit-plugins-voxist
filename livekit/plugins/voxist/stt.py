@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import ssl
+import weakref
 from enum import Enum
 
 import aiohttp
@@ -17,6 +19,9 @@ from .exceptions import (
     ConfigurationError,
     InitializationError,
     LanguageNotSupportedError,
+)
+from .exceptions import (
+    ConnectionError as VoxistConnectionError,
 )
 from .log import logger
 from .models import SUPPORTED_LANGUAGES, validate_language_format
@@ -117,12 +122,21 @@ class VoxistSTT(STT):
             sample_rate: Audio sample rate in Hz (default: 16000)
             base_url: WebSocket endpoint URL
             interim_results: Enable partial transcription results
-            connection_pool_size: Number of persistent connections (2-3 recommended)
-            connection_timeout: Connection timeout in seconds
-            heartbeat_interval: Ping/pong interval in seconds
+            connection_pool_size: Accepted for backwards compatibility and
+                IGNORED. There is no pool: the gateway closes every socket at
+                end of session, so each stream dials its own. Passing a
+                non-default value logs a deprecation warning.
+            connection_timeout: Bound, in seconds, on both the HTTPS token
+                exchange and the WebSocket dial (default: 10.0).
+            heartbeat_interval: WebSocket ping/pong interval in seconds.
+                Still honoured: it is passed to aiohttp's heartbeat, which is
+                how a dead transport is detected during long silences.
             chunk_duration_ms: Audio chunk size in milliseconds
             stride_overlap_ms: Chunk overlap for boundary accuracy
-            max_reconnect_attempts: Max reconnection attempts per connection
+            max_reconnect_attempts: Accepted for backwards compatibility and
+                IGNORED. Retries are owned by livekit's own machinery
+                (conn_options.max_retry on stream()). Passing a non-default
+                value logs a deprecation warning.
             enable_metrics: Emit LiveKit metrics events
             http_session: Optional aiohttp session (for advanced use)
             api_key_header: HTTP header name for API key (default: X-LVL-KEY)
@@ -183,6 +197,22 @@ class VoxistSTT(STT):
                 f"chunk_duration_ms must be 50-500ms, got {chunk_duration_ms}"
             )
 
+        # No silent lies about dead parameters: both are accepted only for
+        # backwards compatibility, and a caller passing a non-default value
+        # is told so once, here, instead of wondering why it has no effect.
+        if connection_pool_size != 2:
+            logger.warning(
+                f"connection_pool_size={connection_pool_size} is deprecated "
+                "and ignored: there is no connection pool (one socket per "
+                "stream, dialed on demand)"
+            )
+        if max_reconnect_attempts != 10:
+            logger.warning(
+                f"max_reconnect_attempts={max_reconnect_attempts} is "
+                "deprecated and ignored: retries are owned by livekit "
+                "(conn_options.max_retry on stream())"
+            )
+
         # Store configuration
         self._config = {
             "language": language,
@@ -205,9 +235,18 @@ class VoxistSTT(STT):
         self._ssl_context = ssl_context
         self._api_key_header = api_key_header
         self._heartbeat_interval = heartbeat_interval
+        self._connection_timeout = connection_timeout
         self._owns_session = http_session is None
         self._dialer: VoxistDialer | None = None
         self._dialer_lock = asyncio.Lock()
+        self._closed = False
+
+        # Live streams, tracked weakly so a stream that ends normally
+        # disappears on its own. aclose() closes these BEFORE the shared
+        # HTTP session: closing the session first left live streams to
+        # redial on a closed session and crash with an unmapped
+        # RuntimeError('Session is closed').
+        self._live_streams: weakref.WeakSet[VoxistSTTStream] = weakref.WeakSet()
 
         # Task lifecycle tracking (QUAL-002: asr-all-dxe)
         self._init_task: asyncio.Task | None = None
@@ -216,7 +255,7 @@ class VoxistSTT(STT):
 
         logger.info(
             f"VoxistSTT initialized: language={language}, "
-            f"pool_size={connection_pool_size}, sample_rate={sample_rate}"
+            f"sample_rate={sample_rate}, connection_timeout={connection_timeout}"
         )
 
         # Pre-warm connections asynchronously (non-blocking)
@@ -224,6 +263,12 @@ class VoxistSTT(STT):
         try:
             loop = asyncio.get_running_loop()
             self._init_task = loop.create_task(self._initialize_pool())
+            # The task re-raises AuthenticationError so an awaiter sees the
+            # true cause, but nobody is REQUIRED to await it - without this
+            # callback, an unawaited failed init surfaces as a GC-time
+            # "Task exception was never retrieved" even though the failure
+            # is already recorded in _init_error/_init_state.
+            self._init_task.add_done_callback(self._retrieve_init_exception)
             logger.debug("Background initialization task created")
         except RuntimeError:
             # No running event loop (e.g., in tests)
@@ -231,9 +276,80 @@ class VoxistSTT(STT):
             self._init_state = InitializationState.NOT_STARTED
             logger.debug("No running event loop, pool will initialize on demand")
 
+    @staticmethod
+    def _retrieve_init_exception(task: asyncio.Task) -> None:
+        """Retrieve (and debug-log) the init task's exception so GC never
+        reports it as unretrieved. The failure itself is already surfaced
+        through initialization_state / initialization_error."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.debug(
+                f"Background initialization failed: {exc!r} (already "
+                "recorded in initialization_state/initialization_error)"
+            )
+
+    @staticmethod
+    def _session_loop(
+        session: aiohttp.ClientSession,
+    ) -> asyncio.AbstractEventLoop | None:
+        """The loop an aiohttp session is bound to, or None if undeterminable."""
+        loop = getattr(session, "_loop", None)
+        return loop if isinstance(loop, asyncio.AbstractEventLoop) else None
+
     async def _ensure_dialer(self) -> VoxistDialer:
-        """Create the HTTP session and dialer on first use, in a running loop."""
+        """
+        Create the HTTP session and dialer on first use, in a running loop.
+
+        aiohttp binds a ClientSession to whichever loop first uses it; a
+        stream running in a DIFFERENT loop (multiple asyncio.run calls, test
+        loops, thread-per-loop servers) would die with an unmapped
+        RuntimeError('Event loop is closed'). When the session is plugin-
+        owned, that situation is repaired transparently by building a fresh
+        session for the current loop; a caller-supplied session is theirs,
+        so it is never replaced - a clear mapped error is raised instead.
+        """
         async with self._dialer_lock:
+            if self._closed:
+                # A stream retry racing aclose() must fail as a mapped,
+                # retryable error - NOT resurrect a fresh session after
+                # shutdown, and not crash with a raw RuntimeError.
+                raise VoxistConnectionError(
+                    "VoxistSTT is closed; cannot dial"
+                )
+
+            running = asyncio.get_running_loop()
+            if self._session is not None:
+                bound_loop = self._session_loop(self._session)
+                unusable = self._session.closed or (
+                    bound_loop is not None
+                    and (bound_loop.is_closed() or bound_loop is not running)
+                )
+                if unusable:
+                    if not self._owns_session:
+                        raise VoxistConnectionError(
+                            "the caller-supplied http_session is closed or "
+                            "bound to a different event loop; it is not "
+                            "plugin-owned, so it will not be replaced"
+                        )
+                    old, old_loop = self._session, bound_loop
+                    self._session = None
+                    self._dialer = None
+                    if not old.closed:
+                        if old_loop is running:
+                            await old.close()
+                        else:
+                            # Bound to a foreign (usually already-closed)
+                            # loop: it cannot be awaited-closed from here.
+                            # Dropping it leaks at most its idle connector,
+                            # once, and is logged rather than hidden.
+                            logger.warning(
+                                "Dropping the plugin-owned HTTP session "
+                                "bound to a defunct event loop; it cannot "
+                                "be closed from the current loop"
+                            )
+
             if self._dialer is None:
                 assert self._api_key is not None  # validated in __init__
                 if self._session is None:
@@ -246,6 +362,7 @@ class VoxistSTT(STT):
                     api_key_header=self._api_key_header,
                     ssl_context=self._ssl_context,
                     heartbeat_interval=self._heartbeat_interval,
+                    connection_timeout=self._connection_timeout,
                 )
             return self._dialer
 
@@ -340,13 +457,18 @@ class VoxistSTT(STT):
         # Ensure stream_language is str (from language or config)
         assert isinstance(stream_language, str)
 
-        return VoxistSTTStream(
+        stream = VoxistSTTStream(
             stt=self,
             config=self._config,
             language=stream_language,
             conn_options=conn_options if conn_options is not None else APIConnectOptions(),
             enable_metrics=self._enable_metrics,
         )
+        # Tracked weakly so aclose() can shut live streams down BEFORE the
+        # shared HTTP session goes away (see aclose); streams that finish on
+        # their own drop out of the set automatically.
+        self._live_streams.add(stream)
+        return stream
 
     async def _recognize_impl(  # type: ignore[override]
         self,
@@ -373,10 +495,15 @@ class VoxistSTT(STT):
         """
         Cleanup plugin resources.
 
-        Cancels pending initialization task and closes all WebSocket
-        connections in the pool gracefully.
+        Order matters: live streams are closed BEFORE the shared HTTP
+        session. Closing the session first left running streams to retry
+        their dial on a closed session and crash with an unmapped
+        RuntimeError('Session is closed') instead of ending cleanly.
         """
         logger.info("Closing VoxistSTT plugin")
+        # From here on, _ensure_dialer refuses to build a new session, so a
+        # stream retry racing this shutdown dies as a mapped ConnectionError.
+        self._closed = True
 
         # Cancel pending initialization task if running (QUAL-HIGH: asr-all-cga)
         if self._init_task is not None and not self._init_task.done():
@@ -385,6 +512,14 @@ class VoxistSTT(STT):
                 await self._init_task
             except asyncio.CancelledError:
                 logger.debug("Initialization task cancelled")
+
+        # Close live streams first (RecognizeStream.aclose closes the input
+        # channel and cancels _main_task, which tears down the socket).
+        # A stream may have been closed concurrently by its owner; that is
+        # not this shutdown's failure to report.
+        for stream in list(self._live_streams):
+            with contextlib.suppress(Exception):
+                await stream.aclose()
 
         await super().aclose()
 

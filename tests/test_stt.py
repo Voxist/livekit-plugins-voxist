@@ -1,9 +1,12 @@
 """Unit tests for VoxistSTT main plugin class."""
 
 import asyncio
+import contextlib
+import logging
 import os
 from unittest.mock import AsyncMock, Mock, patch
 
+import aiohttp
 import pytest
 from livekit.agents.stt import STTCapabilities
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions
@@ -12,6 +15,9 @@ from livekit.plugins.voxist import VoxistSTT
 from livekit.plugins.voxist.exceptions import (
     ConfigurationError,
     LanguageNotSupportedError,
+)
+from livekit.plugins.voxist.exceptions import (
+    ConnectionError as VoxistConnectionError,
 )
 from livekit.plugins.voxist.models import (
     SUPPORTED_LANGUAGES,
@@ -976,4 +982,251 @@ class TestShutdownAndTLSConfiguration:
         dialer = await stt._ensure_dialer()
         assert dialer._ssl_param() is ctx
 
+        await stt.aclose()
+
+
+class TestAcloseWithLiveStreams:
+    """
+    aclose() must shut live streams down BEFORE the shared HTTP session:
+    closing the session first left a retrying stream to dial a closed
+    session and crash with an unmapped RuntimeError('Session is closed').
+    """
+
+    @pytest.mark.asyncio
+    async def test_streams_are_closed_before_the_session(self):
+        stt = VoxistSTT(api_key="test_key")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        order = []
+
+        fake_stream = AsyncMock()
+        fake_stream.aclose = AsyncMock(side_effect=lambda: order.append("stream"))
+        stt._live_streams.add(fake_stream)
+
+        session = AsyncMock()
+        session.closed = False
+        session.close = AsyncMock(side_effect=lambda: order.append("session"))
+        stt._session = session
+        stt._owns_session = True
+
+        await stt.aclose()
+
+        assert order == ["stream", "session"]
+
+    @pytest.mark.asyncio
+    async def test_stream_registers_itself_for_shutdown(self):
+        stt = VoxistSTT(api_key="test_key", base_url="ws://127.0.0.1:9/ws")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        stream = stt.stream(
+            conn_options=APIConnectOptions(
+                max_retry=0, retry_interval=0.1, timeout=1.0
+            )
+        )
+        try:
+            assert stream in stt._live_streams
+        finally:
+            await stream.aclose()
+            # retrieve the failed dial's exception so it never hits GC
+            if stream._task.done() and not stream._task.cancelled():
+                with contextlib.suppress(Exception):
+                    stream._task.exception()
+            await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_dial_after_aclose_is_a_mapped_error(self):
+        """Belt and braces: a stream retry racing shutdown must die as our
+        ConnectionError (mapped to a retryable APIError by the stream), not
+        resurrect a fresh session or crash with a RuntimeError."""
+        stt = VoxistSTT(api_key="test_key")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+        await stt.aclose()
+
+        with pytest.raises(VoxistConnectionError, match="closed"):
+            await stt._ensure_dialer()
+
+    @pytest.mark.asyncio
+    async def test_dialer_maps_closed_session_instead_of_runtime_error(self):
+        """The dialer itself must never let aiohttp's raw
+        RuntimeError('Session is closed') escape a dial."""
+        stt = VoxistSTT(api_key="test_key")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        dialer = await stt._ensure_dialer()
+        # the session dies under the dialer without aclose() being involved
+        await stt._session.close()
+
+        with pytest.raises(VoxistConnectionError):
+            await dialer.dial("fr", 16000)
+
+        stt._closed = True  # skip resurrection paths in aclose
+        await stt.aclose()
+
+
+class TestSessionLoopAffinity:
+    """
+    aiohttp binds a ClientSession to the loop that first uses it. A stream
+    in a different loop must not die with RuntimeError('Event loop is
+    closed') - a plugin-owned session is rebuilt for the current loop; a
+    caller-supplied one is theirs, so it is a clear mapped error instead.
+    """
+
+    def test_owned_session_is_rebuilt_for_a_new_loop(self):
+        stt = VoxistSTT(api_key="test_key")  # no loop: init on demand
+
+        async def ensure():
+            await stt._ensure_dialer()
+            return stt._session, stt._dialer
+
+        first_session, first_dialer = asyncio.run(ensure())
+        # loop 1 is now closed; the session is stranded on it
+
+        second_session, second_dialer = asyncio.run(ensure())
+        assert second_session is not first_session, (
+            "the plugin-owned session must be rebuilt for the new loop"
+        )
+        assert second_dialer is not first_dialer
+
+        async def close():
+            await stt.aclose()
+
+        asyncio.run(close())
+
+    def test_user_session_on_dead_loop_raises_mapped_error(self):
+        async def make_session():
+            return aiohttp.ClientSession()
+
+        session = asyncio.run(make_session())
+        # the caller's session is now bound to a closed loop
+        stt = VoxistSTT(api_key="test_key", http_session=session)
+
+        async def ensure():
+            await stt._ensure_dialer()
+
+        with pytest.raises(VoxistConnectionError, match="http_session"):
+            asyncio.run(ensure())
+
+        # not plugin-owned: it must never have been replaced
+        assert stt._session is session
+
+        async def cleanup():
+            with contextlib.suppress(Exception):
+                await session.close()
+
+        asyncio.run(cleanup())
+
+
+class TestDeadAndLiveParameters:
+    """connection_timeout must actually take effect; genuinely dead
+    parameters must say so instead of silently lying."""
+
+    @pytest.mark.asyncio
+    async def test_connection_timeout_reaches_the_dialer(self):
+        stt = VoxistSTT(api_key="test_key", connection_timeout=3.3)
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        dialer = await stt._ensure_dialer()
+        assert dialer._connection_timeout == 3.3
+
+        await stt.aclose()
+
+    def test_non_default_dead_params_warn(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            VoxistSTT(
+                api_key="test_key",
+                connection_pool_size=3,
+                max_reconnect_attempts=5,
+            )
+
+        messages = [r.message for r in caplog.records]
+        assert any(
+            "connection_pool_size" in m and "ignored" in m for m in messages
+        )
+        assert any(
+            "max_reconnect_attempts" in m and "ignored" in m for m in messages
+        )
+
+    def test_default_params_do_not_warn(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            VoxistSTT(api_key="test_key")
+
+        assert not any("ignored" in r.message for r in caplog.records)
+
+
+class TestInitTaskExceptionRetrieval:
+    """
+    The background init task re-raises AuthenticationError for awaiting
+    callers, but nobody is required to await it - the failure must still be
+    retrieved (it is already surfaced via initialization_state) instead of
+    becoming a GC-time 'Task exception was never retrieved'.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_init_exception_is_retrieved_by_callback(
+        self, monkeypatch, caplog
+    ):
+        from livekit.plugins.voxist.connection import VoxistDialer
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+        from livekit.plugins.voxist.stt import InitializationState
+
+        async def boom(self):
+            raise AuthenticationError("revoked key")
+
+        monkeypatch.setattr(VoxistDialer, "_get_token_url", boom)
+
+        with caplog.at_level(logging.DEBUG, logger="livekit.plugins.voxist"):
+            stt = VoxistSTT(api_key="test_key")
+            assert stt._init_task is not None
+
+            # nobody awaits the task; wait for it to finish and for its
+            # done-callbacks to run
+            while not stt._init_task.done():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0)
+
+        assert stt.initialization_state == InitializationState.FAILED
+        assert isinstance(stt.initialization_error, AuthenticationError)
+        # the callback retrieved the exception (this log line IS the
+        # retrieval - remove the callback and this fails)
+        assert any(
+            "Background initialization failed" in r.message
+            for r in caplog.records
+        )
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_awaiting_the_init_task_still_raises_auth_error(
+        self, monkeypatch
+    ):
+        """The callback must not change wait/await semantics."""
+        from livekit.plugins.voxist.connection import VoxistDialer
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+
+        async def boom(self):
+            raise AuthenticationError("revoked key")
+
+        monkeypatch.setattr(VoxistDialer, "_get_token_url", boom)
+
+        stt = VoxistSTT(api_key="test_key")
+        assert stt._init_task is not None
+        with pytest.raises(AuthenticationError):
+            await stt._init_task
+
+        assert await stt.wait_for_initialization(timeout=1.0) is False
         await stt.aclose()

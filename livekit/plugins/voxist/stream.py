@@ -265,6 +265,11 @@ class VoxistSTTStream(RecognizeStream):
                         f"{self.RESULT_DRAIN_TIMEOUT_SECONDS}s after end of input "
                         "- a trailing transcript may have been lost"
                     )
+                    # The socket still has an unread result frame queued on it.
+                    # Returning it to the pool would hand that frame to the next
+                    # stream, which would emit this session's transcript under
+                    # its own request_id - so retire it instead.
+                    await self._abandon_connection()
                 done = {t for t in (send_task, recv_task) if t not in pending}
 
             # Cancel pending tasks

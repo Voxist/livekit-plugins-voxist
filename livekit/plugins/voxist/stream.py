@@ -409,6 +409,9 @@ class VoxistSTTStream(RecognizeStream):
         """
         try:
             await asyncio.wait_for(coro, timeout=self.SEND_TIMEOUT_SECONDS)
+        # TimeoutError MUST be handled before OSError: on Python 3.11+
+        # asyncio.TimeoutError is builtins.TimeoutError, an OSError subclass,
+        # so the ordering decides which branch a stall takes.
         except asyncio.TimeoutError as e:
             buffer_size = self._get_write_buffer_size()
             logger.warning(
@@ -422,6 +425,13 @@ class VoxistSTTStream(RecognizeStream):
             raise APIConnectionError(
                 "WebSocket send timeout - connection stalled"
             ) from e
+        except (aiohttp.ClientError, ConnectionResetError, OSError) as e:
+            # A send can also fail outright (socket reset mid-write, transport
+            # torn down between the closed-check and the write). Wrap it:
+            # livekit retries only APIError, so a raw ConnectionResetError
+            # escaping _run would kill the stream with no retry and no error
+            # event.
+            raise APIConnectionError(f"WebSocket send failed: {e}") from e
 
     def _get_transport(self) -> asyncio.Transport | None:
         """

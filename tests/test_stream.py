@@ -518,9 +518,14 @@ class TestRunOutcome:
         stream._input_ch.send_nowait(frame(1600))  # input NOT ended
         ws.end()  # server drops the socket
 
-        with pytest.raises(APIConnectionError, match="before end of input"):
+        # Depending on who observes the close first (receive loop ending, the
+        # closed-socket check, or the send itself resetting), the message
+        # differs - the invariant is that it is an APIConnectionError so the
+        # framework retries, and never a "normal" completion.
+        with pytest.raises(APIConnectionError):
             await asyncio.wait_for(stream._run(), timeout=5.0)
         assert not stream._session_complete
+        assert not stream._done_sent
 
     @pytest.mark.asyncio
     async def test_completed_session_is_not_redialed(self):

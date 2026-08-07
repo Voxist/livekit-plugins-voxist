@@ -233,6 +233,32 @@ class ConnectionPool:
             usable.append(conn)
         return usable
 
+    def _prefer_language(
+        self, ready_conns: list[Connection], language: str | None
+    ) -> list[Connection]:
+        """
+        Narrow candidates to sockets already configured for `language`.
+
+        Renegotiating a socket's language is not free: the gateway closes the
+        ASR engine socket and re-dials it (simple-websocket-proxy.gateway.ts
+        :1148-1190), and audio arriving before the new engine socket opens is
+        DROPPED, not buffered - the code increments an audio-dropped counter and
+        returns even though its log line says "buffering audio" (:1284-1299).
+        There is no readiness signal to wait for: the gateway sets banafoReady
+        internally and tells the client nothing.
+
+        So preferring an already-matching socket is the only way to avoid losing
+        the first moments of speech. Falls back to the full list when nothing
+        matches, since a renegotiated socket still beats transcribing with the
+        wrong engine.
+
+        Caller must hold self._lock.
+        """
+        if language is None:
+            return ready_conns
+        matching = [c for c in ready_conns if c.applied_language == language]
+        return matching or ready_conns
+
     def _select_round_robin(self, ready_conns: list[Connection]) -> Connection:
         """
         Pick the next ready connection, rotating across the pool.
@@ -638,7 +664,9 @@ class ConnectionPool:
             conn.state = ConnectionState.FAILED
             return False
 
-    async def get_connection(self) -> Connection:
+    async def get_connection(
+        self, preferred_language: str | None = None
+    ) -> Connection:
         """
         Get a healthy connection from the pool.
 
@@ -660,7 +688,9 @@ class ConnectionPool:
             ready_conns = self._usable_ready(reconnect_dead=True)
 
             if ready_conns:
-                conn = self._select_round_robin(ready_conns)
+                conn = self._select_round_robin(
+                    self._prefer_language(ready_conns, preferred_language)
+                )
                 conn.state = ConnectionState.IN_USE
                 logger.debug(
                     f"Acquired connection {conn.id} "
@@ -703,7 +733,9 @@ class ConnectionPool:
                         )
                         ready_conns = self._usable_ready(reconnect_dead=False)
                         if ready_conns:
-                            conn = self._select_round_robin(ready_conns)
+                            conn = self._select_round_robin(
+                                self._prefer_language(ready_conns, preferred_language)
+                            )
                             conn.state = ConnectionState.IN_USE
                             logger.debug(f"Fallback to connection {conn.id}")
                             return conn

@@ -1561,3 +1561,93 @@ class TestTokenExpiry:
             "wss://host/ws?token=a.e30.c",        # valid JSON, no exp
         ):
             assert ConnectionPool._token_expiry_from_url(url, now) == now + 3600.0
+
+
+class TestLanguageAwareAcquisition:
+    """
+    Acquisition must prefer a socket already configured for the wanted language.
+
+    Renegotiating costs an ASR engine re-dial, and the gateway DROPS audio while
+    the new engine socket opens - it increments an audio-dropped counter and
+    returns, despite logging "buffering audio"
+    (simple-websocket-proxy.gateway.ts:1284-1299). No readiness signal exists to
+    wait for, so avoiding the renegotiation is the only mitigation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prefers_socket_already_on_that_language(
+        self, pool_basic, mock_ws_connect
+    ):
+        """A matching socket wins over the round-robin order."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            for c in pool_basic.connections:
+                c.state = ConnectionState.READY
+            pool_basic.connections[0].applied_language = "fr"
+            pool_basic.connections[1].applied_language = "en"
+
+            # Repeated acquisitions for "en" must always land on connection 1,
+            # even though round-robin alone would alternate.
+            for _ in range(4):
+                conn = await pool_basic.get_connection(preferred_language="en")
+                assert conn.applied_language == "en"
+                await pool_basic.release_connection(conn)
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_when_no_socket_matches(self, pool_basic, mock_ws_connect):
+        """
+        With no match, any usable socket is returned.
+
+        A renegotiated socket still beats transcribing with the wrong engine.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            for c in pool_basic.connections:
+                c.state = ConnectionState.READY
+                c.applied_language = "fr"
+
+            conn = await pool_basic.get_connection(preferred_language="de")
+
+            assert conn is not None
+            assert conn.state == ConnectionState.IN_USE
+
+            await pool_basic.release_connection(conn)
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_no_preference_keeps_rotating(self, pool_basic, mock_ws_connect):
+        """Without a preference, selection must still rotate across the pool."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            for c in pool_basic.connections:
+                c.state = ConnectionState.READY
+                c.applied_language = "fr"
+
+            seen = []
+            for _ in range(6):
+                conn = await pool_basic.get_connection()
+                seen.append(conn.id)
+                await pool_basic.release_connection(conn)
+
+            assert len(set(seen)) > 1, "preference-free acquisition stopped rotating"
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_applied_language_stamped_on_connect(self, pool_basic, mock_ws_connect):
+        """A freshly connected socket records the language its URL carried."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            assert all(
+                c.applied_language == pool_basic.language
+                for c in pool_basic.connections
+                if c.state == ConnectionState.READY
+            )
+
+            await pool_basic.close()

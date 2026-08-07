@@ -193,7 +193,12 @@ class VoxistSTTStream(RecognizeStream):
         Raises:
             ConnectionError: If no connection available
         """
-        self._conn = await self._pool.get_connection()
+        # Prefer a socket already configured for this stream's language:
+        # renegotiating costs an engine re-dial during which the backend drops
+        # audio (see ConnectionPool._prefer_language).
+        self._conn = await self._pool.get_connection(
+            preferred_language=self._language
+        )
         # SECURITY: Mark exclusive ownership for VUL-003 mitigation
         # Connection is IN_USE state - only this stream should access buffered_amount
         self._owns_connection = True
@@ -528,10 +533,16 @@ class VoxistSTTStream(RecognizeStream):
         if self._conn.applied_language == self._language:
             return
 
-        logger.debug(
+        # Warning, not debug: the gateway re-dials the ASR engine on a language
+        # change and silently drops audio until the new engine socket opens, so
+        # the first moments of speech can be lost. There is no readiness signal
+        # to wait for, so this is reported rather than worked around. The pool
+        # avoids it where it can by preferring an already-matching socket.
+        logger.warning(
             f"Stream {self._session_id} renegotiating connection "
-            f"{self._conn.id} from language "
-            f"{self._conn.applied_language!r} to {self._language!r}"
+            f"{self._conn.id} from language {self._conn.applied_language!r} to "
+            f"{self._language!r}; the backend re-dials its ASR engine and may "
+            "drop the first audio of this stream"
         )
 
         await self._send_with_timeout(

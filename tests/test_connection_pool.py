@@ -1,6 +1,7 @@
 """Unit tests for ConnectionPool."""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import aiohttp
@@ -164,31 +165,47 @@ class TestConnectionAcquisition:
 
             conn = await pool_basic.get_connection()
 
-            assert conn.id == 0
+            # Which connection is returned is up to the rotation; what matters
+            # is that a pooled connection comes back and is marked in use.
+            assert conn in pool_basic.connections
             assert conn.state == ConnectionState.IN_USE
 
             await pool_basic.release_connection(conn)
             await pool_basic.close()
 
     @pytest.mark.asyncio
-    async def test_get_connection_selects_lowest_buffered(self, pool_basic, mock_ws_connect):
-        """Test get_connection selects connection with lowest buffered amount."""
+    async def test_get_connection_ignores_buffered_amount(self, pool_basic, mock_ws_connect):
+        """
+        Selection must not depend on buffered_amount.
+
+        It used to: min(buffered_amount) picked the least-used socket only
+        because that field accumulated every byte ever sent. As a real
+        post-send measurement it is ~0 on every healthy connection, so ranking
+        by it ties on every call and collapses to connections[0] forever.
+        Rotation must therefore be independent of the value.
+        """
         with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
             await pool_basic.initialize()
 
-            # Set both to READY with different buffer amounts
+            # Give connection 0 a deliberately terrible reading; rotation must
+            # still hand it out in its turn.
             pool_basic.connections[0].state = ConnectionState.READY
-            pool_basic.connections[0].buffered_amount = 1000
-
+            pool_basic.connections[0].buffered_amount = 10_000_000
             pool_basic.connections[1].state = ConnectionState.READY
-            pool_basic.connections[1].buffered_amount = 500
+            pool_basic.connections[1].buffered_amount = 0
 
-            conn = await pool_basic.get_connection()
+            seen = []
+            for _ in range(4):
+                conn = await pool_basic.get_connection()
+                seen.append(conn.id)
+                await pool_basic.release_connection(conn)
 
-            # Should select connection 1 (lowest buffered)
-            assert conn.id == 1
+            assert 0 in seen, (
+                "connection 0 was never selected; selection is still biased by "
+                "buffered_amount"
+            )
+            assert len(set(seen)) > 1
 
-            await pool_basic.release_connection(conn)
             await pool_basic.close()
 
     @pytest.mark.asyncio
@@ -205,6 +222,51 @@ class TestConnectionAcquisition:
             await pool_basic.release_connection(conn)
 
             assert conn.state == ConnectionState.READY
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_release_connection_clears_buffered_amount(self, pool_basic, mock_ws_connect):
+        """
+        Test release_connection clears the backpressure snapshot.
+
+        buffered_amount describes the departing stream's transport state and is
+        the key get_connection() load-balances on. A value left behind would
+        skew that selection, and historically it never got cleared at all - it
+        accumulated across streams until backpressure tripped permanently.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            pool_basic.connections[0].state = ConnectionState.READY
+            conn = await pool_basic.get_connection()
+            conn.buffered_amount = 750_000  # left over from streaming
+
+            await pool_basic.release_connection(conn)
+
+            assert conn.buffered_amount == 0
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_connect_clears_stale_buffered_amount(self, pool_basic, mock_ws_connect):
+        """
+        Test a (re)connect clears any buffer reading from the old socket.
+
+        A reconnect replaces the WebSocket on the same Connection object, so a
+        carried-over reading describes a transport that no longer exists. Left
+        in place it would misreport the new socket's load.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            conn = pool_basic.connections[0]
+            conn.buffered_amount = 5 * 1024 * 1024  # stale reading from the old socket
+
+            success = await pool_basic._connect(conn, pool_basic.language, pool_basic.sample_rate)
+
+            assert success is True
+            assert conn.buffered_amount == 0
 
             await pool_basic.close()
 
@@ -1180,3 +1242,322 @@ class TestReconnectionRateLimiting:
         # Check semaphore has 5 permits available
         # (internal implementation detail, but important for SEC-012)
         assert pool_basic._reconnect_semaphore._value == 5
+
+
+class TestPoolSelectionAndRelease:
+    """
+    Selection must rotate, and a dead socket must never go back in the pool.
+
+    Selection used to be min(buffered_amount), which only rotated because that
+    field accumulated every byte ever sent. Once buffered_amount became a
+    post-send measurement (~0 on every healthy connection) min() tied on every
+    call and always returned connections[0], so the pool stopped balancing and,
+    worse, would hand back a just-released dead connection.
+    """
+
+    @pytest.mark.asyncio
+    async def test_selection_rotates_across_ready_connections(
+        self, pool_basic, mock_ws_connect
+    ):
+        """Successive acquisitions must not all land on the same connection."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            for c in pool_basic.connections:
+                c.state = ConnectionState.READY
+                c.buffered_amount = 0  # the tie that broke min() selection
+
+            seen = []
+            for _ in range(6):
+                conn = await pool_basic.get_connection()
+                seen.append(conn.id)
+                await pool_basic.release_connection(conn)
+
+            assert len(set(seen)) > 1, (
+                f"all {len(seen)} acquisitions returned connection {seen[0]}; "
+                "selection is not rotating"
+            )
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_released_dead_connection_not_returned_to_pool(
+        self, pool_basic, mock_ws_connect
+    ):
+        """
+        A connection whose WebSocket died must not go back to READY.
+
+        Otherwise the next stream sends every chunk into a closed socket, the
+        receive loop exits immediately, and the session ends with zero
+        transcripts, no exception and no reconnect.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            pool_basic.connections[0].state = ConnectionState.READY
+            conn = await pool_basic.get_connection()
+            assert conn.state == ConnectionState.IN_USE
+
+            conn.ws.closed = True  # socket died mid-session
+
+            await pool_basic.release_connection(conn)
+
+            assert conn.state != ConnectionState.READY, (
+                "a closed WebSocket was returned to the pool as READY"
+            )
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_release_refreshes_heartbeat_timestamp(
+        self, pool_basic, mock_ws_connect
+    ):
+        """
+        Releasing a healthy connection must refresh last_heartbeat.
+
+        The heartbeat loop only refreshes READY connections, so a call longer
+        than the 90s staleness threshold would otherwise hand back a connection
+        the pool immediately judges stale and tears down - and a stream starting
+        during that reconnect window fails with ConnectionPoolExhaustedError.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            pool_basic.connections[0].state = ConnectionState.READY
+            conn = await pool_basic.get_connection()
+
+            conn.last_heartbeat = time.time() - 600  # a 10-minute call
+
+            await pool_basic.release_connection(conn)
+
+            assert conn.state == ConnectionState.READY
+            assert time.time() - conn.last_heartbeat < 5, (
+                "released connection still carries a stale heartbeat timestamp"
+            )
+
+            await pool_basic.close()
+
+    def test_ssl_policy_is_shared_by_all_call_sites(self):
+        """
+        Every aiohttp call must use the same SSL argument.
+
+        The token exchange and the WebSocket connect once computed this
+        separately and disagreed: one verified certificates while the other
+        passed False, silently disabling verification for the same config.
+        """
+        import inspect
+
+        from livekit.plugins.voxist import connection_pool as cp
+
+        source = inspect.getsource(cp)
+        assert "ssl=self._ssl_param()" in source or "ssl_param = self._ssl_param()" in source
+        # No call site may hard-code a verification-disabling value.
+        assert "ssl=False" not in source, "a call site disables certificate verification"
+
+    def test_ssl_param_never_disables_verification(self):
+        """Without an explicit context the fallback must still verify."""
+        pool = ConnectionPool(
+            base_url="ws://localhost:8765/ws",  # no context is built for ws://
+            api_key="k",
+            pool_size=1,
+        )
+        assert pool._ssl_context is None
+        assert pool._ssl_param() is True, (
+            "fallback must be True (verify); False would expose a wss:// token "
+            "URL returned by the token exchange to a man-in-the-middle"
+        )
+
+    def test_ssl_param_uses_explicit_context(self):
+        """An explicit context is passed through unchanged."""
+        pool = ConnectionPool(
+            base_url="wss://api-asr.voxist.com/ws",
+            api_key="k",
+            pool_size=1,
+        )
+        assert pool._ssl_context is not None
+        assert pool._ssl_param() is pool._ssl_context
+
+
+class TestBrokenConnectionHandling:
+    """
+    Retiring a stalled connection, and never handing out a dead one.
+
+    A stalled socket is not a closed socket, so nothing distinguishes it from a
+    healthy one. The pool owns the transition: a stream that sets ConnectionState
+    itself made release_connection() skip its IN_USE branch, so no reconnect was
+    ever scheduled.
+    """
+
+    @pytest.mark.asyncio
+    async def test_mark_broken_retires_and_reconnects(self, pool_basic, mock_ws_connect):
+        """mark_broken() retires the connection and schedules a reconnect."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            conn = pool_basic.connections[0]
+            conn.state = ConnectionState.IN_USE
+            conn.buffered_amount = 4096
+
+            with patch.object(pool_basic, '_spawn_reconnect') as spawn:
+                await pool_basic.mark_broken(conn)
+
+            assert conn.state == ConnectionState.CLOSED
+            assert conn.buffered_amount == 0
+            spawn.assert_called_once_with(conn)
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_mark_broken_is_idempotent(self, pool_basic, mock_ws_connect):
+        """A second call must not schedule a duplicate reconnect."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            conn = pool_basic.connections[0]
+            conn.state = ConnectionState.IN_USE
+
+            with patch.object(pool_basic, '_spawn_reconnect') as spawn:
+                await pool_basic.mark_broken(conn)
+                await pool_basic.mark_broken(conn)
+
+            assert spawn.call_count == 1
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_closed_socket_is_never_handed_out(self, pool_basic, mock_ws_connect):
+        """
+        A READY connection whose socket died must not be acquired.
+
+        Filtering on state alone produced a session that sent every chunk into a
+        closed socket, received nothing, and completed with no transcripts, no
+        exception and no reconnect.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            for c in pool_basic.connections:
+                c.state = ConnectionState.READY
+            dead = pool_basic.connections[0]
+            dead.ws.closed = True
+
+            for _ in range(4):
+                conn = await pool_basic.get_connection()
+                assert conn is not dead, "handed out a connection with a closed socket"
+                await pool_basic.release_connection(conn)
+
+            # ...and the dead one was retired for reconnection rather than ignored
+            assert dead.state != ConnectionState.READY
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_no_reconnect_scheduled_while_closing(self, pool_basic, mock_ws_connect):
+        """
+        Shutdown must not start a reconnect chain.
+
+        Without this guard a connection released during aclose() reconnects
+        against an already-closed ClientSession, retrying with backoff for
+        minutes after shutdown returned.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            conn = pool_basic.connections[0]
+            pool_basic._closing = True
+
+            with patch.object(pool_basic, '_reconnect') as reconnect:
+                pool_basic._spawn_reconnect(conn)
+                await asyncio.sleep(0)
+
+            reconnect.assert_not_called()
+            assert not pool_basic._reconnect_tasks
+
+            pool_basic._closing = False
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_idle_closed_socket_reconnected_by_heartbeat(
+        self, pool_basic, mock_ws_connect
+    ):
+        """
+        The heartbeat loop must act on ws.closed, not an elapsed-time threshold.
+
+        The old staleness check could never fire: the same loop refreshed the
+        timestamp it compared against on every tick. Liveness now comes from
+        aiohttp, which closes the socket when a pong does not arrive.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            conn = pool_basic.connections[0]
+            conn.state = ConnectionState.READY
+            conn.ws.closed = True
+            conn.last_heartbeat = time.time()  # fresh: an age check would pass it
+
+            pool_basic.heartbeat_interval = 0.05
+            with patch.object(pool_basic, '_spawn_reconnect') as spawn:
+                task = asyncio.create_task(pool_basic._heartbeat_loop())
+                await asyncio.sleep(0.2)
+                pool_basic._closing = True
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            assert spawn.called, (
+                "a closed idle socket was not reconnected despite a fresh timestamp"
+            )
+
+            pool_basic._closing = False
+            await pool_basic.close()
+
+
+class TestTokenExpiry:
+    """
+    Token lifetime must come from the JWT, not a duplicated constant.
+
+    The token-exchange response carries only a `url`, so the expiry has to be
+    read from the JWT inside it. Hard-coding an hour duplicates a value owned by
+    the backend: if it ever shortens, the plugin reuses a dead token until the
+    requests start failing.
+    """
+
+    @staticmethod
+    def _url_with_exp(exp):
+        import base64
+        import json as _json
+
+        def seg(obj):
+            raw = _json.dumps(obj).encode()
+            return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+        token = f"{seg({'alg': 'HS256'})}.{seg({'exp': exp})}.sig"
+        return f"wss://host/ws?token={token}"
+
+    def test_expiry_read_from_jwt(self):
+        """The exp claim wins over the one-hour default."""
+        expected = 1_800_000_000.0
+        got = ConnectionPool._token_expiry_from_url(self._url_with_exp(expected), 0.0)
+        assert got == expected
+
+    def test_short_lived_token_is_respected(self):
+        """A token shorter than an hour must not be treated as an hour."""
+        now = 1_000_000.0
+        got = ConnectionPool._token_expiry_from_url(
+            self._url_with_exp(now + 120), now
+        )
+        assert got == now + 120
+        assert got < now + 3600
+
+    def test_falls_back_to_one_hour_when_unreadable(self):
+        """Malformed or absent tokens fall back to the server's current lifetime."""
+        now = 500.0
+        for url in (
+            "wss://host/ws",                      # no token at all
+            "wss://host/ws?token=not-a-jwt",      # no segments
+            "wss://host/ws?token=a.!!!!.c",       # undecodable payload
+            "wss://host/ws?token=a.e30.c",        # valid JSON, no exp
+        ):
+            assert ConnectionPool._token_expiry_from_url(url, now) == now + 3600.0

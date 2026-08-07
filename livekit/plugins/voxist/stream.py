@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
+from collections.abc import Awaitable
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -15,6 +17,11 @@ from livekit.agents.stt import (
     SpeechEvent,
     SpeechEventType,
 )
+
+try:  # livekit-agents >= 1.x
+    from livekit.agents import LanguageCode
+except ImportError:  # pragma: no cover - older livekit-agents has no such type
+    LanguageCode = str  # type: ignore[assignment, misc]
 
 from livekit import rtc  # type: ignore[attr-defined]
 
@@ -57,15 +64,41 @@ class VoxistSTTStream(RecognizeStream):
                 print(event.alternatives[0].text)
     """
 
-    # Backpressure thresholds for WebSocket write buffer (safety net only)
-    # Voxist backend handles streaming well, so these are set high to avoid
-    # unnecessary pauses. Only triggers in extreme network congestion.
-    # - 16kHz Int16 audio = 32KB/sec
-    # - HIGH_WATER_MARK = ~60 seconds of buffered audio (emergency brake)
-    # - LOW_WATER_MARK = ~30 seconds of buffered audio (resume after emergency)
-    HIGH_WATER_MARK = 2 * 1024 * 1024  # 2MB - emergency pause threshold
-    LOW_WATER_MARK = 1 * 1024 * 1024   # 1MB - resume after emergency
-    BACKPRESSURE_CHECK_INTERVAL = 0.05  # 50ms between buffer checks
+    # Backpressure is owned entirely by aiohttp: `await ws.send_bytes()` drains
+    # while the transport is paused, and the transport decides when to pause
+    # using its own limits. Those limits differ per transport - 64KB for a
+    # plain socket, 512KB for asyncio's SSL transport - so the plugin does NOT
+    # compare the buffer against thresholds of its own. An earlier version did,
+    # with marks calibrated for a plain socket; over wss:// the low mark sat
+    # below the level the SSL layer relieves to, making the release condition
+    # unreachable and throttling the stream to one chunk per timeout.
+    #
+    # What the plugin guarantees instead, independent of transport type:
+    #   1. no send blocks longer than SEND_TIMEOUT_SECONDS,
+    #   2. the input backlog is bounded by MAX_INPUT_BACKLOG_FRAMES.
+
+    # A send that cannot complete in this long means the uplink is stalled.
+    # Must stay well below RECEIVE_TIMEOUT_SECONDS so a stalled send surfaces
+    # as a send error and reconnect, rather than tripping the receive watchdog
+    # and looking like a server-side stall.
+    SEND_TIMEOUT_SECONDS = 5.0
+
+    # Receive watchdog: no message from Voxist for this long means the
+    # connection is stalled. Class-level so the invariant against
+    # SEND_TIMEOUT_SECONDS is visible and testable.
+    RECEIVE_TIMEOUT_SECONDS = 30.0
+
+    # Rate limit for the audio-drop warning. The drop condition persists for
+    # the whole overload, and the send loop runs per 10ms frame, so an unlimited
+    # warning would emit ~100 lines/second per stream.
+    DROP_LOG_INTERVAL_SECONDS = 5.0
+
+    # Cap on unsent audio frames held in the input channel. livekit's channel is
+    # unbounded and push_frame() never blocks, so without this a slow uplink
+    # grows the backlog until the process is OOM-killed. At 10ms frames this is
+    # ~10s of audio; beyond that, transcripts would arrive too late to be
+    # useful anyway, so the oldest frames are dropped rather than queued.
+    MAX_INPUT_BACKLOG_FRAMES = 1000
 
     def __init__(
         self,
@@ -98,6 +131,19 @@ class VoxistSTTStream(RecognizeStream):
         self._pool = pool
         self._config = config
         self._language = language
+        # Language reported on emitted SpeechData. livekit normalizes this to
+        # BCP-47, which uppercases the subtag: "fr-medical" is emitted as
+        # "fr-MEDICAL". Normalizing once here makes that visible instead of
+        # leaving it an implicit side effect inside SpeechData.__post_init__.
+        #
+        # WARNING: self._language is NOT sent to Voxist. The socket was opened
+        # by the pool with the pool-level language in the URL query, and this
+        # stream reuses a pooled socket without renegotiating. So a per-stream
+        # override - stt.stream(language="en") on a pool built with "fr" - is
+        # transcribed by the pool's engine while being labelled with the
+        # override here. Fixing that needs a config message on acquire; until
+        # then, do not treat this value as the language Voxist actually used.
+        self._speech_language = LanguageCode(language)
         self._enable_metrics = enable_metrics
 
         self._session_id = utils.shortuuid()
@@ -105,6 +151,15 @@ class VoxistSTTStream(RecognizeStream):
         self._conn: Connection | None = None
         # Track if we own exclusive access to connection (VUL-003 mitigation)
         self._owns_connection = False
+        # Latch so an unreachable transport is reported once, not per chunk
+        self._transport_lookup_failed = False
+        # Count of frames dropped to keep the input backlog bounded, and when
+        # that was last reported. None means "not yet" - monotonic() has an
+        # arbitrary epoch (uptime on Linux), so 0.0 is not a usable sentinel:
+        # on a freshly booted host the elapsed check would suppress the first
+        # report for as long as the interval.
+        self._dropped_frames = 0
+        self._last_drop_log: float | None = None
 
         # Audio processor for format conversion and chunking
         # Resample from input rate (e.g., 48kHz from LiveKit) to 16kHz for Voxist
@@ -269,36 +324,18 @@ class VoxistSTTStream(RecognizeStream):
                     f"Stream {self._session_id} reconnecting in {backoff:.1f}s "
                     f"(attempt {reconnect_attempts}/{max_attempts})"
                 )
+                # Hand the connection back before waiting, not in the trailing
+                # finally: holding it across the backoff leaves it visible to
+                # the pool as reclaimable while this stream still owns it, so
+                # another stream can acquire the same socket and our release
+                # would then flip it to READY underneath that owner.
+                await self._release_connection()
                 await asyncio.sleep(backoff)
 
             finally:
                 await self._release_connection()
 
         logger.info(f"Stream {self._session_id} finished")
-
-    async def _send_config(self) -> None:
-        """
-        Send initial configuration message to WebSocket.
-
-        Protocol:
-            {"config": {"lang": "fr", "sample_rate": 16000}}
-        """
-        if not self._conn or not self._conn.ws:
-            raise ConnectionError("No active connection")
-
-        config_message = {
-            "config": {
-                "lang": self._language,
-                "sample_rate": self._config["sample_rate"],
-            }
-        }
-
-        await self._conn.ws.send_json(config_message)
-
-        logger.debug(
-            f"Stream {self._session_id} sent config: "
-            f"lang={self._language}, sample_rate={self._config['sample_rate']}"
-        )
 
     async def _send_audio_task(self) -> None:
         """
@@ -314,6 +351,7 @@ class VoxistSTTStream(RecognizeStream):
                 frame_count += 1
                 if frame_count % 100 == 0:
                     logger.debug(f"Stream {self._session_id} processing frame {frame_count}")
+
                 # Check for flush sentinel
                 if isinstance(data, self._FlushSentinel):
                     logger.debug(f"Stream {self._session_id} flushing audio")
@@ -325,13 +363,40 @@ class VoxistSTTStream(RecognizeStream):
 
                     # Signal end of stream to Voxist
                     if self._conn and self._conn.ws and not self._conn.ws.closed:
-                        await self._conn.ws.send_str("Done")
+                        await self._send_with_timeout(
+                            self._conn.ws.send_str("Done"), "Done signal"
+                        )
                         logger.debug(f"Stream {self._session_id} sent Done signal")
 
                     continue
 
                 # Process audio frame
                 if isinstance(data, rtc.AudioFrame):
+                    # CRIT-001: bound the unsent backlog. livekit's input channel
+                    # is unbounded and push_frame() never blocks, so a slow uplink
+                    # would otherwise grow it for the life of the call until the
+                    # process is OOM-killed.
+                    #
+                    # The bound is applied here, on consumption: when the backlog
+                    # is over the cap this frame is discarded instead of sent, so
+                    # the loop drains the excess at full speed and keeps the most
+                    # recent MAX_INPUT_BACKLOG_FRAMES. Discarding the frame in
+                    # hand - rather than reaching into the channel to trim it -
+                    # is what makes this safe: nothing is removed out of order,
+                    # markers below always take the branch above and are honoured
+                    # in sequence, and the loop's termination does not depend on
+                    # what it finds. An earlier version trimmed the channel
+                    # directly and had to re-queue markers, which reordered
+                    # utterance boundaries, silently destroyed markers once the
+                    # channel was closed, and could spin forever.
+                    #
+                    # Dropping audio is the right policy for live transcription:
+                    # frames this far behind the speaker would produce transcripts
+                    # too late to act on.
+                    if self._input_ch.qsize() > self.MAX_INPUT_BACKLOG_FRAMES:
+                        self._note_dropped_frame()
+                        continue
+
                     # Convert and chunk audio
                     frame_bytes = bytes(data.data)
                     chunks = self._audio_processor.process_audio_frame(frame_bytes)
@@ -353,44 +418,198 @@ class VoxistSTTStream(RecognizeStream):
             logger.error(f"Stream {self._session_id} send task error: {e}")
             raise
 
-    def _get_write_buffer_size(self) -> int:
+    @property
+    def dropped_frames(self) -> int:
         """
-        Get actual transport write buffer size for accurate backpressure detection.
+        Audio frames discarded to bound the input backlog.
+
+        Non-zero means the transcript for this stream has gaps: the uplink could
+        not keep up and audio was deliberately dropped. Exposed so a caller can
+        tell a lossy transcript from a complete one - the loss is otherwise only
+        visible in the logs, and the emitted events look normal.
+        """
+        return self._dropped_frames
+
+    def _note_dropped_frame(self) -> None:
+        """
+        Count a dropped frame and report it, rate-limited.
+
+        The drop condition persists for as long as the uplink is behind, and the
+        send loop iterates per 10ms frame, so logging every drop would emit ~100
+        lines/second per stream during exactly the overload being reported.
+        """
+        self._dropped_frames += 1
+
+        now = time.monotonic()
+        if (
+            self._last_drop_log is not None
+            and now - self._last_drop_log < self.DROP_LOG_INTERVAL_SECONDS
+        ):
+            return
+        self._last_drop_log = now
+
+        logger.warning(
+            f"Stream {self._session_id} dropping audio to bound the input "
+            f"backlog (cap {self.MAX_INPUT_BACKLOG_FRAMES} frames, "
+            f"{self._dropped_frames} dropped so far on this stream) - the "
+            "uplink is not keeping up with real time, so the transcript will "
+            "have gaps"
+        )
+
+    async def _send_with_timeout(self, coro: Awaitable[None], what: str) -> None:
+        """
+        Await a WebSocket send, bounded by SEND_TIMEOUT_SECONDS.
+
+        Every send on this stream goes through here. aiohttp's drain has no
+        timeout of its own, so an unbounded send blocks the send loop until the
+        receive watchdog fires 30s later - during which nothing is consumed from
+        the input channel and the backlog grows unchecked. Routing all sends
+        through one helper keeps the bound from being applied only to some of
+        them.
+
+        Args:
+            coro: The send coroutine to await
+            what: Short description for the error path (e.g. "audio chunk")
+
+        Raises:
+            ConnectionError: If the send stalls past SEND_TIMEOUT_SECONDS.
+        """
+        try:
+            await asyncio.wait_for(coro, timeout=self.SEND_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError as e:
+            buffer_size = self._get_write_buffer_size()
+            logger.warning(
+                f"Stream {self._session_id} send stalled for "
+                f"{self.SEND_TIMEOUT_SECONDS}s sending {what} "
+                f"(write buffer={buffer_size}B); treating the connection as broken"
+            )
+            await self._abandon_connection()
+            raise ConnectionError(
+                "WebSocket send timeout - connection stalled"
+            ) from e
+
+    async def _abandon_connection(self) -> None:
+        """
+        Give up on the current connection so the pool recycles it.
+
+        A stalled socket is not a closed socket, so without this the pool would
+        hand it straight to the next stream, which would stall in turn. The pool
+        owns the state transition and the reconnect - the stream must not write
+        ConnectionState itself, or release_connection() would find the
+        connection no longer IN_USE and skip its own bookkeeping entirely.
+
+        The transport is aborted because a cancelled send may have left a frame
+        mid-flight, so this connection is no longer safe to write to.
+        """
+        if not self._conn:
+            return
+
+        transport = self._get_transport()
+        if transport is not None:
+            transport.abort()  # immediate, does not attempt to flush
+
+        await self._pool.mark_broken(self._conn)
+
+    def _get_transport(self) -> asyncio.Transport | None:
+        """
+        Reach the asyncio transport underlying the WebSocket, for diagnostics.
+
+        Prefers a public accessor if the installed aiohttp grows one; otherwise
+        walks ws._response.connection, which is not public API. Used only for
+        observability - nothing in the send path depends on the result, so a
+        None here degrades logging, never behaviour.
 
         Returns:
-            Buffer size in bytes, or 0 if transport not available.
+            The transport, or None if it cannot be reached or is closing.
         """
         if not self._conn or not self._conn.ws:
+            return None
+
+        ws = self._conn.ws
+        transport = None
+
+        # Public accessor, if this aiohttp has one.
+        getter = getattr(ws, "get_transport", None)
+        if callable(getter):
+            try:
+                transport = getter()
+            except (AttributeError, RuntimeError):
+                transport = None
+
+        if transport is None:
+            # Private fallback. get_extra_info("transport") is not an option:
+            # asyncio transports carry no "transport" extra-info key, so it
+            # always returns None.
+            try:
+                connection = ws._response.connection  # type: ignore[attr-defined]
+                transport = connection.transport if connection is not None else None
+            except (AttributeError, RuntimeError):
+                transport = None
+
+        if transport is not None:
+            # Guarded: `getter` is any callable named get_transport, so the
+            # result is not guaranteed to be a transport. This method is
+            # documented as observability-only and must never raise into the
+            # send path.
+            try:
+                if transport.is_closing():
+                    return None
+                return transport  # type: ignore[no-any-return]
+            except (AttributeError, RuntimeError):
+                transport = None
+
+        # Log once per stream: a silent permanent failure would hide the loss of
+        # every buffer metric behind an aiohttp upgrade.
+        if not self._transport_lookup_failed:
+            self._transport_lookup_failed = True
+            logger.debug(
+                f"Stream {self._session_id} cannot reach the WebSocket "
+                "transport; write-buffer metrics unavailable for this "
+                "stream (aiohttp internals may have changed)"
+            )
+        return None
+
+    def _get_write_buffer_size(self) -> int:
+        """
+        Measure the transport write buffer size, for observability only.
+
+        Deliberately NOT used for flow control. Two earlier versions got that
+        wrong: first by accumulating half of every chunk ever sent into a
+        counter that never decayed, then by comparing the real size against
+        thresholds calibrated for a plain socket while production runs TLS.
+        Backpressure belongs to aiohttp, which drains inside send_bytes() using
+        the transport's own pause state rather than any absolute byte count.
+
+        Returns:
+            Buffer size in bytes, or 0 if it cannot be measured.
+        """
+        transport = self._get_transport()
+        if transport is None:
             return 0
 
         try:
-            # Access aiohttp's underlying transport for accurate buffer size
-            # This is the actual TCP write buffer, not an estimate
-            transport = self._conn.ws.get_transport()  # type: ignore[attr-defined]
-            if transport is not None:
-                return transport.get_write_buffer_size()  # type: ignore[no-any-return]
+            return int(transport.get_write_buffer_size())
         except (AttributeError, RuntimeError):
-            # Transport not available or closed
-            pass
-
-        # Fallback to tracked estimate
-        return self._conn.buffered_amount
+            return 0
 
     async def _send_audio_chunk(self, audio_int16: np.ndarray) -> None:
         """
-        Send Int16 PCM audio chunk to WebSocket with backpressure handling.
+        Send an Int16 PCM audio chunk to the WebSocket.
 
-        CRIT-001 FIX: Implements high/low water mark backpressure pattern to prevent
-        buffer overflow and memory exhaustion during audio streaming.
+        Backpressure is aiohttp's: this await drains while the transport is
+        paused, which is correct for both plain and TLS transports because it
+        follows the transport's own pause state instead of a fixed threshold.
 
-        Flow Control:
-            1. Check transport write buffer size before sending
-            2. If buffer > HIGH_WATER_MARK, wait until it drains to LOW_WATER_MARK
-            3. Send audio chunk as binary frame
-            4. Pace at real-time rate to match audio duration
+        CRIT-001: the send is bounded by SEND_TIMEOUT_SECONDS so a stalled
+        uplink cannot block the send loop indefinitely; memory is bounded
+        separately by the input backlog cap in _send_audio_task.
 
         Args:
             audio_int16: Int16 NumPy array to send (Voxist expects raw Int16 PCM)
+
+        Raises:
+            ConnectionError: If the send stalls past SEND_TIMEOUT_SECONDS.
+            OwnershipViolationError: If the stream does not own the connection.
         """
         if not self._conn or not self._conn.ws:
             logger.warning(f"Stream {self._session_id} no connection, skipping chunk")
@@ -400,57 +619,35 @@ class VoxistSTTStream(RecognizeStream):
             logger.warning(f"Stream {self._session_id} WebSocket closed, skipping chunk")
             return
 
-        # CRIT-001: Backpressure handling using transport write buffer
-        # Wait if buffer exceeds HIGH_WATER_MARK until it drains to LOW_WATER_MARK
-        buffer_size = self._get_write_buffer_size()
-        if buffer_size > self.HIGH_WATER_MARK:
-            logger.warning(
-                f"Stream {self._session_id} backpressure triggered: "
-                f"buffer={buffer_size}B > HIGH_WATER_MARK={self.HIGH_WATER_MARK}B"
-            )
-            # Wait for buffer to drain below LOW_WATER_MARK
-            while buffer_size > self.LOW_WATER_MARK:
-                await asyncio.sleep(self.BACKPRESSURE_CHECK_INTERVAL)
-                # Re-check connection state during wait
-                if not self._conn or not self._conn.ws or self._conn.ws.closed:
-                    logger.warning(
-                        f"Stream {self._session_id} connection lost during wait"
-                    )
-                    return
-                buffer_size = self._get_write_buffer_size()
-
-            logger.debug(
-                f"Stream {self._session_id} backpressure released: "
-                f"buffer={buffer_size}B < LOW_WATER_MARK={self.LOW_WATER_MARK}B"
-            )
-
-        # Send as binary frame (raw Int16 PCM bytes)
-        audio_bytes = audio_int16.tobytes()
-        await self._conn.ws.send_bytes(audio_bytes)
-
-        logger.debug(f"Stream {self._session_id} sent {len(audio_bytes)} bytes to WebSocket")
-
-        # Update fallback estimate (used when transport not available)
-        # SECURITY: Validate exclusive ownership to prevent race condition (VUL-003)
-        # This read-modify-write is safe because only one stream owns the connection
+        # SECURITY: Validate exclusive ownership before touching shared
+        # connection state (VUL-003). Checked before the send so a violation is
+        # reported even when the send itself fails.
         if not self._owns_connection:
             raise OwnershipViolationError(
                 f"Stream {self._session_id} updating buffered_amount without ownership - "
                 "potential race condition. This indicates a bug in stream lifecycle."
             )
-        self._conn.buffered_amount += len(audio_bytes)
-        # Decay estimate conservatively (assume ~half sent during await)
-        self._conn.buffered_amount = max(0, self._conn.buffered_amount - len(audio_bytes) // 2)
+
+        audio_bytes = audio_int16.tobytes()
+        await self._send_with_timeout(
+            self._conn.ws.send_bytes(audio_bytes), "audio chunk"
+        )
+
+        logger.debug(f"Stream {self._session_id} sent {len(audio_bytes)} bytes to WebSocket")
+
+        # Diagnostic snapshot only. The pool no longer selects on this value;
+        # it round-robins, because a post-send measurement is ~0 for every
+        # healthy connection and cannot distinguish between them.
+        self._conn.buffered_amount = self._get_write_buffer_size()
 
     async def _recv_results_task(self) -> None:
         """
         Task for receiving transcription results from WebSocket.
 
         Processes JSON messages and emits LiveKit SpeechEvent objects.
-        Includes 30-second receive timeout to detect stalled connections.
+        Uses RECEIVE_TIMEOUT_SECONDS to detect stalled connections.
         """
-        # Receive timeout to detect stalled connections (network issues, server hang)
-        RECEIVE_TIMEOUT_SECONDS = 30.0
+        RECEIVE_TIMEOUT_SECONDS = self.RECEIVE_TIMEOUT_SECONDS
 
         try:
             logger.debug(f"Stream {self._session_id} receive task started")
@@ -471,9 +668,23 @@ class VoxistSTTStream(RecognizeStream):
                         f"Stream {self._session_id} receive timeout after "
                         f"{RECEIVE_TIMEOUT_SECONDS}s - connection may be stalled"
                     )
+                    # Same treatment as a stalled send: a socket that stops
+                    # answering is not a closed socket, so without this the pool
+                    # returns it to READY and the next stream inherits the stall.
+                    # ws.receive() was also cancelled mid-await, which leaves
+                    # aiohttp's reader in an undefined state.
+                    await self._abandon_connection()
                     raise ConnectionError(
                         "WebSocket receive timeout - connection stalled"
                     ) from e
+
+                # Any message is proof the socket is alive. The pool's heartbeat
+                # loop only refreshes last_heartbeat for READY connections, so
+                # without this a long call would hand back a connection with a
+                # timestamp older than the staleness threshold and the pool
+                # would tear down a perfectly healthy socket.
+                if self._conn:
+                    self._conn.last_heartbeat = time.time()
 
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     # Parse JSON message
@@ -556,7 +767,7 @@ class VoxistSTTStream(RecognizeStream):
                     request_id=self._session_id,
                     alternatives=[
                         SpeechData(
-                            language=self._language,
+                            language=self._speech_language,
                             text=text,
                             confidence=data.get("confidence", 1.0),
                         )
@@ -574,7 +785,7 @@ class VoxistSTTStream(RecognizeStream):
                     request_id=self._session_id,
                     alternatives=[
                         SpeechData(
-                            language=self._language,
+                            language=self._speech_language,
                             text=text,
                             confidence=data.get("confidence", 1.0),
                         )

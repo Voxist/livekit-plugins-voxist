@@ -24,19 +24,25 @@ class MockVoxistServer:
     host/port, because ConnectionPool._get_http_base_url() derives the token
     URL from base_url by swapping the scheme and dropping the "/ws" suffix.
 
+    By default the server binds port 0: the OS picks a free ephemeral port,
+    so any number of servers (parallel pytest workers, concurrent suites,
+    leaked processes from a previous run) coexist without EADDRINUSE. After
+    start(), ``self.port`` holds the real bound port - always build URLs
+    from ``server.port`` AFTER ``await server.start()``.
+
     Example:
-        server = MockVoxistServer(port=8765)
+        server = MockVoxistServer()
         await server.start()
 
-        # Token exchange at http://localhost:8765/websocket
-        # WebSocket at ws://localhost:8765/ws
+        # Token exchange at http://{server.host}:{server.port}/websocket
+        # WebSocket at ws://{server.host}:{server.port}/ws
 
         await server.stop()
     """
 
     def __init__(
         self,
-        port: int = 8765,
+        port: int = 0,
         host: str = "localhost",
         *,
         valid_api_key: str = "test_key",
@@ -54,7 +60,8 @@ class MockVoxistServer:
         Initialize mock Voxist server.
 
         Args:
-            port: Server port
+            port: Server port; 0 (the default) binds an OS-assigned ephemeral
+                  port, published on self.port once start() returns
             host: Server host
             valid_api_key: Expected API key for authentication
             processing_delay_ms: Delay before sending final result (simulates processing)
@@ -266,6 +273,12 @@ class MockVoxistServer:
         self.site = web.TCPSite(self.runner, self.host, self.port)
         await self.site.start()
 
+        # With port=0 the OS assigned an ephemeral port; publish the real one
+        # so URL construction (tests AND token_handler) uses it. The listening
+        # socket lives on the underlying asyncio Server held by the TCPSite.
+        assert self.site._server is not None
+        self.port = self.site._server.sockets[0].getsockname()[1]
+
         print(
             f"Mock Voxist server started at ws://{self.host}:{self.port}/ws "
             f"(token exchange at http://{self.host}:{self.port}/websocket)"
@@ -316,7 +329,7 @@ class ConfigurableMockServer(MockVoxistServer):
 
     def __init__(
         self,
-        port: int = 8765,
+        port: int = 0,
         *,
         responses: list[dict] | None = None,
         disconnect_after: int | None = None,
@@ -327,7 +340,8 @@ class ConfigurableMockServer(MockVoxistServer):
         Initialize configurable mock server.
 
         Args:
-            port: Server port
+            port: Server port; 0 (the default) binds an OS-assigned ephemeral
+                  port, published on self.port once start() returns
             responses: List of response dicts to send in sequence
             disconnect_after: Disconnect after N audio frames (for reconnection testing)
             variable_latency: Vary processing delay randomly (20-100ms)

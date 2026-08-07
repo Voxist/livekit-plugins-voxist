@@ -31,7 +31,11 @@ def auto_mock_token_exchange(request):
     from livekit.plugins.voxist.connection import VoxistDialer
 
     async def _mock_get_token_url(self) -> str:
-        return "ws://localhost:8765/ws?token=mock_jwt_token"
+        # Decoy URL: unit tests mock the dialer/WebSocket layer, so nothing
+        # ever connects here. Port 9 (discard) refuses immediately, so if a
+        # test DOES dial it, it fails loudly instead of silently talking to
+        # whatever process happens to be squatting on a fixed port.
+        return "ws://127.0.0.1:9/ws?token=mock_jwt_token"
 
     with patch.object(VoxistDialer, '_get_token_url', _mock_get_token_url):
         yield
@@ -93,11 +97,14 @@ async def mock_voxist_server():
     route, so integration tests exercise the real token exchange rather than
     a patched _get_ws_token.
 
+    Binds an OS-assigned ephemeral port (no fixed-port collisions between
+    parallel runs); read the real port from server.port - the fixture only
+    yields after start(), so it is always resolved.
+
     Yields:
-        MockVoxistServer instance running on localhost:8765
+        MockVoxistServer instance running on an ephemeral localhost port
     """
     server = MockVoxistServer(
-        port=8765,
         valid_api_key="test_key",
         transcription_text="bonjour monde",
         transcription_confidence=0.95,

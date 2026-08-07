@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
 import time
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING
@@ -36,7 +37,7 @@ import numpy as np
 # Required, not optional: a fallback shim here once silently disabled BCP-47
 # normalization on older livekit-agents. The dependency floor guarantees the
 # import, and failing loudly beats diverging quietly.
-from livekit.agents import APIConnectionError, LanguageCode, utils
+from livekit.agents import APIConnectionError, APIError, LanguageCode, utils
 from livekit.agents.stt import (
     RecognizeStream,
     SpeechData,
@@ -94,11 +95,26 @@ class VoxistSTTStream(RecognizeStream):
 
     # How long to keep receiving after "Done" has been written. The gateway
     # closes the socket once the engine has flushed - normally within
-    # milliseconds - so this is a generous watchdog, not an expected wait.
-    # It is the ONLY receive-side timeout: during streaming, transport death
-    # is detected by aiohttp's heartbeat (missed pong closes the socket), so
-    # long user silences cannot false-trigger a watchdog.
-    SESSION_DRAIN_TIMEOUT_SECONDS = 30.0
+    # milliseconds - so this is a watchdog, not an expected wait, and it is
+    # the ONLY receive-side timeout: during streaming, transport death is
+    # detected by aiohttp's heartbeat, so long user silences cannot
+    # false-trigger it. 5s because: (a) it must be >= SEND_TIMEOUT_SECONDS -
+    # a server that was still ACKing our sends deserves at least as long to
+    # flush its finals as a single send was given; (b) the old 2s bound was
+    # arguably too tight for a slow final on a loaded engine; (c) every
+    # second here is dead air at end of turn when the server has wedged, so
+    # a 30s bound (briefly shipped) meant half a minute of silence reported
+    # as success.
+    SESSION_DRAIN_TIMEOUT_SECONDS = 5.0
+
+    # Silence synthesized at a segment boundary (flush()) to force engine
+    # endpointing; see _on_segment_end. Slightly above the engine's ~300ms
+    # endpointing threshold.
+    SEGMENT_SILENCE_SECONDS = 0.4
+
+    # The wire format is always 16kHz Int16 mono; the AudioProcessor
+    # resamples caller audio to this rate.
+    WIRE_SAMPLE_RATE = 16000
 
     # Rate limit for the audio-drop warning. The drop condition persists for
     # the whole overload, and the send loop runs per 10ms frame, so an
@@ -151,13 +167,32 @@ class VoxistSTTStream(RecognizeStream):
         self._speaking = False
         self._ws: aiohttp.ClientWebSocketResponse | None = None
 
-        # Session outcome. "Done" written once marks the input as fully
-        # delivered; session_complete marks the whole exchange as finished so
-        # a framework retry after a late failure does not redial pointlessly
-        # (the audio of a dead session is unrecoverable - streaming ASR cannot
-        # replay what was already consumed).
+        # ------------------------------------------------------------------
+        # State scope matters here, and getting it wrong has shipped bugs:
+        # _run() may execute several times on one stream (livekit's
+        # _main_task retries it), so every flag is explicitly either
+        #
+        # per-SESSION - describes the stream's whole lifetime and is NEVER
+        # reset by a retry:
+        #   _session_complete  the exchange finished; retries are no-ops
+        #   _audio_consumed    real audio left the input channel (on ANY
+        #                      attempt) - it can never be replayed
+        #   _final_received    at least one FINAL_TRANSCRIPT was emitted
+        #   _speaking          START_OF_SPEECH was emitted without its
+        #                      matching END_OF_SPEECH yet
+        #   _dropped_frames / _last_drop_log   loss accounting for the caller
+        #
+        # per-ATTEMPT - describes one _run() and is reset at the top of each
+        # attempt (a stale True from a failed attempt once disabled both the
+        # "server closed before end of input" and the "connection lost
+        # before Done" guards on the next attempt):
+        #   _done_sent               "Done" was written on THIS socket
+        #   _transport_lookup_failed log-once latch for THIS socket
+        # ------------------------------------------------------------------
         self._done_sent = False
         self._session_complete = False
+        self._audio_consumed = False
+        self._final_received = False
 
         # Latch so an unreachable transport is reported once, not per chunk
         self._transport_lookup_failed = False
@@ -172,7 +207,7 @@ class VoxistSTTStream(RecognizeStream):
             sample_rate=config["sample_rate"],
             chunk_duration_ms=config["chunk_duration_ms"],
             stride_overlap_ms=config["stride_overlap_ms"],
-            target_sample_rate=16000,  # Voxist expects 16kHz audio
+            target_sample_rate=self.WIRE_SAMPLE_RATE,  # Voxist expects 16kHz
         )
 
         logger.debug(
@@ -190,13 +225,62 @@ class VoxistSTTStream(RecognizeStream):
                 stalled send, server close before end of input). livekit's
                 _main_task catches this, emits a recoverable error event, and
                 calls _run() again up to conn_options.max_retry.
-            AuthenticationError: The key was rejected. Deliberately NOT an
-                APIError: retrying cannot fix a revoked key, so it propagates
-                immediately as the true cause.
+            APIError (retryable=False): The session failed in a way no retry
+                can fix - its audio was already consumed and produced no
+                transcript. Raised instead of fabricating a clean, empty
+                completion.
+            AuthenticationError: The key was rejected even with a fresh
+                token. Deliberately NOT an APIError: retrying cannot fix a
+                revoked key, so it propagates immediately as the true cause.
         """
         if self._session_complete:
             # A previous attempt already finished the exchange; a late error
             # (e.g. during drain) triggered a retry with nothing to recover.
+            return
+
+        # Per-ATTEMPT reset (see the scope comment in __init__). A _done_sent
+        # left True by a failed attempt would disable both the "server closed
+        # before end of input" guard and the "connection lost before Done"
+        # guard for this whole attempt.
+        self._done_sent = False
+        self._transport_lookup_failed = False
+
+        # A retry cannot replay streamed audio. If a previous attempt already
+        # consumed the input (it is closed and drained) then dialing a fresh
+        # socket would send a bare "Done" and "complete" with whatever the
+        # engine makes of zero audio - total transcript loss presented as
+        # success. Against _main_task's loop this plays out as:
+        #   - no finals ever emitted: the session produced NOTHING, and no
+        #     retry can change that -> raise APIError(retryable=False). The
+        #     installed _main_task does not consult `retryable` and will
+        #     still loop, but this guard is idempotent - every retry lands
+        #     here again without dialing - so the stream terminates in
+        #     honest failure once max_retry is exhausted (and terminates
+        #     immediately on framework versions that do honour the flag).
+        #   - finals WERE emitted (by an earlier attempt): the data that
+        #     could be delivered has been delivered; only audio past the
+        #     last final (if any existed) is unrecoverable. Completing
+        #     without a pointless re-dial matches the _session_complete
+        #     path, with the possible tail loss reported in the log rather
+        #     than silently absorbed.
+        if (
+            self._audio_consumed
+            and self._input_ch.closed
+            and self._input_ch.qsize() == 0
+        ):
+            if not self._final_received:
+                raise APIError(
+                    "session audio was consumed by a failed attempt and "
+                    "cannot be replayed; no transcript was produced",
+                    retryable=False,
+                )
+            logger.warning(
+                f"Stream {self._session_id} retry found the input already "
+                "consumed by a previous attempt; completing with the finals "
+                "already emitted - audio past the last final (if any) was "
+                "lost with the failed connection"
+            )
+            self._finish_session()
             return
 
         try:
@@ -231,6 +315,31 @@ class VoxistSTTStream(RecognizeStream):
                             recv_task, timeout=self.SESSION_DRAIN_TIMEOUT_SECONDS
                         )
                     except asyncio.TimeoutError:
+                        if not self._final_received:
+                            # Nothing was EVER transcribed and now the server
+                            # has gone mute after Done: completing here would
+                            # fabricate a silent success out of a failed
+                            # session. If audio was consumed, a retry cannot
+                            # replay it (same taxonomy as the guard at the
+                            # top of _run); if none was, a fresh dial could
+                            # legitimately succeed, so let the framework
+                            # retry it.
+                            if self._audio_consumed:
+                                raise APIError(
+                                    "server produced no transcript and did "
+                                    "not close within "
+                                    f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s "
+                                    "of Done; the audio cannot be replayed",
+                                    retryable=False,
+                                ) from None
+                            raise APIConnectionError(
+                                "server produced no transcript and did not "
+                                "close within "
+                                f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s of Done"
+                            ) from None
+                        # Finals made it out; only a trailing one can be
+                        # missing. Completing with a warning beats failing a
+                        # session whose data was delivered.
                         logger.warning(
                             f"Stream {self._session_id} server neither closed "
                             f"nor answered within "
@@ -251,32 +360,54 @@ class VoxistSTTStream(RecognizeStream):
                         "server closed the connection before end of input"
                     )
 
-            self._session_complete = True
-
-            if self._speaking:
-                self._speaking = False
-                logger.debug(
-                    f"Stream {self._session_id} emitting END_OF_SPEECH"
-                )
-                self._event_ch.send_nowait(
-                    SpeechEvent(
-                        type=SpeechEventType.END_OF_SPEECH,
-                        request_id=self._session_id,
-                    )
-                )
-
-            logger.debug(f"Stream {self._session_id} session complete")
+            self._finish_session()
 
         finally:
-            for task in (send_task, recv_task):
-                if not task.done():
-                    task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await task
-            if not ws.closed:
-                with contextlib.suppress(Exception):
-                    await ws.close()
-            self._ws = None
+            try:
+                # cancel_and_wait (livekit's own helper) never awaits the
+                # children directly - it waits on done-callbacks - so an
+                # OUTER cancellation delivered while we sit here propagates
+                # out of _run as it must. The previous pattern,
+                # `with suppress(CancelledError): await task`, swallowed the
+                # outer task's own cancellation whenever aclose() cancelled
+                # _main_task while this finally was awaiting a child.
+                await utils.aio.cancel_and_wait(send_task, recv_task)
+            finally:
+                # Retrieve every completed task's exception. When send and
+                # recv both fail in the same FIRST_COMPLETED wake, only one
+                # is raised; the other would surface at GC as "Task
+                # exception was never retrieved", once per retry. The one
+                # currently propagating out of the try block is skipped so
+                # the primary failure is not double-logged as "secondary".
+                in_flight = sys.exc_info()[1]
+                for task in (send_task, recv_task):
+                    if task.done() and not task.cancelled():
+                        exc2 = task.exception()
+                        if exc2 is not None and exc2 is not in_flight:
+                            logger.debug(
+                                f"Stream {self._session_id} secondary task "
+                                f"failure in {task.get_name()}: {exc2!r}"
+                            )
+                if not ws.closed:
+                    with contextlib.suppress(Exception):
+                        await ws.close()
+                self._ws = None
+
+    def _finish_session(self) -> None:
+        """Mark the exchange finished and emit END_OF_SPEECH if it is owed."""
+        self._session_complete = True
+
+        if self._speaking:
+            self._speaking = False
+            logger.debug(f"Stream {self._session_id} emitting END_OF_SPEECH")
+            self._event_ch.send_nowait(
+                SpeechEvent(
+                    type=SpeechEventType.END_OF_SPEECH,
+                    request_id=self._session_id,
+                )
+            )
+
+        logger.debug(f"Stream {self._session_id} session complete")
 
     async def _send_audio_task(self) -> None:
         """
@@ -306,6 +437,10 @@ class VoxistSTTStream(RecognizeStream):
                 continue
 
             if isinstance(data, rtc.AudioFrame):
+                # The frame has irrevocably left the channel - whether it is
+                # sent or dropped below, a later retry can never replay it.
+                # This is what the exhausted-input guard in _run keys on.
+                self._audio_consumed = True
                 if self._input_ch.qsize() > self.MAX_INPUT_BACKLOG_FRAMES:
                     self._note_dropped_frame()
                     continue
@@ -338,16 +473,30 @@ class VoxistSTTStream(RecognizeStream):
 
     async def _on_segment_end(self) -> None:
         """
-        Hook for the flush policy. Currently: nothing.
+        Flush policy hook: synthesize silence to force engine endpointing.
 
-        The engine emits finals per silence-delimited segment on its own (the
-        gateway threads precedingContext across finals - multi-final sessions
-        are its normal operation), so a segment boundary needs no signal. If
-        the live probe (scratchpad/probe_finals.py) ever shows an engine that
-        only finalizes on "Done", this hook is where the policy changes:
-        send "Done", drain, and rotate the socket - without touching the rest
-        of the loop.
+        The engine finalizes per silence-delimited segment, but it needs
+        ~300ms of silence ON THE WIRE to endpoint. A caller that only pushes
+        speech frames (VAD-gated capture that stops pushing during silence)
+        never puts that silence on the wire, so its flush() would otherwise
+        produce no final at all. Sending SEGMENT_SILENCE_SECONDS of zeros
+        provides the endpointing trigger without "Done" - the session (and
+        socket) stay open for the next segment.
+
+        The zeros are built directly at the 16kHz wire rate and go through
+        _send_audio_chunk like any other audio; they deliberately BYPASS the
+        AudioProcessor, which would resample them as if they were caller-rate
+        input. The whole segment-boundary policy lives in this one hook.
+
+        NOTE: pending live-probe confirmation against the real engine. If the
+        probe shows the engine does not finalize on injected silence, this
+        hook is where the policy changes - nothing else in the loop assumes
+        it.
         """
+        # 100ms chunks, matching the normal streaming cadence
+        chunk = np.zeros(self.WIRE_SAMPLE_RATE // 10, dtype=np.int16)
+        for _ in range(int(self.SEGMENT_SILENCE_SECONDS * 10)):
+            await self._send_audio_chunk(chunk)
 
     @property
     def dropped_frames(self) -> int:
@@ -547,20 +696,36 @@ class VoxistSTTStream(RecognizeStream):
             f"Stream {self._session_id} server closed the socket"
         )
 
-    async def _process_result(self, data: dict):
+    async def _process_result(self, data: object):
         """
         Process a transcription result from Voxist and emit events.
 
         Voxist Message Format:
             {"type": "partial"|"final", "text": "...", "confidence": 0.95, ...}
 
+        Defensive by design: the gateway can send frames outside that shape
+        (it emits pub/sub redirect frames like {"type": "redirect", ...}, and
+        valid JSON need not be an object at all). An unexpected frame must
+        never crash the receive loop - non-dict frames are ignored at debug,
+        a non-string "text" (e.g. {"text": null}) is treated as absent, and
+        unknown "type" values take the warn path below.
+
         Args:
-            data: Parsed JSON message from Voxist
+            data: Parsed JSON message from Voxist (any JSON value)
         """
+        if not isinstance(data, dict):
+            logger.debug(
+                f"Stream {self._session_id} ignoring non-object frame: "
+                f"{str(data)[:80]}"
+            )
+            return
+
         msg_type = data.get("type")
 
-        # Detect start of speech
-        text = data.get("text", "").strip()
+        # Detect start of speech. "text" is server-supplied: anything that
+        # is not a string (absent, null, a number) counts as no text.
+        raw_text = data.get("text")
+        text = raw_text.strip() if isinstance(raw_text, str) else ""
         if not self._speaking and text:
             self._speaking = True
             logger.debug(f"Stream {self._session_id} speech started")
@@ -595,6 +760,7 @@ class VoxistSTTStream(RecognizeStream):
             if text:
                 logger.info(f"Stream {self._session_id} final: {text[:100]}")
 
+                self._final_received = True
                 event = SpeechEvent(
                     type=SpeechEventType.FINAL_TRANSCRIPT,
                     request_id=self._session_id,

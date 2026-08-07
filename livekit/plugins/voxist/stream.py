@@ -143,8 +143,14 @@ class VoxistSTTStream(RecognizeStream):
         # BCP-47, which uppercases the subtag: "fr-medical" is emitted as
         # "fr-MEDICAL". Normalizing once here makes that visible instead of
         # leaving it an implicit side effect inside SpeechData.__post_init__.
-        # self._language stays raw - it is what Voxist receives, and the
-        # backend routes engines on the exact code.
+        #
+        # WARNING: self._language is NOT sent to Voxist. The socket was opened
+        # by the pool with the pool-level language in the URL query, and this
+        # stream reuses a pooled socket without renegotiating. So a per-stream
+        # override - stt.stream(language="en") on a pool built with "fr" - is
+        # transcribed by the pool's engine while being labelled with the
+        # override here. Fixing that needs a config message on acquire; until
+        # then, do not treat this value as the language Voxist actually used.
         self._speech_language = LanguageCode(language)
         self._enable_metrics = enable_metrics
 

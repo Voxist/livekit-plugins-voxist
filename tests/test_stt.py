@@ -5,9 +5,9 @@ import os
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-
-from livekit.agents.stt import STTCapabilities
+from livekit.agents.stt import STT, STTCapabilities
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions
+
 from livekit.plugins.voxist import VoxistSTT
 from livekit.plugins.voxist.exceptions import (
     ConfigurationError,
@@ -944,3 +944,65 @@ class TestSEC002LanguageValidation:
         pool._closing = True
         mock_session.closed = False
         mock_session.close = AsyncMock()
+
+
+class TestShutdownAndTLSConfiguration:
+    """Shutdown ordering, and reaching a deployment behind a private CA."""
+
+    @pytest.mark.asyncio
+    async def test_streams_closed_before_pool(self):
+        """
+        Streams must be closed before the pool.
+
+        pool.close() only touches connections whose socket is still open, so
+        closing it first leaves a connection whose socket already died in
+        IN_USE. The stream's later release then schedules a reconnect against
+        an already-closed ClientSession, retrying with backoff for minutes
+        after aclose() returned.
+        """
+        order = []
+
+        stt = VoxistSTT(api_key="test_key", base_url="ws://localhost:9/ws")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            try:
+                await stt._init_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        async def note_pool_close():
+            order.append("pool")
+
+        stt._pool.close = note_pool_close
+
+        with patch.object(
+            STT, "aclose", new=AsyncMock(side_effect=lambda: order.append("streams"))
+        ):
+            await stt.aclose()
+
+        assert order == ["streams", "pool"], (
+            f"expected streams closed before the pool, got {order}"
+        )
+
+    def test_ssl_context_is_forwarded_to_the_pool(self):
+        """
+        An explicit SSL context must reach the pool.
+
+        Certificate verification is never disabled now, so without this
+        passthrough a deployment whose certificate is signed by a private CA is
+        unreachable through the public API - there is no other way to inject a
+        trust store.
+        """
+        import ssl as ssl_module
+
+        ctx = ssl_module.create_default_context()
+        stt = VoxistSTT(
+            api_key="test_key",
+            base_url="ws://localhost:9/ws",
+            ssl_context=ctx,
+        )
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+
+        assert stt._pool._ssl_context is ctx
+        assert stt._pool._ssl_param() is ctx

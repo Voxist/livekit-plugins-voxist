@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, Mock
 import numpy as np
 import pytest
 
+from livekit import rtc
 from livekit.plugins.voxist.connection_pool import ConnectionPool
 from livekit.plugins.voxist.exceptions import OwnershipViolationError
 from livekit.plugins.voxist.models import Connection, ConnectionState
@@ -554,8 +555,12 @@ class TestSendPathWithOwnership:
                 stream._send_audio_chunk(np.zeros(160, dtype=np.int16)), timeout=5.0
             )
 
-        assert connection.state == ConnectionState.FAILED, (
-            "a stalled connection was left in a state the pool treats as usable"
+        # The pool owns the transition. The stream setting FAILED itself made
+        # release_connection() skip its IN_USE branch, so no reconnect was ever
+        # scheduled.
+        mock_pool.mark_broken.assert_awaited_once_with(connection)
+        assert connection.state == ConnectionState.IN_USE, (
+            "the stream must not write ConnectionState directly"
         )
 
     @pytest.mark.asyncio
@@ -862,13 +867,20 @@ class TestBackpressureLiveness:
 
 class TestInputBacklogBound:
     """
-    CRIT-001: the unsent audio backlog must be bounded.
+    CRIT-001: the unsent audio backlog must be bounded, without touching the
+    channel or reordering its contents.
 
     livekit's input channel is unbounded and push_frame() uses send_nowait, so
-    nothing upstream slows down when the uplink cannot keep up. Without an
-    explicit cap the backlog grows for the life of the call until the process
-    is OOM-killed. Dropping the oldest audio is the right policy for live
-    transcription: audio that far behind the speaker is already useless.
+    nothing upstream slows down when the uplink cannot keep up; without a bound
+    the backlog grows for the life of the call.
+
+    The bound is applied on consumption - a frame over the cap is discarded
+    instead of sent - specifically so the send loop never reaches into the
+    channel. An earlier version trimmed the channel directly and had to re-queue
+    flush sentinels, which (a) spun forever when the queued sentinels outnumbered
+    the cap, (b) silently destroyed sentinels once end_input() had closed the
+    channel, and (c) moved utterance boundaries behind later audio. These tests
+    pin all three away.
     """
 
     @pytest.fixture
@@ -898,91 +910,200 @@ class TestInputBacklogBound:
             await stream._task
         except asyncio.CancelledError:
             pass
-        return stream
+
+        conn = Connection(id=0, state=ConnectionState.IN_USE)
+        conn.ws = AsyncMock()
+        conn.ws.closed = False
+        conn.ws._response = None
+        del conn.ws.get_transport
+        stream._conn = conn
+        stream._owns_connection = True
+
+        # Record what actually reaches the socket rather than sending it
+        stream._send_audio_chunk = AsyncMock()
+        return stream, conn
+
+    @staticmethod
+    def _frame(samples=160):
+        return rtc.AudioFrame(
+            data=np.zeros(samples, dtype=np.int16).tobytes(),
+            sample_rate=16000,
+            num_channels=1,
+            samples_per_channel=samples,
+        )
 
     @pytest.mark.asyncio
-    async def test_backlog_cap_is_bounded_and_documented(self, mock_stt):
+    async def test_backlog_cap_is_bounded_and_documented(self):
         """The cap must exist and be a sane amount of audio."""
         assert VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES > 0
         # 10ms frames: keep at least 1s, no more than a minute of audio
         assert 100 <= VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES <= 6000
 
     @pytest.mark.asyncio
-    async def test_oldest_frames_dropped_above_cap(self, mock_stt, monkeypatch):
-        """Backlog above the cap is trimmed back down to it."""
-        stream = await self._stream(mock_stt)
+    async def test_frames_over_the_cap_are_dropped(self, mock_stt, monkeypatch):
+        """A backlog deeper than the cap loses its oldest frames, not its newest."""
+        stream, _ = await self._stream(mock_stt)
         monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 10)
 
-        for _ in range(35):
-            stream._input_ch.send_nowait(Mock(spec=[]))
-        assert stream._input_ch.qsize() == 35
+        total = 40
+        for _ in range(total):
+            stream._input_ch.send_nowait(self._frame())
+        stream._input_ch.close()
 
-        stream._drop_stale_input()
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
 
-        assert stream._input_ch.qsize() == 10
-        assert stream._dropped_frames == 25
+        # The frame in hand has already left the channel when the check runs, so
+        # the cap bounds what is still queued behind it: cap + 1 frames survive.
+        assert stream.dropped_frames == total - 10 - 1
+        assert stream._send_audio_chunk.await_count > 0
 
     @pytest.mark.asyncio
-    async def test_backlog_below_cap_untouched(self, mock_stt, monkeypatch):
+    async def test_no_drops_below_the_cap(self, mock_stt, monkeypatch):
         """Nothing is dropped while the backlog is within bounds."""
-        stream = await self._stream(mock_stt)
-        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 10)
+        stream, _ = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 100)
 
-        for _ in range(10):
-            stream._input_ch.send_nowait(Mock(spec=[]))
+        for _ in range(20):
+            stream._input_ch.send_nowait(self._frame())
+        stream._input_ch.close()
 
-        stream._drop_stale_input()
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
 
-        assert stream._input_ch.qsize() == 10
-        assert stream._dropped_frames == 0
+        assert stream.dropped_frames == 0
 
     @pytest.mark.asyncio
-    async def test_flush_sentinel_survives_dropping(self, mock_stt, monkeypatch):
+    async def test_terminates_with_more_sentinels_than_the_cap(self, mock_stt, monkeypatch):
         """
-        A flush sentinel must never be discarded.
+        Regression: a backlog of flush sentinels must not hang the event loop.
 
-        Dropping one would lose the end-of-utterance signal, so Voxist would
-        never be told to finalize and the caller would lose a transcript.
+        The previous trimmer re-queued each sentinel it pulled, leaving qsize()
+        unchanged, so a queue holding more sentinels than the cap spun forever -
+        synchronously, inside the send task, wedging the whole loop.
         """
-        stream = await self._stream(mock_stt)
+        stream, conn = await self._stream(mock_stt)
         monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
 
-        # Sentinel sits inside the prefix that will be trimmed away.
         for _ in range(20):
-            stream._input_ch.send_nowait(Mock(spec=[]))
+            stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
+        stream._input_ch.close()
+
+        # Fails by timeout if the loop cannot make progress
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_every_sentinel_is_honoured_even_over_the_cap(self, mock_stt, monkeypatch):
+        """
+        No flush sentinel may be dropped, and each must trigger its flush.
+
+        Losing one means Voxist is never told to finalize, so the caller silently
+        loses the FINAL_TRANSCRIPT for that utterance.
+        """
+        stream, conn = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
+        stream._audio_processor = Mock()
+        stream._audio_processor.flush = Mock(return_value=[])
+        stream._audio_processor.process_audio_frame = Mock(return_value=[])
+
+        sentinels = 3
+        for _ in range(20):
+            stream._input_ch.send_nowait(self._frame())
+        for _ in range(sentinels):
+            stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
+            for _ in range(20):
+                stream._input_ch.send_nowait(self._frame())
+        # Channel closed, as end_input() leaves it - the old code silently
+        # destroyed sentinels in exactly this state.
+        stream._input_ch.close()
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        assert stream._audio_processor.flush.call_count == sentinels
+        assert conn.ws.send_str.await_count == sentinels  # one "Done" each
+
+    @pytest.mark.asyncio
+    async def test_sentinel_order_is_preserved(self, mock_stt, monkeypatch):
+        """
+        A sentinel must be honoured at its own position, not moved behind audio.
+
+        The previous trimmer appended re-queued sentinels to the tail, so an
+        utterance boundary could land ~10s of audio late - finalizing segment N
+        only after segment N+1 had been streamed, and sending "Done" mid-speech.
+        """
+        stream, conn = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 1000)
+
+        events = []
+        stream._audio_processor = Mock()
+        stream._audio_processor.process_audio_frame = Mock(
+            side_effect=lambda _b: events.append("audio") or []
+        )
+        stream._audio_processor.flush = Mock(
+            side_effect=lambda: events.append("flush") or []
+        )
+
+        for _ in range(3):
+            stream._input_ch.send_nowait(self._frame())
         stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
-        for _ in range(20):
-            stream._input_ch.send_nowait(Mock(spec=[]))
-        assert stream._input_ch.qsize() == 41
+        for _ in range(3):
+            stream._input_ch.send_nowait(self._frame())
+        stream._input_ch.close()
 
-        stream._drop_stale_input()
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
 
-        remaining = []
-        while stream._input_ch.qsize():
-            remaining.append(stream._input_ch.recv_nowait())
-
-        sentinels = [r for r in remaining if isinstance(r, VoxistSTTStream._FlushSentinel)]
-        assert len(sentinels) == 1, "the end-of-utterance signal was dropped"
-        # Trimming 41 items to the cap of 5 removes 36; the sentinel is
-        # re-queued rather than removed, so all 36 are audio frames.
-        assert stream._dropped_frames == 36
-        assert len(remaining) == 5
-        # It now sits after the audio that was kept, which is where it belongs
-        assert isinstance(remaining[-1], VoxistSTTStream._FlushSentinel)
+        assert events == ["audio", "audio", "audio", "flush", "audio", "audio", "audio"]
 
     @pytest.mark.asyncio
-    async def test_drop_logs_a_warning(self, mock_stt, monkeypatch, caplog):
-        """Dropped audio must be visible, not silent."""
-        stream = await self._stream(mock_stt)
+    async def test_dropped_frames_is_visible_to_the_caller(self, mock_stt, monkeypatch):
+        """
+        Audio loss must be observable, not log-only.
+
+        Dropping frames makes the transcript lossy while the emitted events look
+        completely normal, so a caller needs a way to tell the difference.
+        """
+        stream, _ = await self._stream(mock_stt)
         monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
 
+        assert stream.dropped_frames == 0
         for _ in range(30):
-            stream._input_ch.send_nowait(Mock(spec=[]))
+            stream._input_ch.send_nowait(self._frame())
+        stream._input_ch.close()
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        assert stream.dropped_frames == 30 - 5 - 1  # cap + 1 frames survive
+
+    @pytest.mark.asyncio
+    async def test_drop_warning_is_rate_limited(self, mock_stt, monkeypatch, caplog):
+        """
+        The drop warning must not flood.
+
+        The drop condition persists for the whole overload and the loop runs per
+        10ms frame, so an unlimited warning emits ~100 lines/second per stream.
+        """
+        stream, _ = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
+        monkeypatch.setattr(VoxistSTTStream, "DROP_LOG_INTERVAL_SECONDS", 3600.0)
+
+        # Simulate a freshly booted host: monotonic() has an arbitrary epoch, so
+        # a small value must not make the elapsed check suppress the first
+        # report. Using 0.0 as the "never reported" sentinel did exactly that,
+        # and only showed up on CI because a developer machine's uptime happens
+        # to exceed any plausible interval.
+        clock = iter([1.0 + i * 0.001 for i in range(5000)])
+        monkeypatch.setattr(
+            "livekit.plugins.voxist.stream.time.monotonic", lambda: next(clock)
+        )
+
+        for _ in range(200):
+            stream._input_ch.send_nowait(self._frame())
+        stream._input_ch.close()
 
         with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
-            stream._drop_stale_input()
+            await asyncio.wait_for(stream._send_audio_task(), timeout=10.0)
 
-        assert any("dropped" in r.message for r in caplog.records)
+        drops = [r for r in caplog.records if "dropping audio" in r.message]
+        assert stream.dropped_frames == 200 - 5 - 1
+        assert len(drops) == 1, f"expected 1 rate-limited warning, got {len(drops)}"
 
 
 class TestTransportAccessorAgainstRealAiohttp:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import ssl
 from enum import Enum
 
 import aiohttp
@@ -105,6 +106,7 @@ class VoxistSTT(STT):
         enable_metrics: bool = True,
         http_session: aiohttp.ClientSession | None = None,
         api_key_header: str = "X-LVL-KEY",
+        ssl_context: ssl.SSLContext | None = None,
     ):
         """
         Initialize Voxist STT plugin.
@@ -124,6 +126,10 @@ class VoxistSTT(STT):
             enable_metrics: Emit LiveKit metrics events
             http_session: Optional aiohttp session (for advanced use)
             api_key_header: HTTP header name for API key (default: X-LVL-KEY)
+            ssl_context: Optional SSL context for TLS. Needed to reach a
+                deployment whose certificate is signed by a private CA:
+                certificate verification is always enabled, so without a
+                context trusting that CA the connection is refused.
 
         Raises:
             ConfigurationError: If API key missing or invalid config
@@ -200,6 +206,7 @@ class VoxistSTT(STT):
             heartbeat_interval=heartbeat_interval,
             max_reconnect_attempts=max_reconnect_attempts,
             language=language,
+            ssl_context=ssl_context,
             sample_rate=16000,  # Voxist expects 16kHz (we resample from input rate)
             api_key_header=api_key_header,
         )
@@ -345,8 +352,13 @@ class VoxistSTT(STT):
             except asyncio.CancelledError:
                 logger.debug("Initialization task cancelled")
 
-        await self._pool.close()
+        # Streams first, pool second. The other order leaves any connection
+        # whose socket already died still IN_USE (pool.close() only touches open
+        # ones), so the stream's release would schedule a reconnect against an
+        # already-closed ClientSession and retry with backoff for minutes after
+        # aclose() returned.
         await super().aclose()
+        await self._pool.close()
 
     @property
     def initialization_error(self) -> Exception | None:

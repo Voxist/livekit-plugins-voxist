@@ -88,6 +88,14 @@ class VoxistSTTStream(RecognizeStream):
     # SEND_TIMEOUT_SECONDS is visible and testable.
     RECEIVE_TIMEOUT_SECONDS = 30.0
 
+    # How long to keep receiving after "Done" has been written. The trailing
+    # final transcript is produced after end of input, so the receive side must
+    # outlive the send side; the wait normally ends early when Voxist closes the
+    # socket. Kept short because it delays END_OF_SPEECH when a server neither
+    # answers nor closes, and well under RECEIVE_TIMEOUT_SECONDS so a genuine
+    # stall is still classified by the receive watchdog.
+    RESULT_DRAIN_TIMEOUT_SECONDS = 2.0
+
     # Rate limit for the audio-drop warning. The drop condition persists for
     # the whole overload, and the send loop runs per 10ms frame, so an unlimited
     # warning would emit ~100 lines/second per stream.
@@ -232,6 +240,38 @@ class VoxistSTTStream(RecognizeStream):
                 return_when=asyncio.FIRST_COMPLETED
             )
 
+            # The send task finishing is not the end of the exchange: it returns
+            # as soon as "Done" is written, while the transcript for that audio
+            # is still being computed. Cancelling the receive task here would
+            # discard it - the final result of every utterance - so give it a
+            # bounded window to finish. Voxist closes the socket once it has
+            # flushed, which ends the wait immediately in the normal case; the
+            # timeout only covers a server that leaves the socket open.
+            if (
+                recv_task in pending
+                and send_task in done
+                and not send_task.cancelled()
+                and send_task.exception() is None
+            ):
+                logger.debug(
+                    f"Stream {self._session_id} input ended, draining results"
+                )
+                _, pending = await asyncio.wait(
+                    [recv_task], timeout=self.RESULT_DRAIN_TIMEOUT_SECONDS
+                )
+                if pending:
+                    logger.warning(
+                        f"Stream {self._session_id} gave up draining results "
+                        f"{self.RESULT_DRAIN_TIMEOUT_SECONDS}s after end of input "
+                        "- a trailing transcript may have been lost"
+                    )
+                    # The socket still has an unread result frame queued on it.
+                    # Returning it to the pool would hand that frame to the next
+                    # stream, which would emit this session's transcript under
+                    # its own request_id - so retire it instead.
+                    await self._abandon_connection()
+                done = {t for t in (send_task, recv_task) if t not in pending}
+
             # Cancel pending tasks
             for task in pending:
                 task.cancel()
@@ -242,6 +282,8 @@ class VoxistSTTStream(RecognizeStream):
 
             # Check for exceptions in completed tasks
             for task in done:
+                if task.cancelled():
+                    continue
                 exc = task.exception()
                 if exc is not None:
                     raise exc

@@ -19,7 +19,8 @@ def auto_mock_token_exchange(request):
 
     To skip this fixture, mark test with:
     - @pytest.mark.no_auto_mock_token - for tests that need to test token exchange directly
-    - @pytest.mark.integration - for integration tests that use mock_voxist_server fixture
+    - @pytest.mark.integration - integration tests run against MockVoxistServer,
+      which serves the real token endpoint, so they must not be patched
     """
     # Skip if test is marked with no_auto_mock_token or integration (which has its own server)
     if (request.node.get_closest_marker('no_auto_mock_token') or
@@ -84,17 +85,17 @@ def test_api_key():
 
 
 @pytest.fixture
-async def mock_voxist_server(request):
+async def mock_voxist_server():
     """
-    Create and start mock Voxist WebSocket server for testing.
+    Create and start mock Voxist server for testing.
 
-    Also sets up the token exchange mock to return this server's URL.
+    The server exposes both the SEC-001 token endpoint and the WebSocket
+    route, so integration tests exercise the real token exchange rather than
+    a patched _get_ws_token.
 
     Yields:
         MockVoxistServer instance running on localhost:8765
     """
-    from livekit.plugins.voxist.connection_pool import ConnectionPool
-
     server = MockVoxistServer(
         port=8765,
         valid_api_key="test_key",
@@ -105,12 +106,7 @@ async def mock_voxist_server(request):
 
     await server.start()
 
-    # Mock token exchange to return this server's URL (for integration tests)
-    async def _mock_get_ws_token(self, language: str, sample_rate: int) -> str:
-        return f"ws://{server.host}:{server.port}/ws?token=mock_jwt_token&lang={language}&sample_rate={sample_rate}"
-
-    with patch.object(ConnectionPool, '_get_ws_token', _mock_get_ws_token):
-        yield server
+    yield server
 
     await server.stop()
 

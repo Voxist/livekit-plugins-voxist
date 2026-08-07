@@ -117,6 +117,10 @@ class ConnectionPool:
         self.connections: list[Connection] = []
         self.current_index = 0
         self._lock = asyncio.Lock()
+        # Separate from _lock so an in-flight initialize() does not block
+        # get_connection()/release_connection() for the whole connect timeout.
+        self._init_lock = asyncio.Lock()
+
         # Strong references to in-flight reconnect tasks (see _spawn_reconnect)
         self._reconnect_tasks: set[asyncio.Task] = set()
         self._initialized = False
@@ -289,69 +293,77 @@ class ConnectionPool:
         Establishes connections in parallel and waits for at least one
         successful connection before returning.
 
+        Safe to call concurrently: only the first caller builds the pool, the
+        rest wait for it and return.
+
         Raises:
             ConnectionError: If no connections could be established
             AuthenticationError: If API key is invalid
         """
-        if self._initialized:
-            logger.debug("Pool already initialized")
-            return
+        # _initialized is only set once every connection has been attempted, so
+        # the flag alone cannot make this idempotent: two concurrent callers
+        # would each append pool_size connections and each create a
+        # ClientSession, leaking the first. Serialize, then re-check.
+        async with self._init_lock:
+            if self._initialized:
+                logger.debug("Pool already initialized")
+                return
 
-        logger.info(f"Initializing connection pool with {self.pool_size} connections")
+            logger.info(f"Initializing connection pool with {self.pool_size} connections")
 
-        # Create shared aiohttp session
-        self._session = aiohttp.ClientSession()
+            # Create shared aiohttp session
+            self._session = aiohttp.ClientSession()
 
-        # Create all connection objects
-        for i in range(self.pool_size):
-            conn = Connection(id=i)
-            self.connections.append(conn)
+            # Create all connection objects
+            for i in range(self.pool_size):
+                conn = Connection(id=i)
+                self.connections.append(conn)
 
-        # Connect all in parallel
-        connect_tasks = [
-            asyncio.create_task(self._connect(conn, self.language, self.sample_rate))
-            for conn in self.connections
-        ]
+            # Connect all in parallel
+            connect_tasks = [
+                asyncio.create_task(self._connect(conn, self.language, self.sample_rate))
+                for conn in self.connections
+            ]
 
-        # Wait for at least one success, but give all a chance
-        done, pending = await asyncio.wait(
-            connect_tasks,
-            return_when=asyncio.FIRST_COMPLETED,
-            timeout=self.connection_timeout
-        )
-
-        # Let remaining connections finish in background
-        for _task in pending:
-            # Don't cancel, let them complete
-            pass
-
-        # Check if at least one succeeded
-        successful = sum(
-            1 for task in done
-            if not task.exception() and task.result()
-        )
-
-        if successful == 0:
-            # Check for auth errors in completed tasks
-            for task in done:
-                if task.exception():
-                    exc = task.exception()
-                    if isinstance(exc, AuthenticationError):
-                        raise exc
-
-            raise ConnectionError(
-                f"Failed to establish any connections. "
-                f"Completed: {len(done)}/{self.pool_size}"
+            # Wait for at least one success, but give all a chance
+            done, pending = await asyncio.wait(
+                connect_tasks,
+                return_when=asyncio.FIRST_COMPLETED,
+                timeout=self.connection_timeout
             )
 
-        logger.debug(
-            f"Connection pool initialized: {successful}/{self.pool_size} successful"
-        )
+            # Let remaining connections finish in background
+            for _task in pending:
+                # Don't cancel, let them complete
+                pass
 
-        self._initialized = True
+            # Check if at least one succeeded
+            successful = sum(
+                1 for task in done
+                if not task.exception() and task.result()
+            )
 
-        # Start heartbeat monitoring in background
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+            if successful == 0:
+                # Check for auth errors in completed tasks
+                for task in done:
+                    if task.exception():
+                        exc = task.exception()
+                        if isinstance(exc, AuthenticationError):
+                            raise exc
+
+                raise ConnectionError(
+                    f"Failed to establish any connections. "
+                    f"Completed: {len(done)}/{self.pool_size}"
+                )
+
+            logger.debug(
+                f"Connection pool initialized: {successful}/{self.pool_size} successful"
+            )
+
+            self._initialized = True
+
+            # Start heartbeat monitoring in background
+            self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     def _get_http_base_url(self) -> str:
         """
@@ -584,6 +596,15 @@ class ConnectionPool:
 
             logger.debug(f"Connection {conn.id} established successfully")
             return True
+
+        except AuthenticationError:
+            # Raised by the token exchange for a 401/403. Must not fall through
+            # to the catch-all below: an invalid key is permanent, and both
+            # initialize() (which re-raises it) and _reconnect() (which stops
+            # retrying on it) depend on seeing this exception rather than False.
+            logger.error(f"Authentication failed for connection {conn.id}")
+            conn.state = ConnectionState.FAILED
+            raise
 
         except asyncio.TimeoutError:
             logger.error(f"Connection {conn.id} timeout after {self.connection_timeout}s")

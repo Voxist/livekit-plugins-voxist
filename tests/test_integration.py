@@ -9,8 +9,24 @@ from livekit.agents.stt import SpeechEventType
 
 from livekit import rtc
 from livekit.plugins.voxist import VoxistSTT
+from livekit.plugins.voxist.models import ConnectionState
 
 from .fixtures.mock_server import MockVoxistServer
+
+
+async def wait_for_pool_settled(pool, timeout: float = 5.0) -> None:
+    """
+    Wait until no connection in the pool is still CONNECTING.
+
+    initialize() returns as soon as the first connection is up and deliberately
+    lets the rest finish in the background, so pool state read immediately
+    afterwards is not final: a straggler that completes later overwrites
+    whatever state it had in the meantime.
+    """
+    deadline = time.time() + timeout
+    while any(c.state == ConnectionState.CONNECTING for c in pool.connections):
+        assert time.time() < deadline, f"pool did not settle within {timeout}s"
+        await asyncio.sleep(0.01)
 
 
 @pytest.mark.integration
@@ -488,6 +504,7 @@ class TestErrorHandling:
         )
 
         await stt._pool.initialize()
+        await wait_for_pool_settled(stt._pool)
 
         # Manually fail all connections
         for conn in stt._pool.connections:
@@ -667,6 +684,7 @@ class TestStreamLifecycle:
         )
 
         await stt._pool.initialize()
+        await wait_for_pool_settled(stt._pool)
 
         # Check initial pool state
         initial_health = stt._pool.get_pool_health()
@@ -697,7 +715,3 @@ class TestStreamLifecycle:
         assert final_health["ready"] + final_health["in_use"] >= 1
 
         await stt.aclose()
-
-
-# Import ConnectionState for exhaustion test
-from livekit.plugins.voxist.models import ConnectionState

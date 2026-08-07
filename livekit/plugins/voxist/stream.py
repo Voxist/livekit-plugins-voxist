@@ -10,18 +10,19 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 import numpy as np
-from livekit.agents import utils
+
+# Required, not optional: the fallback shim this replaced silently disabled
+# BCP-47 normalization on older livekit-agents, so the emitted language differed
+# from the documented behaviour with nothing to signal it. The dependency floor
+# guarantees this import, and failing loudly at import time beats diverging
+# quietly at runtime.
+from livekit.agents import LanguageCode, utils
 from livekit.agents.stt import (
     RecognizeStream,
     SpeechData,
     SpeechEvent,
     SpeechEventType,
 )
-
-try:  # livekit-agents >= 1.x
-    from livekit.agents import LanguageCode
-except ImportError:  # pragma: no cover - older livekit-agents has no such type
-    LanguageCode = str  # type: ignore[assignment, misc]
 
 from livekit import rtc  # type: ignore[attr-defined]
 
@@ -160,6 +161,30 @@ class VoxistSTTStream(RecognizeStream):
         self._owns_connection = False
         # Latch so an unreachable transport is reported once, not per chunk
         self._transport_lookup_failed = False
+        # Lifecycle bookkeeping. A run of _run_stream_tasks() ends in exactly
+        # one of two states and they must not be confused:
+        #
+        #   input exhausted - the flush sentinel was processed and "Done" was
+        #                     written, so the utterance is genuinely over. Only
+        #                     this counts as normal completion.
+        #   interrupted     - anything else: the connection died, stalled, or
+        #                     was closed by the peer before the input ended.
+        #                     Must be retried, and the socket must be retired.
+        #
+        # Classifying an interruption as completion is how a mid-call socket
+        # close came to truncate a transcript silently: the send loop discarded
+        # chunks on a closed socket, the receive loop exited on the same
+        # condition, neither raised, and the retry loop was never entered.
+        self._input_exhausted = False
+        # Set when the sentinel is consumed, cleared once "Done" is away.
+        # Consuming the sentinel and flushing the ring buffer are both
+        # destructive, so a failure between them would otherwise lose the
+        # finalize signal permanently, and with it the trailing transcript.
+        self._flush_pending = False
+        # Whether the current connection has produced any result. This is the
+        # definition of progress for the retry budget: resetting the budget on
+        # every successful acquire instead let a stream retry forever.
+        self._made_progress = False
         # Count of frames dropped to keep the input backlog bounded, and when
         # that was last reported. None means "not yet" - monotonic() has an
         # arbitrary epoch (uptime on Linux), so 0.0 is not a usable sentinel:
@@ -215,7 +240,13 @@ class VoxistSTTStream(RecognizeStream):
         """
         if self._conn:
             self._owns_connection = False  # Release exclusive ownership
-            await self._pool.release_connection(self._conn)
+            # The pool cannot tell a socket the gateway closed after "Done" from
+            # one that died mid-session; only the stream knows. Without this the
+            # normal end of every utterance was treated as a failure and pushed
+            # through the reconnect backoff.
+            await self._pool.release_connection(
+                self._conn, expected_close=self._input_exhausted
+            )
             self._conn = None
 
     async def _run_stream_tasks(self) -> None:
@@ -269,6 +300,11 @@ class VoxistSTTStream(RecognizeStream):
                         f"{self.RESULT_DRAIN_TIMEOUT_SECONDS}s after end of input "
                         "- a trailing transcript may have been lost"
                     )
+                    # The socket still has an unread result frame queued on it.
+                    # Returning it to the pool would hand that frame to the next
+                    # stream, which would emit this session's text under its own
+                    # request_id, so retire it instead.
+                    await self._abandon_connection()
                 done = {t for t in (send_task, recv_task) if t not in pending}
 
             # Cancel pending tasks
@@ -334,11 +370,21 @@ class VoxistSTTStream(RecognizeStream):
                 # be configured for a different one.
                 await self._apply_config()
 
-                # Reset reconnection counter on successful connection
-                reconnect_attempts = 0
+                # A fresh connection has produced nothing yet.
+                self._made_progress = False
+                self._input_exhausted = False
 
                 # Run concurrent send/receive tasks
                 await self._run_stream_tasks()
+
+                # Both tasks returned without raising, which is not by itself
+                # normal completion: a socket that died mid-session used to land
+                # here and break out of the retry loop with a truncated
+                # transcript. Only an exhausted input means the utterance is over.
+                if not self._input_exhausted:
+                    raise ConnectionError(
+                        "stream ended before the input was exhausted"
+                    )
 
                 # Normal completion - emit END_OF_SPEECH if we were speaking
                 # (Voxist doesn't signal end of utterance, client closes connection)
@@ -357,6 +403,20 @@ class VoxistSTTStream(RecognizeStream):
 
             except Exception as e:
                 logger.error(f"Stream {self._session_id} error: {e}")
+
+                # Refresh the budget only if this connection actually produced
+                # something. Resetting it on every successful acquire made the
+                # guard unreachable: the pool always hands back a fresh socket,
+                # so the counter oscillated between 0 and 1 and the stream could
+                # retry forever without ever raising - no transcripts, no error,
+                # for the life of the call.
+                if self._made_progress:
+                    logger.debug(
+                        f"Stream {self._session_id} made progress before failing, "
+                        "resetting the reconnect budget"
+                    )
+                    reconnect_attempts = 0
+                    self._made_progress = False
 
                 if reconnect_attempts >= max_attempts:
                     logger.error(
@@ -401,6 +461,10 @@ class VoxistSTTStream(RecognizeStream):
                 # Check for flush sentinel
                 if isinstance(data, self._FlushSentinel):
                     logger.debug(f"Stream {self._session_id} flushing audio")
+                    # Record that a finalize is owed before doing anything
+                    # destructive, so a failed send is retried rather than
+                    # silently losing the trailing transcript.
+                    self._flush_pending = True
 
                     # Flush remaining audio from processor
                     final_chunks = self._audio_processor.flush()
@@ -414,6 +478,7 @@ class VoxistSTTStream(RecognizeStream):
                         )
                         logger.debug(f"Stream {self._session_id} sent Done signal")
 
+                    self._flush_pending = False
                     continue
 
                 # Process audio frame
@@ -458,6 +523,9 @@ class VoxistSTTStream(RecognizeStream):
                 else:
                     logger.warning(f"Stream {self._session_id} unexpected data type: {type(data)}")
 
+            # Reached only once the input channel closed and every sentinel in
+            # it was processed, so the utterance really is over.
+            self._input_exhausted = True
             logger.debug(f"Stream {self._session_id} send task completed")
 
         except Exception as e:
@@ -711,8 +779,12 @@ class VoxistSTTStream(RecognizeStream):
             return
 
         if self._conn.ws.closed:
-            logger.warning(f"Stream {self._session_id} WebSocket closed, skipping chunk")
-            return
+            # Not skippable: silently dropping chunks here made a mid-call close
+            # look like a clean end of input, so the stream "completed" with a
+            # truncated transcript and never retried.
+            raise ConnectionError(
+                "WebSocket closed while sending audio - connection lost"
+            )
 
         # SECURITY: Validate exclusive ownership before touching shared
         # connection state (VUL-003). Checked before the send so a violation is
@@ -806,15 +878,32 @@ class VoxistSTTStream(RecognizeStream):
                     )
                     raise ConnectionError("WebSocket connection error occurred")
 
-                elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    logger.debug(f"Stream {self._session_id} WebSocket closed by server")
-                    break
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.CLOSING,
+                ):
+                    # Expected once the input is exhausted: the gateway forwards
+                    # "Done" to the engine and lets the socket close naturally.
+                    # Before that, it means the connection was lost and the
+                    # remaining audio still needs a working socket.
+                    if self._input_exhausted:
+                        logger.debug(
+                            f"Stream {self._session_id} WebSocket closed after "
+                            "end of input"
+                        )
+                        break
+                    raise ConnectionError(
+                        "WebSocket closed by server before end of input"
+                    )
 
-                elif msg.type == aiohttp.WSMsgType.CLOSING:
-                    logger.debug(f"Stream {self._session_id} WebSocket closing")
-                    break
-
-            logger.debug(f"Stream {self._session_id} receive task completed")
+            if not self._conn.ws.closed or self._input_exhausted:
+                logger.debug(f"Stream {self._session_id} receive task completed")
+            else:
+                # The loop guard saw a closed socket rather than a close frame -
+                # same situation, same conclusion.
+                raise ConnectionError(
+                    "WebSocket closed before end of input"
+                )
 
         except Exception as e:
             logger.error(f"Stream {self._session_id} receive task error: {e}")
@@ -831,6 +920,11 @@ class VoxistSTTStream(RecognizeStream):
         Args:
             data: Parsed JSON message from Voxist
         """
+        # Any result means this connection is working, which is what allows the
+        # retry budget to be refreshed without letting a failing stream loop
+        # forever on connections that never produce anything.
+        self._made_progress = True
+
         msg_type = data.get("type")
         msg_status = data.get("status")
 

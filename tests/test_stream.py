@@ -631,14 +631,24 @@ class TestSendPathWithOwnership:
         await stream._send_audio_chunk(np.zeros(160, dtype=np.int16))
 
     @pytest.mark.asyncio
-    async def test_closed_ws_returns_early(self, mock_stt, mock_pool, mock_connection):
-        """Test _send_audio_chunk returns early with closed WebSocket."""
+    async def test_closed_ws_raises_rather_than_skipping(
+        self, mock_stt, mock_pool, mock_connection
+    ):
+        """
+        A closed socket must raise, not silently skip the chunk.
+
+        Skipping made a mid-call close look like a clean end of input: the send
+        loop discarded every remaining chunk with only a warning, so the stream
+        "completed normally" with a truncated transcript and never retried.
+        """
         stream, connection = await self._create_stream_with_connection(
             mock_stt, mock_pool, mock_connection
         )
         connection.ws.closed = True
 
-        await stream._send_audio_chunk(np.zeros(160, dtype=np.int16))
+        with pytest.raises(ConnectionError, match="closed while sending"):
+            await stream._send_audio_chunk(np.zeros(160, dtype=np.int16))
+
         connection.ws.send_bytes.assert_not_called()
 
 
@@ -1249,16 +1259,6 @@ class TestTransportAccessorAgainstRealAiohttp:
             await runner.cleanup()
 
 
-LANGUAGE_CODE_AVAILABLE = getattr(
-    __import__("livekit.agents", fromlist=["LanguageCode"]), "LanguageCode", None
-) is not None
-
-
-@pytest.mark.skipif(
-    not LANGUAGE_CODE_AVAILABLE,
-    reason="livekit-agents predates LanguageCode; stream.py falls back to str "
-    "and performs no normalization, so these expectations do not apply",
-)
 class TestLanguageCodeHandling:
     """
     The code sent to Voxist stays raw; the code emitted to livekit is normalized.
@@ -1483,3 +1483,378 @@ class TestPerStreamLanguageOverride:
         await stream._apply_config()
 
         conn.ws.send_json.assert_not_awaited()
+
+
+class TestRunOutcomeClassification:
+    """
+    A run of _run_stream_tasks() must be classified correctly as completion or
+    interruption, because everything downstream depends on it: the retry budget,
+    whether the socket is retired, and whether END_OF_SPEECH is emitted.
+
+    Getting this wrong was the shared root of several defects - a mid-call close
+    read as normal completion (truncated transcript, no retry), and a retry
+    budget that could never be exhausted (a stream that spun forever without
+    producing anything or ever raising).
+    """
+
+    @pytest.fixture
+    def mock_stt(self):
+        stt = Mock()
+        stt._config = {
+            "sample_rate": 16000,
+            "chunk_duration_ms": 100,
+            "stride_overlap_ms": 20,
+            "interim_results": True,
+        }
+        stt._api_key = "test_key"
+        return stt
+
+    async def _stream(self, mock_stt):
+        from livekit.agents.types import APIConnectOptions
+
+        pool = AsyncMock(spec=ConnectionPool)
+        stream = VoxistSTTStream(
+            stt=mock_stt,
+            pool=pool,
+            config=mock_stt._config,
+            language="fr",
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
+        )
+        stream._task.cancel()
+        try:
+            await stream._task
+        except asyncio.CancelledError:
+            pass
+        conn = Connection(id=0, state=ConnectionState.IN_USE)
+        conn.ws = AsyncMock()
+        conn.ws.closed = False
+        conn.ws._response = None
+        del conn.ws.get_transport
+        conn.applied_language = "fr"
+        stream._conn = conn
+        stream._owns_connection = True
+        return stream, conn, pool
+
+    @pytest.mark.asyncio
+    async def test_retry_budget_is_exhaustible(self, mock_stt, monkeypatch):
+        """
+        A stream that never makes progress must eventually raise.
+
+        The budget used to reset on every successful acquire, so with the pool
+        always handing back a fresh socket the counter oscillated 0->1->0->1 and
+        the guard was unreachable: the stream retried forever, emitting no
+        transcripts and never erroring, for the life of the call.
+        """
+        stream, conn, pool = await self._stream(mock_stt)
+        pool.get_connection = AsyncMock(return_value=conn)
+
+        attempts = {"n": 0}
+
+        async def always_fails():
+            attempts["n"] += 1
+            raise ConnectionError("uplink stalled")
+
+        stream._run_stream_tasks = always_fails
+        stream._apply_config = AsyncMock()
+        monkeypatch.setattr(VoxistSTTStream, "_calculate_backoff", lambda self, a: 0.0)
+
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(stream._run(), timeout=10.0)
+
+        # Bounded by conn_options.max_retry rather than unbounded
+        assert attempts["n"] <= 6, f"retried {attempts['n']} times; budget not enforced"
+
+    @pytest.mark.asyncio
+    async def test_progress_refreshes_the_budget(self, mock_stt, monkeypatch):
+        """
+        A connection that produced results earns a fresh budget.
+
+        Without this a long call with intermittent blips would exhaust a
+        per-stream budget and abort, so the fix for the unbounded loop must not
+        swing to the opposite failure.
+        """
+        stream, conn, pool = await self._stream(mock_stt)
+        pool.get_connection = AsyncMock(return_value=conn)
+        stream._apply_config = AsyncMock()
+        monkeypatch.setattr(VoxistSTTStream, "_calculate_backoff", lambda self, a: 0.0)
+
+        attempts = {"n": 0}
+
+        async def fails_but_progresses():
+            attempts["n"] += 1
+            stream._made_progress = True  # a result arrived on this connection
+            if attempts["n"] < 8:
+                raise ConnectionError("blip")
+            stream._input_exhausted = True
+
+        stream._run_stream_tasks = fails_but_progresses
+
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+
+        # Survived more failures than the raw budget because each made progress
+        assert attempts["n"] == 8
+
+    @pytest.mark.asyncio
+    async def test_clean_return_without_exhausted_input_is_retried(
+        self, mock_stt, monkeypatch
+    ):
+        """
+        Tasks returning without raising is not sufficient for completion.
+
+        A socket closed mid-session made both tasks exit cleanly, so the stream
+        broke out of its retry loop and reported success with a transcript
+        truncated at the moment of the close.
+        """
+        stream, conn, pool = await self._stream(mock_stt)
+        pool.get_connection = AsyncMock(return_value=conn)
+        stream._apply_config = AsyncMock()
+        monkeypatch.setattr(VoxistSTTStream, "_calculate_backoff", lambda self, a: 0.0)
+
+        attempts = {"n": 0}
+
+        async def returns_without_exhausting_input():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                return  # both tasks ended, but the input was never exhausted
+            stream._input_exhausted = True
+
+        stream._run_stream_tasks = returns_without_exhausting_input
+
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+
+        assert attempts["n"] == 2, "a clean return with unexhausted input was not retried"
+
+    @pytest.mark.asyncio
+    async def test_release_reports_expected_close_only_when_exhausted(self, mock_stt):
+        """
+        The pool is told whether the close was expected.
+
+        Only the stream knows: the gateway closes the socket after "Done", so a
+        completed stream hands back a closed socket that is indistinguishable
+        from a mid-session death without this signal.
+        """
+        stream, conn, pool = await self._stream(mock_stt)
+
+        stream._input_exhausted = True
+        await stream._release_connection()
+        assert pool.release_connection.await_args.kwargs["expected_close"] is True
+
+        stream._conn = conn
+        stream._input_exhausted = False
+        await stream._release_connection()
+        assert pool.release_connection.await_args.kwargs["expected_close"] is False
+
+
+class TestResultDrainWindow:
+    """
+    Coverage for the post-input drain in _run_stream_tasks.
+
+    This is the fix for trailing transcripts being discarded, and it had no unit
+    test at all - only the integration suite CI excluded, so all four of its
+    guard conditions were unguarded against refactoring.
+    """
+
+    @pytest.fixture
+    def mock_stt(self):
+        stt = Mock()
+        stt._config = {
+            "sample_rate": 16000,
+            "chunk_duration_ms": 100,
+            "stride_overlap_ms": 20,
+            "interim_results": True,
+        }
+        stt._api_key = "test_key"
+        return stt
+
+    async def _stream(self, mock_stt):
+        from livekit.agents.types import APIConnectOptions
+
+        pool = AsyncMock(spec=ConnectionPool)
+        stream = VoxistSTTStream(
+            stt=mock_stt,
+            pool=pool,
+            config=mock_stt._config,
+            language="fr",
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
+        )
+        stream._task.cancel()
+        try:
+            await stream._task
+        except asyncio.CancelledError:
+            pass
+        conn = Connection(id=0, state=ConnectionState.IN_USE)
+        conn.ws = AsyncMock()
+        conn.ws.closed = False
+        conn.ws._response = None
+        del conn.ws.get_transport
+        stream._conn = conn
+        stream._owns_connection = True
+        return stream, conn, pool
+
+    @pytest.mark.asyncio
+    async def test_recv_task_outlives_the_send_task(self, mock_stt):
+        """
+        The receive side is given time after the input ends.
+
+        The send task returns as soon as "Done" is written while the trailing
+        transcript is still being computed, so cancelling the receive task at
+        that moment discarded the final result of every utterance.
+        """
+        stream, conn, pool = await self._stream(mock_stt)
+
+        recv_finished = {"done": False}
+
+        async def quick_send():
+            stream._input_exhausted = True
+
+        async def slow_recv():
+            await asyncio.sleep(0.15)
+            recv_finished["done"] = True
+
+        stream._send_audio_task = quick_send
+        stream._recv_results_task = slow_recv
+
+        await asyncio.wait_for(stream._run_stream_tasks(), timeout=5.0)
+
+        assert recv_finished["done"], (
+            "the receive task was cancelled before it could deliver the "
+            "trailing transcript"
+        )
+
+    @pytest.mark.asyncio
+    async def test_drain_is_bounded(self, mock_stt, monkeypatch):
+        """A receive task that never finishes must not hang the stream."""
+        stream, conn, pool = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "RESULT_DRAIN_TIMEOUT_SECONDS", 0.2)
+
+        async def quick_send():
+            stream._input_exhausted = True
+
+        async def never_finishes():
+            await asyncio.Event().wait()
+
+        stream._send_audio_task = quick_send
+        stream._recv_results_task = never_finishes
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        await asyncio.wait_for(stream._run_stream_tasks(), timeout=5.0)
+        elapsed = loop.time() - start
+
+        assert 0.2 <= elapsed < 3.0
+
+    @pytest.mark.asyncio
+    async def test_drain_giveup_retires_the_connection(self, mock_stt, monkeypatch):
+        """
+        Giving up on the drain must retire the socket, not pool it.
+
+        An unread result frame is still queued on it, so returning it to the pool
+        made the next stream emit this session's transcript under its own
+        request_id - one caller's words delivered as another's.
+        """
+        stream, conn, pool = await self._stream(mock_stt)
+        monkeypatch.setattr(VoxistSTTStream, "RESULT_DRAIN_TIMEOUT_SECONDS", 0.1)
+
+        async def quick_send():
+            stream._input_exhausted = True
+
+        async def never_finishes():
+            await asyncio.Event().wait()
+
+        stream._send_audio_task = quick_send
+        stream._recv_results_task = never_finishes
+
+        await asyncio.wait_for(stream._run_stream_tasks(), timeout=5.0)
+
+        pool.mark_broken.assert_awaited_once_with(conn)
+
+    @pytest.mark.asyncio
+    async def test_no_drain_when_the_send_task_failed(self, mock_stt):
+        """
+        A failed send must not earn a drain window.
+
+        There is no trailing transcript to wait for when the input never
+        finished, and the exception has to propagate so the run is retried.
+        """
+        stream, conn, pool = await self._stream(mock_stt)
+
+        async def failing_send():
+            raise ConnectionError("send died")
+
+        async def slow_recv():
+            await asyncio.sleep(5.0)
+
+        stream._send_audio_task = failing_send
+        stream._recv_results_task = slow_recv
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        with pytest.raises(ConnectionError, match="send died"):
+            await asyncio.wait_for(stream._run_stream_tasks(), timeout=5.0)
+        assert loop.time() - start < 2.0, "waited for a drain that was not owed"
+
+
+class TestFlushSurvivesSendFailure:
+    """
+    The finalize signal must survive a failed send during flush.
+
+    Consuming the sentinel and flushing the ring buffer are both destructive, so
+    a send failure between them lost "Done" permanently: the retry found an empty
+    closed channel, completed immediately, and the caller silently lost the
+    trailing transcript for that utterance.
+    """
+
+    @pytest.fixture
+    def mock_stt(self):
+        stt = Mock()
+        stt._config = {
+            "sample_rate": 16000,
+            "chunk_duration_ms": 100,
+            "stride_overlap_ms": 20,
+            "interim_results": True,
+        }
+        stt._api_key = "test_key"
+        return stt
+
+    @pytest.mark.asyncio
+    async def test_flush_pending_marks_the_owed_finalize(self, mock_stt):
+        """A failure during flush leaves the finalize recorded as still owed."""
+        from livekit.agents.types import APIConnectOptions
+
+        stream = VoxistSTTStream(
+            stt=mock_stt,
+            pool=AsyncMock(spec=ConnectionPool),
+            config=mock_stt._config,
+            language="fr",
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
+        )
+        stream._task.cancel()
+        try:
+            await stream._task
+        except asyncio.CancelledError:
+            pass
+
+        conn = Connection(id=0, state=ConnectionState.IN_USE)
+        conn.ws = AsyncMock()
+        conn.ws.closed = False
+        conn.ws._response = None
+        del conn.ws.get_transport
+        stream._conn = conn
+        stream._owns_connection = True
+
+        stream._audio_processor = Mock()
+        stream._audio_processor.flush = Mock(return_value=[np.zeros(160, dtype=np.int16)])
+        stream._send_audio_chunk = AsyncMock(side_effect=ConnectionError("stalled"))
+
+        stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
+        stream._input_ch.close()
+
+        with pytest.raises(ConnectionError):
+            await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        assert stream._flush_pending is True, (
+            "the owed finalize was not recorded, so the retry cannot re-send Done"
+        )
+        assert stream._input_exhausted is False, (
+            "a failed flush must not look like an exhausted input"
+        )

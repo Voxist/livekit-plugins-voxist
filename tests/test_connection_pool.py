@@ -1537,10 +1537,35 @@ class TestTokenExpiry:
         return f"wss://host/ws?token={token}"
 
     def test_expiry_read_from_jwt(self):
-        """The exp claim wins over the one-hour default."""
-        expected = 1_800_000_000.0
-        got = ConnectionPool._token_expiry_from_url(self._url_with_exp(expected), 0.0)
+        """A plausible exp claim wins over the one-hour default."""
+        now = 1_800_000_000.0
+        expected = now + 7200  # two hours: longer than the default, still sane
+        got = ConnectionPool._token_expiry_from_url(self._url_with_exp(expected), now)
         assert got == expected
+
+    def test_implausible_expiry_is_clamped(self):
+        """
+        An exp far in the future falls back to the known lifetime.
+
+        The claim is server-supplied and compared against the local wall clock,
+        so clock skew or a seconds-vs-milliseconds change would otherwise push
+        the refresh past real expiry - after which every connection fails until
+        the process restarts.
+        """
+        now = 1_800_000_000.0
+        # exp in milliseconds, the classic unit mix-up
+        got = ConnectionPool._token_expiry_from_url(
+            self._url_with_exp((now + 3600) * 1000), now
+        )
+        assert got == now + 3600.0
+
+    def test_already_expired_claim_is_not_trusted(self):
+        """A backdated claim must not make the plugin skip refreshing."""
+        now = 1_800_000_000.0
+        got = ConnectionPool._token_expiry_from_url(
+            self._url_with_exp(now - 600), now
+        )
+        assert got == now + 3600.0
 
     def test_short_lived_token_is_respected(self):
         """A token shorter than an hour must not be treated as an hour."""
@@ -1651,3 +1676,242 @@ class TestLanguageAwareAcquisition:
             )
 
             await pool_basic.close()
+
+
+class TestConnectionRecyclingVsFailure:
+    """
+    A socket spent by a completed stream is not a failed socket.
+
+    The gateway forwards "Done" to the engine and lets the socket close
+    naturally, so a *successful* stream almost always returns a closed one.
+    Treating that as failure sent every finished utterance through the reconnect
+    backoff and the rate limiter, so an agent doing back-to-back turns hit
+    ConnectionPoolExhaustedError during entirely normal operation.
+    """
+
+    @pytest.mark.asyncio
+    async def test_expected_close_recycles_without_backoff(
+        self, pool_basic, mock_ws_connect
+    ):
+        """A normal end re-dials immediately instead of entering the failure path."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            pool_basic.connections[0].state = ConnectionState.READY
+            conn = await pool_basic.get_connection()
+            conn.ws.closed = True  # gateway closed it after "Done"
+
+            with patch.object(pool_basic, '_spawn_reconnect') as failure_path:
+                await pool_basic.release_connection(conn, expected_close=True)
+                await asyncio.sleep(0.05)
+
+            failure_path.assert_not_called()
+            assert conn.retry_count == 0
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_unexpected_close_still_uses_the_failure_path(
+        self, pool_basic, mock_ws_connect
+    ):
+        """A mid-session death must keep its backoff and retry accounting."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            pool_basic.connections[0].state = ConnectionState.READY
+            conn = await pool_basic.get_connection()
+            conn.ws.closed = True
+
+            with patch.object(pool_basic, '_spawn_reconnect') as failure_path:
+                await pool_basic.release_connection(conn, expected_close=False)
+
+            failure_path.assert_called_once_with(conn)
+
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_back_to_back_turns_do_not_exhaust_the_pool(
+        self, pool_basic, mock_ws_connect
+    ):
+        """
+        Sequential utterances must keep finding a connection.
+
+        This is the user-visible shape of the regression: a voice agent taking
+        consecutive turns got ConnectionPoolExhaustedError because each completed
+        turn parked its connection in a reconnect backoff.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+            for c in pool_basic.connections:
+                c.state = ConnectionState.READY
+
+            for turn in range(5):
+                conn = await pool_basic.get_connection()
+                conn.ws.closed = True  # completed turn, socket spent
+                await pool_basic.release_connection(conn, expected_close=True)
+                await asyncio.sleep(0.05)  # let the recycle land
+
+            await pool_basic.close()
+
+
+class TestReconnectBudgetRecovery:
+    """
+    An exhausted reconnect budget must not brick a connection permanently.
+
+    retry_count counts *consecutive* failures but was only ever reset by a
+    successful connect, so an outage long enough to exhaust the budget left every
+    connection FAILED for the life of the process - a transient network problem
+    required a restart.
+    """
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_starts_a_new_episode_when_budget_spent(
+        self, pool_basic, mock_ws_connect
+    ):
+        """The heartbeat retries an over-budget connection rather than skipping it."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            conn = pool_basic.connections[0]
+            conn.state = ConnectionState.FAILED
+            conn.retry_count = pool_basic.max_reconnect_attempts + 1
+
+            pool_basic.heartbeat_interval = 0.05
+            with patch.object(pool_basic, '_spawn_reconnect') as spawn:
+                task = asyncio.create_task(pool_basic._heartbeat_loop())
+                await asyncio.sleep(0.2)
+                pool_basic._closing = True
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            assert spawn.called, "an over-budget connection was abandoned forever"
+            assert conn.retry_count == 0, "the failure episode was not reset"
+
+            pool_basic._closing = False
+            await pool_basic.close()
+
+    @pytest.mark.asyncio
+    async def test_mark_broken_starts_a_fresh_episode(self, pool_basic, mock_ws_connect):
+        """A working connection that dies gets a full budget, not a leftover one."""
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            conn = pool_basic.connections[0]
+            conn.state = ConnectionState.IN_USE
+            conn.retry_count = 7  # left over from an earlier rough patch
+
+            with patch.object(pool_basic, '_spawn_reconnect'):
+                await pool_basic.mark_broken(conn)
+
+            assert conn.retry_count == 0
+
+            await pool_basic.close()
+
+
+class TestShutdownAndErrorSurfacing:
+    """Shutdown must not leave work behind, and causes must reach the caller."""
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_in_flight_reconnects(self, pool_basic, mock_ws_connect):
+        """
+        A reconnect parked in its backoff must not outlive the pool.
+
+        _closing suppresses only *new* spawns; a task already sleeping up to 30s
+        would wake against a closed ClientSession and log errors after shutdown.
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            started = asyncio.Event()
+
+            async def long_backoff(conn, state_already_set=False):
+                started.set()
+                await asyncio.sleep(30)
+
+            with patch.object(pool_basic, '_reconnect', long_backoff):
+                pool_basic._spawn_reconnect(pool_basic.connections[0])
+                await asyncio.wait_for(started.wait(), timeout=2.0)
+                assert pool_basic._reconnect_tasks
+
+                await pool_basic.close()
+
+            assert not pool_basic._reconnect_tasks, (
+                "reconnect tasks survived close()"
+            )
+
+    @pytest.mark.asyncio
+    async def test_auth_failure_is_reported_not_swallowed(
+        self, pool_basic, mock_ws_connect
+    ):
+        """
+        A revoked key must surface as AuthenticationError.
+
+        Reconnects are fire-and-forget, so nothing retrieved their exception: the
+        real cause died inside the task while callers saw only "no healthy
+        connections available".
+        """
+        with patch.object(aiohttp.ClientSession, 'ws_connect', mock_ws_connect):
+            await pool_basic.initialize()
+
+            for c in pool_basic.connections:
+                c.state = ConnectionState.FAILED
+
+            # Simulate what a reconnect task reports when the key is rejected
+            failing = asyncio.get_running_loop().create_future()
+            failing.set_exception(AuthenticationError("Invalid API key"))
+            task = Mock()
+            task.cancelled = Mock(return_value=False)
+            task.exception = Mock(return_value=AuthenticationError("Invalid API key"))
+            pool_basic._log_task_exception(task)
+
+            with pytest.raises(AuthenticationError, match="Invalid API key"):
+                await pool_basic.get_connection()
+
+            failing.exception()  # retrieved, keeps the loop quiet
+            await pool_basic.close()
+
+
+class TestInitializeIsRetryable:
+    """
+    initialize() advertises itself as safe to call again; it must be.
+
+    A retry after a failed first attempt appended another pool_size connections
+    with colliding ids and overwrote the session, leaking the first one's sockets.
+    """
+
+    @pytest.mark.asyncio
+    async def test_retry_after_failure_does_not_duplicate_state(self, pool_basic):
+        """A second attempt rebuilds cleanly rather than accumulating."""
+        async def always_fails(self, *args, **kwargs):
+            raise aiohttp.ClientError("network down")
+
+        with patch.object(aiohttp.ClientSession, 'ws_connect', always_fails):
+            with pytest.raises(ConnectionError):
+                await pool_basic.initialize()
+
+        assert len(pool_basic.connections) == pool_basic.pool_size
+        first_session = pool_basic._session
+
+        async def works(self, *args, **kwargs):
+            ws = AsyncMock()
+            ws.closed = False
+            ws.close = AsyncMock()
+            return ws
+
+        with patch.object(aiohttp.ClientSession, 'ws_connect', works):
+            await pool_basic.initialize()
+
+        assert len(pool_basic.connections) == pool_basic.pool_size, (
+            f"retry duplicated connections: {len(pool_basic.connections)}"
+        )
+        assert len({c.id for c in pool_basic.connections}) == pool_basic.pool_size, (
+            "retry produced colliding connection ids"
+        )
+        assert first_session is None or first_session.closed, (
+            "the failed attempt's ClientSession was leaked"
+        )
+
+        await pool_basic.close()

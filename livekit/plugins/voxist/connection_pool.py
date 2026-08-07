@@ -123,6 +123,10 @@ class ConnectionPool:
 
         # Strong references to in-flight reconnect tasks (see _spawn_reconnect)
         self._reconnect_tasks: set[asyncio.Task] = set()
+        # Last authentication failure seen by a background reconnect, so
+        # get_connection() can report the real cause rather than "no healthy
+        # connections" when the key has been revoked.
+        self._auth_error: AuthenticationError | None = None
         self._initialized = False
         self._heartbeat_task: asyncio.Task | None = None
         self._session: aiohttp.ClientSession | None = None
@@ -151,6 +155,39 @@ class ConnectionPool:
         """Check if the connection pool has been initialized."""
         return self._initialized
 
+    async def recycle_connection(self, conn: Connection) -> None:
+        """
+        Replace a socket that closed as part of finishing normally.
+
+        The gateway forwards "Done" to the ASR engine and lets the socket close
+        naturally, so a *successful* stream almost always hands back a closed
+        socket. Treating that as a failure sent every completed utterance through
+        the reconnect backoff and the reconnect rate limiter, which made a voice
+        agent doing back-to-back turns hit ConnectionPoolExhaustedError during
+        entirely normal operation.
+
+        So this path re-dials immediately: no backoff, no retry accounting, no
+        rate-limit consumption. Failures still go through mark_broken().
+
+        Args:
+            conn: The connection whose socket closed after a completed stream
+        """
+        async with self._lock:
+            if self._closing or conn.state == ConnectionState.CONNECTING:
+                return
+            conn.state = ConnectionState.CONNECTING
+            conn.buffered_amount = 0
+            conn.retry_count = 0
+
+        logger.debug(f"Recycling connection {conn.id} after normal completion")
+
+        task = asyncio.create_task(
+            self._connect(conn, self.language, self.sample_rate)
+        )
+        self._reconnect_tasks.add(task)
+        task.add_done_callback(self._reconnect_tasks.discard)
+        task.add_done_callback(self._log_task_exception)
+
     async def mark_broken(self, conn: Connection) -> None:
         """
         Retire a connection a stream found unusable, and reconnect it.
@@ -171,9 +208,39 @@ class ConnectionPool:
                 return  # already retired
             conn.state = ConnectionState.CLOSED
             conn.buffered_amount = 0
+            # A connection that was working until now begins a fresh failure
+            # episode. retry_count is a consecutive-failure count, and leaving it
+            # at its previous value meant one bad patch earlier in the process
+            # could leave the connection permanently over budget.
+            conn.retry_count = 0
             logger.warning(f"Connection {conn.id} marked broken, will reconnect")
 
         self._spawn_reconnect(conn)
+
+    def _log_task_exception(self, task: asyncio.Task) -> None:
+        """
+        Retrieve and report a background task's exception.
+
+        Reconnects are fire-and-forget, so without this nothing ever calls
+        task.exception(): an AuthenticationError from a revoked key died inside
+        the task (at best an "exception was never retrieved" warning at GC) while
+        callers saw only "No healthy connections available". The cause is also
+        stored so get_connection() can report it instead of a generic message.
+        """
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is None:
+            return
+
+        if isinstance(exc, AuthenticationError):
+            self._auth_error = exc
+            logger.error(
+                f"Authentication failed while reconnecting: {exc}. "
+                "The API key is rejected; reconnecting will not help."
+            )
+        else:
+            logger.error(f"Reconnect task failed: {exc}")
 
     def _spawn_reconnect(
         self, conn: Connection, state_already_set: bool = False
@@ -197,6 +264,7 @@ class ConnectionPool:
         )
         self._reconnect_tasks.add(task)
         task.add_done_callback(self._reconnect_tasks.discard)
+        task.add_done_callback(self._log_task_exception)
 
     def _usable_ready(self, reconnect_dead: bool) -> list[Connection]:
         """
@@ -337,6 +405,18 @@ class ConnectionPool:
 
             logger.info(f"Initializing connection pool with {self.pool_size} connections")
 
+            # Reset any state a previous failed attempt left behind. The lock
+            # makes concurrent calls safe, but a *sequential* retry after a
+            # failure would otherwise append another pool_size connections with
+            # colliding ids and overwrite the session, leaking the first one's
+            # sockets. The docstring advertises this method as retryable, so it
+            # has to actually be.
+            if self._session is not None and not self._session.closed:
+                logger.debug("Discarding the session from a failed initialize()")
+                await self._session.close()
+            self.connections.clear()
+            self.current_index = 0
+
             # Create shared aiohttp session
             self._session = aiohttp.ClientSession()
 
@@ -448,10 +528,23 @@ class ConnectionPool:
             )
             return fallback
 
+        # Clamp before use. The claim is server-supplied and compared against
+        # the local wall clock, so clock skew or a unit change (seconds vs
+        # milliseconds) could otherwise push the refresh far past real expiry -
+        # every connection would then fail until the process restarted.
+        max_lifetime = 24 * 3600.0
         if exp <= now:
             logger.warning(
-                "WebSocket token is already expired according to its exp claim"
+                "WebSocket token is already expired according to its exp claim; "
+                "using the default lifetime instead"
             )
+            return fallback
+        if exp - now > max_lifetime:
+            logger.warning(
+                f"WebSocket token exp claim is implausibly far ahead "
+                f"({exp - now:.0f}s); using the default lifetime instead"
+            )
+            return fallback
         return exp
 
     async def _get_ws_token(self, language: str, sample_rate: int) -> str:
@@ -721,7 +814,14 @@ class ConnectionPool:
                 # SECURITY: Re-validate state after wait to prevent TOCTOU race (VUL-001)
                 # Connection state may have changed while we waited without the lock
                 async with self._lock:
-                    if wait_conn.state == ConnectionState.READY:
+                    # Same guard as _usable_ready(): _connect() marks a
+                    # connection READY the instant ws_connect() returns, so a
+                    # server that closes right after the handshake (expired JWT,
+                    # quota rejection) leaves a READY-but-dead socket that this
+                    # branch would hand straight out.
+                    if wait_conn.state == ConnectionState.READY and (
+                        wait_conn.ws is not None and not wait_conn.ws.closed
+                    ):
                         wait_conn.state = ConnectionState.IN_USE
                         logger.debug(f"Acquired connecting connection {wait_conn.id}")
                         return wait_conn
@@ -766,20 +866,38 @@ class ConnectionPool:
             pool_status = self._get_pool_status()
             logger.error(f"Connection pool exhausted: {pool_status}")
 
+            # A revoked or rotated key makes every reconnect fail for a reason
+            # the caller cannot guess from "no healthy connections". Reconnects
+            # are fire-and-forget, so the cause is captured by
+            # _log_task_exception and re-surfaced here.
+            if self._auth_error is not None:
+                raise self._auth_error
+
             # Log detailed status internally, but sanitize user-facing message
             raise ConnectionPoolExhaustedError(
                 "No healthy connections available. "
                 "Check network connectivity and Voxist API status."
             )
 
-    async def release_connection(self, conn: Connection) -> None:
+    async def release_connection(
+        self, conn: Connection, expected_close: bool = False
+    ) -> None:
         """
         Release connection back to pool.
 
         Args:
             conn: Connection to release
+            expected_close: True when the stream finished normally. The gateway
+                forwards "Done" to the engine and lets the socket close
+                naturally, so a *completed* stream almost always hands back a
+                closed socket. Without this flag that is indistinguishable from
+                a mid-session death, and every finished utterance was pushed
+                through the failure backoff and the reconnect rate limiter -
+                which made back-to-back turns raise
+                ConnectionPoolExhaustedError during normal operation.
         """
         needs_reconnect = False
+        needs_recycle = False
 
         async with self._lock:
             if conn.state == ConnectionState.IN_USE:
@@ -787,7 +905,11 @@ class ConnectionPool:
                 # transport that is no longer in use.
                 conn.buffered_amount = 0
 
-                if conn.ws is None or conn.ws.closed:
+                if (conn.ws is None or conn.ws.closed) and expected_close:
+                    # Spent socket from a completed stream: re-dial immediately
+                    # rather than treating it as a failure.
+                    needs_recycle = True
+                elif conn.ws is None or conn.ws.closed:
                     # Never hand a dead socket back to the pool. A stream whose
                     # connection died mid-session would otherwise return it to
                     # READY, and the next stream would send every chunk into a
@@ -810,6 +932,8 @@ class ConnectionPool:
 
         if needs_reconnect:
             self._spawn_reconnect(conn)
+        elif needs_recycle:
+            await self.recycle_connection(conn)
 
     async def _wait_for_ready(self, conn: Connection) -> None:
         """
@@ -1022,6 +1146,19 @@ class ConnectionPool:
                         if conn.retry_count < self.max_reconnect_attempts:
                             logger.debug(f"Heartbeat triggering reconnect for connection {conn.id}")
                             self._spawn_reconnect(conn)
+                        else:
+                            # Budget spent. Start a new episode rather than
+                            # abandoning the connection for the life of the
+                            # process: retry_count counts *consecutive* failures
+                            # and nothing else ever reset it, so an outage long
+                            # enough to exhaust the budget bricked the pool until
+                            # restart. The heartbeat interval is the cooldown.
+                            logger.warning(
+                                f"Connection {conn.id} exhausted its reconnect "
+                                "budget; starting a new attempt cycle"
+                            )
+                            conn.retry_count = 0
+                            self._spawn_reconnect(conn)
 
                 # Log pool health periodically
                 if logger.isEnabledFor(10):  # DEBUG level
@@ -1073,6 +1210,17 @@ class ConnectionPool:
                 await self._heartbeat_task
             except asyncio.CancelledError:
                 pass
+
+        # Cancel in-flight reconnects. _closing only suppresses *new* spawns; a
+        # reconnect already parked in its backoff (up to 30s) would otherwise
+        # outlive the pool and wake up against a closed ClientSession.
+        if self._reconnect_tasks:
+            pending = list(self._reconnect_tasks)
+            logger.debug(f"Cancelling {len(pending)} in-flight reconnect task(s)")
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._reconnect_tasks.clear()
 
         # Close all connections
         close_tasks = []

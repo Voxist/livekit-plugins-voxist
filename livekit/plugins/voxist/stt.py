@@ -352,11 +352,14 @@ class VoxistSTT(STT):
             except asyncio.CancelledError:
                 logger.debug("Initialization task cancelled")
 
-        # Streams first, pool second. The other order leaves any connection
-        # whose socket already died still IN_USE (pool.close() only touches open
-        # ones), so the stream's release would schedule a reconnect against an
-        # already-closed ClientSession and retry with backoff for minutes after
-        # aclose() returned.
+        # NOTE: livekit.agents.stt.STT.aclose() is a no-op stub in 1.x and this
+        # class retains no streams, so this call closes nothing - it exists only
+        # to honour the base-class contract. An earlier version reordered these
+        # two lines claiming it closed live streams before the pool; it did not.
+        #
+        # What actually protects shutdown is in the pool: close() sets _closing
+        # (suppressing new reconnects) and cancels the in-flight reconnect tasks
+        # it holds references to, so nothing wakes up against a closed session.
         await super().aclose()
         await self._pool.close()
 

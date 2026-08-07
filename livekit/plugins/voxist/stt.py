@@ -11,7 +11,7 @@ import aiohttp
 from livekit.agents.stt import STT, STTCapabilities
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions, NotGivenOr
 
-from .connection_pool import ConnectionPool
+from .connection import VoxistDialer
 from .exceptions import (
     AuthenticationError,
     ConfigurationError,
@@ -196,20 +196,18 @@ class VoxistSTT(STT):
         self._session = http_session
         self._enable_metrics = enable_metrics
 
-        # Initialize connection pool
-        # Always use 16kHz for Voxist API (we resample internally)
-        self._pool = ConnectionPool(
-            base_url=base_url,
-            api_key=self._api_key,
-            pool_size=connection_pool_size,
-            connection_timeout=connection_timeout,
-            heartbeat_interval=heartbeat_interval,
-            max_reconnect_attempts=max_reconnect_attempts,
-            language=language,
-            ssl_context=ssl_context,
-            sample_rate=16000,  # Voxist expects 16kHz (we resample from input rate)
-            api_key_header=api_key_header,
-        )
+        # One dialer per plugin; one socket per stream. There is no pool:
+        # the gateway ends every session by closing the socket after "Done",
+        # so connections cannot be reused. connection_pool_size,
+        # max_reconnect_attempts and heartbeat_interval are accepted for
+        # backwards compatibility; reconnection is owned by livekit's own
+        # retry (conn_options.max_retry) and liveness by aiohttp's heartbeat.
+        self._ssl_context = ssl_context
+        self._api_key_header = api_key_header
+        self._heartbeat_interval = heartbeat_interval
+        self._owns_session = http_session is None
+        self._dialer: VoxistDialer | None = None
+        self._dialer_lock = asyncio.Lock()
 
         # Task lifecycle tracking (QUAL-002: asr-all-dxe)
         self._init_task: asyncio.Task | None = None
@@ -233,9 +231,45 @@ class VoxistSTT(STT):
             self._init_state = InitializationState.NOT_STARTED
             logger.debug("No running event loop, pool will initialize on demand")
 
+    async def _ensure_dialer(self) -> VoxistDialer:
+        """Create the HTTP session and dialer on first use, in a running loop."""
+        async with self._dialer_lock:
+            if self._dialer is None:
+                assert self._api_key is not None  # validated in __init__
+                if self._session is None:
+                    self._session = aiohttp.ClientSession()
+                    self._owns_session = True
+                self._dialer = VoxistDialer(
+                    session=self._session,
+                    base_url=self._base_url,
+                    api_key=self._api_key,
+                    api_key_header=self._api_key_header,
+                    ssl_context=self._ssl_context,
+                    heartbeat_interval=self._heartbeat_interval,
+                )
+            return self._dialer
+
+    async def _dial(self, language: str):
+        """
+        Open a WebSocket for one stream session.
+
+        Raises:
+            AuthenticationError: The key was rejected (fatal, not retried).
+            ConnectionError: Transport failure (the stream converts this to
+                APIConnectionError so livekit retries it).
+        """
+        dialer = await self._ensure_dialer()
+        # Always 16kHz on the wire; the stream resamples its input.
+        return await dialer.dial(language, 16000)
+
     async def _initialize_pool(self) -> None:
         """
-        Initialize connection pool (called asynchronously).
+        Warm up: pre-fetch the WebSocket token (called asynchronously).
+
+        The token exchange is the one slow step of the first dial (an HTTPS
+        round-trip). Pre-fetching it keeps the InitializationState API
+        meaningful: COMPLETED means the first stream dials without it, and
+        FAILED surfaces a bad key at startup instead of on first use.
 
         State transitions (QUAL-002):
             PENDING -> RUNNING (start)
@@ -246,9 +280,10 @@ class VoxistSTT(STT):
         logger.debug("Initialization state: RUNNING")
 
         try:
-            await self._pool.initialize()
+            dialer = await self._ensure_dialer()
+            await dialer._get_token_url()
             self._init_state = InitializationState.COMPLETED
-            logger.debug("Connection pool pre-warming complete (state: COMPLETED)")
+            logger.debug("Token pre-fetch complete (state: COMPLETED)")
         except AuthenticationError as e:
             # Store and re-raise critical errors - never swallow auth failures
             self._init_error = e
@@ -259,7 +294,7 @@ class VoxistSTT(STT):
             # Store error for later access, mark as failed
             self._init_error = e
             self._init_state = InitializationState.FAILED
-            logger.error(f"Failed to pre-warm connection pool: {e} (state: FAILED)")
+            logger.error(f"Failed to pre-fetch WebSocket token: {e} (state: FAILED)")
             # Don't re-raise - allow stream() to attempt on-demand initialization
 
     def stream(
@@ -307,7 +342,6 @@ class VoxistSTT(STT):
 
         return VoxistSTTStream(
             stt=self,
-            pool=self._pool,
             config=self._config,
             language=stream_language,
             conn_options=conn_options if conn_options is not None else APIConnectOptions(),
@@ -352,13 +386,12 @@ class VoxistSTT(STT):
             except asyncio.CancelledError:
                 logger.debug("Initialization task cancelled")
 
-        # Streams first, pool second. The other order leaves any connection
-        # whose socket already died still IN_USE (pool.close() only touches open
-        # ones), so the stream's release would schedule a reconnect against an
-        # already-closed ClientSession and retry with backoff for minutes after
-        # aclose() returned.
         await super().aclose()
-        await self._pool.close()
+
+        # Sockets are per-stream and close with their stream; the only shared
+        # resource is the HTTP session, and only if this plugin created it.
+        if self._owns_session and self._session is not None and not self._session.closed:
+            await self._session.close()
 
     @property
     def initialization_error(self) -> Exception | None:
@@ -394,8 +427,8 @@ class VoxistSTT(STT):
         """
         if self._init_state == InitializationState.COMPLETED:
             return True
-        # Also check pool directly for on-demand initialization
-        return self._pool.is_initialized
+        # Also ready if a token was fetched on demand by a stream
+        return self._dialer is not None and self._dialer._token_url is not None
 
     async def wait_for_initialization(self, timeout: float = 30.0) -> bool:
         """
@@ -423,9 +456,11 @@ class VoxistSTT(STT):
         if self._init_state == InitializationState.NOT_STARTED:
             # No background task, initialize on demand
             try:
-                await asyncio.wait_for(self._pool.initialize(), timeout=timeout)
-                self._init_state = InitializationState.COMPLETED
-                return True
+                await asyncio.wait_for(self._initialize_pool(), timeout=timeout)
+                # _initialize_pool records its own outcome and swallows
+                # non-auth errors (streams may still succeed on demand), so
+                # the state - not the absence of an exception - is the result.
+                return self._init_state == InitializationState.COMPLETED
             except asyncio.TimeoutError:
                 self._init_error = asyncio.TimeoutError(
                     f"Initialization timed out after {timeout}s"

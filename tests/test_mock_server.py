@@ -1,4 +1,9 @@
-"""Tests for MockVoxistServer."""
+"""Tests for MockVoxistServer against the gateway-faithful contract.
+
+The mock mirrors verified gateway behaviour (simple-websocket-proxy.gateway.ts):
+no greeting frame on connect, a final per silence-delimited segment without
+"Done", and "Done" as the end-of-SESSION signal after which the socket closes.
+"""
 
 import asyncio
 
@@ -9,282 +14,218 @@ import pytest
 from .fixtures.mock_server import MockVoxistServer
 
 
-class TestMockServerBasics:
-    """Test basic mock server functionality."""
+def speech_frame(ms=100, rate=16000):
+    """Non-silent Int16 audio (sine), as the plugin would send."""
+    n = rate * ms // 1000
+    t = np.linspace(0, ms / 1000.0, n, endpoint=False)
+    return (np.sin(2 * np.pi * 440 * t) * 20000).astype(np.int16).tobytes()
 
+
+def silence_frame(ms=100, rate=16000):
+    return b"\x00" * (rate * ms // 1000 * 2)
+
+
+async def collect_json(ws, timeout=2.0):
+    """Drain currently-available JSON messages."""
+    out = []
+    try:
+        while True:
+            msg = await asyncio.wait_for(ws.receive(), timeout=timeout)
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                break
+            out.append(msg.json())
+    except asyncio.TimeoutError:
+        pass
+    return out
+
+
+class TestMockServerBasics:
     @pytest.mark.asyncio
     async def test_server_starts_and_stops(self):
-        """Test server can start and stop."""
         server = MockVoxistServer(port=8766)
-
         await server.start()
         assert server.runner is not None
         assert server.site is not None
-
         await server.stop()
 
     @pytest.mark.asyncio
-    async def test_server_accepts_connection(self, mock_voxist_server):
-        """Test server accepts WebSocket connections."""
+    async def test_no_greeting_on_connect(self, mock_voxist_server):
+        """
+        The gateway sends nothing on connect.
+
+        The mock once sent {"status": "connected"}, which made it more
+        talkative than production and kept an unreachable plugin branch
+        looking alive. Connecting must yield silence until audio flows.
+        """
         async with aiohttp.ClientSession() as session:
-            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key"
-
+            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key&lang=fr"
             async with session.ws_connect(url) as ws:
-                # Should receive connection confirmation
-                msg = await ws.receive()
-                assert msg.type == aiohttp.WSMsgType.TEXT
-
-                data = msg.json()
-                assert data["status"] == "connected"
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(ws.receive(), timeout=0.3)
 
     @pytest.mark.asyncio
     async def test_server_rejects_invalid_api_key(self, mock_voxist_server):
-        """Test server rejects connections with invalid API key."""
         async with aiohttp.ClientSession() as session:
             url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=invalid"
-
             async with session.ws_connect(url) as ws:
-                # Server should close connection
                 msg = await ws.receive()
                 assert msg.type == aiohttp.WSMsgType.CLOSE
 
     @pytest.mark.asyncio
-    async def test_server_handles_config_message(self, mock_voxist_server):
-        """Test server accepts config message."""
+    async def test_final_per_silence_delimited_segment(self, mock_voxist_server):
+        """Speech followed by enough silence finalizes WITHOUT Done."""
         async with aiohttp.ClientSession() as session:
-            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key"
-
+            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key&lang=fr"
             async with session.ws_connect(url) as ws:
-                # Receive connection confirmation
-                await ws.receive()
-
-                # Send config
-                config = {"config": {"lang": "fr", "sample_rate": 16000}}
-                await ws.send_json(config)
-
-                # Server should process it (no response expected for config)
-                # Just verify connection stays open
-                await asyncio.sleep(0.1)
-                assert not ws.closed
-
-    @pytest.mark.asyncio
-    async def test_server_processes_audio_and_returns_transcription(self, mock_voxist_server):
-        """Test server receives audio and sends transcription."""
-        async with aiohttp.ClientSession() as session:
-            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key"
-
-            async with session.ws_connect(url) as ws:
-                # Receive connection confirmation
-                await ws.receive()
-
-                # Send config
-                await ws.send_json({"config": {"lang": "fr", "sample_rate": 16000}})
-
-                # Send audio frames (Float32 format, 1600 samples = 100ms at 16kHz)
                 for _ in range(3):
-                    audio_float32 = np.random.rand(1600).astype(np.float32)
-                    await ws.send_bytes(audio_float32.tobytes())
-                    await asyncio.sleep(0.01)
+                    await ws.send_bytes(speech_frame())
+                for _ in range(5):  # 500ms of silence > silence_ms_to_finalize
+                    await ws.send_bytes(silence_frame())
 
-                # Should receive interim result (after 1st frame)
-                msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
-                assert msg.type == aiohttp.WSMsgType.TEXT
-                interim = msg.json()
-                assert interim["type"] == "partial"
-                assert "bonjour" in interim["text"].lower()
+                messages = await collect_json(ws)
 
-                # Should receive final result (after 3 frames)
-                msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
-                assert msg.type == aiohttp.WSMsgType.TEXT
-                final = msg.json()
-                assert final["type"] == "final"
-                assert final["text"] == "bonjour monde"
-                assert final["confidence"] == 0.95
+        types = [m["type"] for m in messages]
+        assert "final" in types, f"no final without Done, got {types}"
+        assert mock_voxist_server.done_received_count == 0
 
     @pytest.mark.asyncio
-    async def test_server_handles_done_signal(self, mock_voxist_server):
-        """Test server handles Done signal properly."""
+    async def test_two_segments_two_finals_one_socket(self, mock_voxist_server):
+        """Multi-final sessions are the engine's normal operation."""
         async with aiohttp.ClientSession() as session:
-            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key"
-
+            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key&lang=fr"
             async with session.ws_connect(url) as ws:
-                # Receive connection confirmation
-                await ws.receive()
+                for _segment in range(2):
+                    for _ in range(3):
+                        await ws.send_bytes(speech_frame())
+                    for _ in range(5):
+                        await ws.send_bytes(silence_frame())
+                messages = await collect_json(ws)
 
-                # Send Done signal
+        finals = [m for m in messages if m["type"] == "final"]
+        assert len(finals) == 2
+        assert len(mock_voxist_server.segments_finalized) == 2
+
+    @pytest.mark.asyncio
+    async def test_done_finalizes_and_closes_the_socket(self, mock_voxist_server):
+        """
+        Done is end-of-session: pending speech is finalized, then the server
+        closes the client socket - mirroring gateway.ts:899.
+        """
+        async with aiohttp.ClientSession() as session:
+            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key&lang=fr"
+            async with session.ws_connect(url) as ws:
+                for _ in range(3):
+                    await ws.send_bytes(speech_frame())
                 await ws.send_str("Done")
 
-                # Server should break from message loop
-                # Wait for any final messages or close
-                try:
-                    msg = await asyncio.wait_for(ws.receive(), timeout=0.5)
-                    # Server might send final result or close
-                    assert msg.type in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.CLOSE)
-                except asyncio.TimeoutError:
-                    # Or connection stays open (that's fine)
-                    pass
+                got_final = False
+                closed = False
+                while True:
+                    msg = await asyncio.wait_for(ws.receive(), timeout=3.0)
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        if msg.json().get("type") == "final":
+                            got_final = True
+                    elif msg.type in (
+                        aiohttp.WSMsgType.CLOSE,
+                        aiohttp.WSMsgType.CLOSED,
+                        aiohttp.WSMsgType.CLOSING,
+                    ):
+                        closed = True
+                        break
+
+        assert got_final, "pending speech must be finalized on Done"
+        assert closed, "the server must close the socket after Done"
+        assert mock_voxist_server.done_received_count == 1
 
     @pytest.mark.asyncio
-    async def test_server_tracks_statistics(self):
-        """Test server tracks connection and audio statistics."""
-        server = MockVoxistServer(port=8767, valid_api_key="test")
-
-        await server.start()
-
+    async def test_config_message_is_tolerated(self, mock_voxist_server):
+        """A config frame is accepted without ending the session."""
         async with aiohttp.ClientSession() as session:
-            url = "ws://localhost:8767/ws?api_key=test"
-
+            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key&lang=fr"
             async with session.ws_connect(url) as ws:
-                await ws.receive()  # Connection confirmation
-
-                # Send 5 audio frames
+                await ws.send_json({"config": {"lang": "fr"}})
+                for _ in range(3):
+                    await ws.send_bytes(speech_frame())
                 for _ in range(5):
-                    audio = np.random.rand(1600).astype(np.float32)
-                    await ws.send_bytes(audio.tobytes())
+                    await ws.send_bytes(silence_frame())
+                messages = await collect_json(ws)
 
-                await asyncio.sleep(0.1)
-
-        # Check stats
-        stats = server.get_stats()
-        assert stats["connections_count"] == 1
-        assert stats["audio_frames_received"] == 5
-        assert stats["total_audio_bytes"] == 5 * 1600 * 4  # 5 frames * 1600 samples * 4 bytes
-
-        await server.stop()
+        assert any(m["type"] == "final" for m in messages)
 
     @pytest.mark.asyncio
-    async def test_server_handles_multiple_concurrent_connections(self):
-        """Test server handles multiple connections simultaneously."""
-        server = MockVoxistServer(port=8768, valid_api_key="test")
+    async def test_server_tracks_statistics(self, mock_voxist_server):
+        async with aiohttp.ClientSession() as session:
+            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key&lang=fr"
+            async with session.ws_connect(url) as ws:
+                payload = speech_frame()
+                await ws.send_bytes(payload)
+                await ws.send_str("Done")
+                await collect_json(ws, timeout=1.0)
 
-        await server.start()
+        assert mock_voxist_server.connections_count >= 1
+        assert mock_voxist_server.audio_frames_received >= 1
+        assert mock_voxist_server.total_audio_bytes >= len(payload)
+        assert mock_voxist_server.connected_languages[-1] == "fr"
 
-        async def connect_and_send():
+    @pytest.mark.asyncio
+    async def test_concurrent_connections(self, mock_voxist_server):
+        async def one_session():
             async with aiohttp.ClientSession() as session:
-                url = "ws://localhost:8768/ws?api_key=test"
+                url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key&lang=fr"
                 async with session.ws_connect(url) as ws:
-                    await ws.receive()  # Confirmation
-                    audio = np.random.rand(1600).astype(np.float32)
-                    await ws.send_bytes(audio.tobytes())
-                    await asyncio.sleep(0.1)
+                    for _ in range(3):
+                        await ws.send_bytes(speech_frame())
+                    await ws.send_str("Done")
+                    messages = await collect_json(ws, timeout=2.0)
+                    return any(m.get("type") == "final" for m in messages)
 
-        # Connect 3 clients concurrently
-        await asyncio.gather(
-            connect_and_send(),
-            connect_and_send(),
-            connect_and_send(),
-        )
-
-        stats = server.get_stats()
-        assert stats["connections_count"] == 3
-
-        await server.stop()
+        results = await asyncio.gather(one_session(), one_session())
+        assert all(results)
 
 
 class TestMockServerErrorSimulation:
-    """Test mock server error simulation capabilities."""
-
     @pytest.mark.asyncio
     async def test_server_auth_failure_mode(self):
-        """Test server can simulate authentication failures."""
-        server = MockVoxistServer(
-            port=8769,
-            error_mode="auth_failure"
-        )
-
+        server = MockVoxistServer(port=8767, error_mode="auth_failure")
         await server.start()
-
-        async with aiohttp.ClientSession() as session:
-            url = "ws://localhost:8769/ws?api_key=any_key"
-
-            async with session.ws_connect(url) as ws:
-                # Should close with auth error
-                msg = await ws.receive()
-                assert msg.type == aiohttp.WSMsgType.CLOSE
-                # Close code is in msg.data, message is in msg.extra
-                assert msg.data == 1008  # Insufficient balance / auth failure code
-
-        await server.stop()
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = "ws://localhost:8767/ws?api_key=anything"
+                async with session.ws_connect(url) as ws:
+                    msg = await ws.receive()
+                    assert msg.type == aiohttp.WSMsgType.CLOSE
+        finally:
+            await server.stop()
 
 
-class TestMockServerProtocolCompliance:
-    """Test mock server implements Voxist protocol correctly."""
+class TestFinalsWithoutDoneToggle:
+    """
+    finals_without_done=False models an engine that only finalizes on Done.
+
+    This is the fallback the live probe (scratchpad/probe_finals.py) would
+    select; tests can flip the flag to develop against that behaviour.
+    """
 
     @pytest.mark.asyncio
-    async def test_protocol_sequence(self, mock_voxist_server):
-        """Test complete protocol sequence."""
-        async with aiohttp.ClientSession() as session:
-            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key"
-
-            async with session.ws_connect(url) as ws:
-                # Step 1: Receive connection confirmation
-                msg = await ws.receive()
-                assert msg.type == aiohttp.WSMsgType.TEXT
-                assert msg.json()["status"] == "connected"
-
-                # Step 2: Send config
-                await ws.send_json({"config": {"lang": "fr", "sample_rate": 16000}})
-
-                # Step 3: Send binary audio (Float32)
-                for _i in range(5):
-                    audio = np.random.rand(1600).astype(np.float32)
-                    await ws.send_bytes(audio.tobytes())
-                    await asyncio.sleep(0.02)
-
-                # Step 4: Receive interim result
-                msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
-                assert msg.type == aiohttp.WSMsgType.TEXT
-                partial = msg.json()
-                assert partial["type"] == "partial"
-
-                # Step 5: Receive final result
-                msg = await asyncio.wait_for(ws.receive(), timeout=1.0)
-                assert msg.type == aiohttp.WSMsgType.TEXT
-                final = msg.json()
-                assert final["type"] == "final"
-                assert "confidence" in final
-
-                # Step 6: Send Done signal
-                await ws.send_str("Done")
-
-    @pytest.mark.asyncio
-    async def test_audio_format_validation(self, mock_voxist_server):
-        """Test server correctly receives Int16 PCM audio (matches plugin format)."""
-        received_frames = []
-
-        def audio_callback(data: bytes, num_samples: int):
-            # Verify Int16 format (2 bytes per sample)
-            assert len(data) == num_samples * 2
-            received_frames.append((data, num_samples))
-
-        server = MockVoxistServer(
-            port=8770,
-            valid_api_key="test",
-            on_audio_received=audio_callback,
-        )
-
+    async def test_silence_does_not_finalize_when_disabled(self):
+        server = MockVoxistServer(port=8768, valid_api_key="test_key")
+        server.finals_without_done = False
         await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = "ws://localhost:8768/ws?api_key=test_key&lang=fr"
+                async with session.ws_connect(url) as ws:
+                    for _ in range(3):
+                        await ws.send_bytes(speech_frame())
+                    for _ in range(8):
+                        await ws.send_bytes(silence_frame())
+                    interim_only = await collect_json(ws, timeout=0.5)
+                    assert not any(
+                        m["type"] == "final" for m in interim_only
+                    ), "finalized on silence despite finals_without_done=False"
 
-        async with aiohttp.ClientSession() as session:
-            url = "ws://localhost:8770/ws?api_key=test"
-
-            async with session.ws_connect(url) as ws:
-                await ws.receive()  # Confirmation
-
-                # Send known Int16 PCM data (plugin sends Int16)
-                test_audio = np.array([0, 16384, -16384, 32767, -32768], dtype=np.int16)
-                await ws.send_bytes(test_audio.tobytes())
-
-                await asyncio.sleep(0.1)
-
-        # Verify callback was called
-        assert len(received_frames) == 1
-        data, num_samples = received_frames[0]
-        assert num_samples == 5
-        assert len(data) == 10  # 5 samples * 2 bytes
-
-        # Verify we can parse it back
-        received_audio = np.frombuffer(data, dtype=np.int16)
-        np.testing.assert_array_equal(received_audio, test_audio)
-
-        await server.stop()
+                    await ws.send_str("Done")
+                    rest = await collect_json(ws, timeout=2.0)
+                    assert any(m["type"] == "final" for m in rest)
+        finally:
+            await server.stop()

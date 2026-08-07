@@ -1,8 +1,30 @@
-"""VoxistSTTStream - Streaming recognition interface."""
+"""VoxistSTTStream - Streaming recognition interface.
+
+One WebSocket per stream, matching the gateway's protocol:
+
+- The socket is dialed by this stream, for this stream, with the language in
+  the URL. There is nothing to renegotiate and no window where audio can meet
+  the wrong engine.
+- flush() marks the end of a SEGMENT. The engine does its own endpointing and
+  emits a final per silence-delimited segment on the same socket (the gateway
+  threads context across finals - they are the normal flow, not a special
+  case). No "Done" is sent at segment boundaries.
+- end_input() ends the SESSION: "Done" is written once, the engine flushes,
+  and the gateway closes the client socket
+  (simple-websocket-proxy.gateway.ts:899). The server close after "Done" is
+  the expected terminator, not a failure.
+- Retrying is owned by livekit: RecognizeStream._main_task already retries
+  _run() up to conn_options.max_retry with proper error events. _run therefore
+  performs exactly ONE attempt and raises APIConnectionError on interruption.
+  An earlier design wrapped its own reconnect loop inside the framework's,
+  and every retry-budget bug in this plugin's history lived in that
+  duplication.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import time
 from collections.abc import Awaitable
@@ -10,7 +32,11 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 import numpy as np
-from livekit.agents import utils
+
+# Required, not optional: a fallback shim here once silently disabled BCP-47
+# normalization on older livekit-agents. The dependency floor guarantees the
+# import, and failing loudly beats diverging quietly.
+from livekit.agents import APIConnectionError, LanguageCode, utils
 from livekit.agents.stt import (
     RecognizeStream,
     SpeechData,
@@ -18,20 +44,13 @@ from livekit.agents.stt import (
     SpeechEventType,
 )
 
-try:  # livekit-agents >= 1.x
-    from livekit.agents import LanguageCode
-except ImportError:  # pragma: no cover - older livekit-agents has no such type
-    LanguageCode = str  # type: ignore[assignment, misc]
-
 from livekit import rtc  # type: ignore[attr-defined]
 
 from .audio_processor import AudioProcessor
-from .exceptions import OwnershipViolationError
+from .exceptions import ConnectionError as VoxistConnectionError
 from .log import logger
-from .models import Connection
 
 if TYPE_CHECKING:
-    from .connection_pool import ConnectionPool
     from .stt import VoxistSTT
 
 
@@ -39,26 +58,19 @@ class VoxistSTTStream(RecognizeStream):
     """
     Streaming interface for Voxist ASR.
 
-    Implements concurrent send/receive pattern for optimal latency:
-    - Send task: Converts and streams audio to WebSocket
-    - Receive task: Processes transcription results and emits events
-
     Event Flow:
         1. START_OF_SPEECH (when first text detected)
         2. INTERIM_TRANSCRIPT (partial results, if enabled)
-        3. FINAL_TRANSCRIPT (confirmed transcription)
-        4. END_OF_SPEECH (after final result)
+        3. FINAL_TRANSCRIPT (one per silence-delimited segment)
+        4. END_OF_SPEECH (when the session ends)
 
     Example:
         stream = stt.stream(language="fr-medical")
 
-        # Push audio frames
         for frame in audio_frames:
             stream.push_frame(frame)
-
         stream.end_input()
 
-        # Consume events
         async for event in stream:
             if event.type == SpeechEventType.FINAL_TRANSCRIPT:
                 print(event.alternatives[0].text)
@@ -78,41 +90,32 @@ class VoxistSTTStream(RecognizeStream):
     #   2. the input backlog is bounded by MAX_INPUT_BACKLOG_FRAMES.
 
     # A send that cannot complete in this long means the uplink is stalled.
-    # Must stay well below RECEIVE_TIMEOUT_SECONDS so a stalled send surfaces
-    # as a send error and reconnect, rather than tripping the receive watchdog
-    # and looking like a server-side stall.
     SEND_TIMEOUT_SECONDS = 5.0
 
-    # Receive watchdog: no message from Voxist for this long means the
-    # connection is stalled. Class-level so the invariant against
-    # SEND_TIMEOUT_SECONDS is visible and testable.
-    RECEIVE_TIMEOUT_SECONDS = 30.0
-
-    # How long to keep receiving after "Done" has been written. The trailing
-    # final transcript is produced after end of input, so the receive side must
-    # outlive the send side; the wait normally ends early when Voxist closes the
-    # socket. Kept short because it delays END_OF_SPEECH when a server neither
-    # answers nor closes, and well under RECEIVE_TIMEOUT_SECONDS so a genuine
-    # stall is still classified by the receive watchdog.
-    RESULT_DRAIN_TIMEOUT_SECONDS = 2.0
+    # How long to keep receiving after "Done" has been written. The gateway
+    # closes the socket once the engine has flushed - normally within
+    # milliseconds - so this is a generous watchdog, not an expected wait.
+    # It is the ONLY receive-side timeout: during streaming, transport death
+    # is detected by aiohttp's heartbeat (missed pong closes the socket), so
+    # long user silences cannot false-trigger a watchdog.
+    SESSION_DRAIN_TIMEOUT_SECONDS = 30.0
 
     # Rate limit for the audio-drop warning. The drop condition persists for
-    # the whole overload, and the send loop runs per 10ms frame, so an unlimited
-    # warning would emit ~100 lines/second per stream.
+    # the whole overload, and the send loop runs per 10ms frame, so an
+    # unlimited warning would emit ~100 lines/second per stream.
     DROP_LOG_INTERVAL_SECONDS = 5.0
 
-    # Cap on unsent audio frames held in the input channel. livekit's channel is
-    # unbounded and push_frame() never blocks, so without this a slow uplink
-    # grows the backlog until the process is OOM-killed. At 10ms frames this is
-    # ~10s of audio; beyond that, transcripts would arrive too late to be
-    # useful anyway, so the oldest frames are dropped rather than queued.
+    # Cap on unsent audio frames held in the input channel. livekit's channel
+    # is unbounded and push_frame() never blocks, so without this a slow
+    # uplink grows the backlog until the process is OOM-killed. At 10ms frames
+    # this is ~10s of audio; beyond that, transcripts would arrive too late to
+    # be useful anyway, so the oldest frames are dropped rather than queued.
     MAX_INPUT_BACKLOG_FRAMES = 1000
 
     def __init__(
         self,
         *,
         stt: VoxistSTT,
-        pool: ConnectionPool,
         config: dict,
         language: str,
         conn_options,
@@ -122,8 +125,7 @@ class VoxistSTTStream(RecognizeStream):
         Initialize streaming recognition session.
 
         Args:
-            stt: Parent VoxistSTT instance
-            pool: ConnectionPool for WebSocket management
+            stt: Parent VoxistSTT instance (owns the dialer and HTTP session)
             config: Configuration dictionary
             language: Language code for this stream
             conn_options: LiveKit connection options
@@ -135,42 +137,37 @@ class VoxistSTTStream(RecognizeStream):
             sample_rate=config["sample_rate"],
         )
 
-        self._stt = stt
-        self._pool = pool
+        self._voxist_stt = stt
         self._config = config
         self._language = language
         # Language reported on emitted SpeechData. livekit normalizes this to
         # BCP-47, which uppercases the subtag: "fr-medical" is emitted as
-        # "fr-MEDICAL". Normalizing once here makes that visible instead of
-        # leaving it an implicit side effect inside SpeechData.__post_init__.
-        #
-        # WARNING: self._language is NOT sent to Voxist. The socket was opened
-        # by the pool with the pool-level language in the URL query, and this
-        # stream reuses a pooled socket without renegotiating. So a per-stream
-        # override - stt.stream(language="en") on a pool built with "fr" - is
-        # transcribed by the pool's engine while being labelled with the
-        # override here. Fixing that needs a config message on acquire; until
-        # then, do not treat this value as the language Voxist actually used.
+        # "fr-MEDICAL". The engine language matches by construction: this
+        # stream's socket is dialed with self._language in the URL.
         self._speech_language = LanguageCode(language)
         self._enable_metrics = enable_metrics
 
         self._session_id = utils.shortuuid()
         self._speaking = False
-        self._conn: Connection | None = None
-        # Track if we own exclusive access to connection (VUL-003 mitigation)
-        self._owns_connection = False
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+
+        # Session outcome. "Done" written once marks the input as fully
+        # delivered; session_complete marks the whole exchange as finished so
+        # a framework retry after a late failure does not redial pointlessly
+        # (the audio of a dead session is unrecoverable - streaming ASR cannot
+        # replay what was already consumed).
+        self._done_sent = False
+        self._session_complete = False
+
         # Latch so an unreachable transport is reported once, not per chunk
         self._transport_lookup_failed = False
         # Count of frames dropped to keep the input backlog bounded, and when
         # that was last reported. None means "not yet" - monotonic() has an
-        # arbitrary epoch (uptime on Linux), so 0.0 is not a usable sentinel:
-        # on a freshly booted host the elapsed check would suppress the first
-        # report for as long as the interval.
+        # arbitrary epoch, so 0.0 is not a usable sentinel on a fresh host.
         self._dropped_frames = 0
         self._last_drop_log: float | None = None
 
         # Audio processor for format conversion and chunking
-        # Resample from input rate (e.g., 48kHz from LiveKit) to 16kHz for Voxist
         self._audio_processor = AudioProcessor(
             sample_rate=config["sample_rate"],
             chunk_duration_ms=config["chunk_duration_ms"],
@@ -184,291 +181,184 @@ class VoxistSTTStream(RecognizeStream):
             f"chunk_duration_ms={config['chunk_duration_ms']}"
         )
 
-    async def _acquire_connection(self) -> None:
+    async def _run(self) -> None:
         """
-        Acquire connection from pool and mark ownership (HIGH-002 refactor).
-
-        Security: VUL-003 mitigation - marks exclusive ownership to prevent
-        race conditions on buffered_amount access.
+        One attempt at the session. Retries belong to the framework.
 
         Raises:
-            ConnectionError: If no connection available
+            APIConnectionError: The session was interrupted (dial failure,
+                stalled send, server close before end of input). livekit's
+                _main_task catches this, emits a recoverable error event, and
+                calls _run() again up to conn_options.max_retry.
+            AuthenticationError: The key was rejected. Deliberately NOT an
+                APIError: retrying cannot fix a revoked key, so it propagates
+                immediately as the true cause.
         """
-        self._conn = await self._pool.get_connection()
-        # SECURITY: Mark exclusive ownership for VUL-003 mitigation
-        # Connection is IN_USE state - only this stream should access buffered_amount
-        self._owns_connection = True
+        if self._session_complete:
+            # A previous attempt already finished the exchange; a late error
+            # (e.g. during drain) triggered a retry with nothing to recover.
+            return
 
-        logger.debug(
-            f"Stream {self._session_id} acquired connection {self._conn.id}"
-        )
+        try:
+            ws = await self._voxist_stt._dial(self._language)
+        except VoxistConnectionError as e:
+            raise APIConnectionError(str(e)) from e
 
-    async def _release_connection(self) -> None:
-        """
-        Release connection back to pool (HIGH-002 refactor).
-
-        Safe to call even if no connection is held.
-        """
-        if self._conn:
-            self._owns_connection = False  # Release exclusive ownership
-            await self._pool.release_connection(self._conn)
-            self._conn = None
-
-    async def _run_stream_tasks(self) -> None:
-        """
-        Run concurrent send/receive tasks (HIGH-002 refactor).
-
-        Creates and orchestrates the send and receive tasks,
-        handling cancellation and exception propagation.
-
-        Raises:
-            Exception: Propagates exceptions from failed tasks
-        """
+        self._ws = ws
         send_task = asyncio.create_task(
-            self._send_audio_task(),
-            name=f"send-{self._session_id}"
+            self._send_audio_task(), name=f"send-{self._session_id}"
         )
         recv_task = asyncio.create_task(
-            self._recv_results_task(),
-            name=f"recv-{self._session_id}"
+            self._recv_results_task(), name=f"recv-{self._session_id}"
         )
 
         try:
-            # Wait for either task to complete or fail
             done, pending = await asyncio.wait(
-                [send_task, recv_task],
-                return_when=asyncio.FIRST_COMPLETED
+                {send_task, recv_task}, return_when=asyncio.FIRST_COMPLETED
             )
 
-            # The send task finishing is not the end of the exchange: it returns
-            # as soon as "Done" is written, while the transcript for that audio
-            # is still being computed. Cancelling the receive task here would
-            # discard it - the final result of every utterance - so give it a
-            # bounded window to finish. Voxist closes the socket once it has
-            # flushed, which ends the wait immediately in the normal case; the
-            # timeout only covers a server that leaves the socket open.
-            if (
-                recv_task in pending
-                and send_task in done
-                and not send_task.cancelled()
-                and send_task.exception() is None
-            ):
-                logger.debug(
-                    f"Stream {self._session_id} input ended, draining results"
-                )
-                _, pending = await asyncio.wait(
-                    [recv_task], timeout=self.RESULT_DRAIN_TIMEOUT_SECONDS
-                )
-                if pending:
-                    logger.warning(
-                        f"Stream {self._session_id} gave up draining results "
-                        f"{self.RESULT_DRAIN_TIMEOUT_SECONDS}s after end of input "
-                        "- a trailing transcript may have been lost"
-                    )
-                    # The socket still has an unread result frame queued on it.
-                    # Returning it to the pool would hand that frame to the next
-                    # stream, which would emit this session's transcript under
-                    # its own request_id - so retire it instead.
-                    await self._abandon_connection()
-                done = {t for t in (send_task, recv_task) if t not in pending}
-
-            # Cancel pending tasks
-            for task in pending:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-            # Check for exceptions in completed tasks
-            for task in done:
-                if task.cancelled():
-                    continue
-                exc = task.exception()
+            if send_task in done:
+                exc = send_task.exception()
                 if exc is not None:
                     raise exc
-        except asyncio.CancelledError:
-            # Clean up both tasks on cancellation
-            for task in [send_task, recv_task]:
+
+                # Input delivered and "Done" written. The trailing finals are
+                # still being computed; the gateway closes the socket once the
+                # engine has flushed, which ends the receive task naturally.
+                if recv_task in pending:
+                    try:
+                        await asyncio.wait_for(
+                            recv_task, timeout=self.SESSION_DRAIN_TIMEOUT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"Stream {self._session_id} server neither closed "
+                            f"nor answered within "
+                            f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s of Done - "
+                            "a trailing transcript may have been lost"
+                        )
+
+            if recv_task.done() and not recv_task.cancelled():
+                exc = recv_task.exception()
+                if exc is not None:
+                    raise exc
+                if not self._done_sent:
+                    # The server ended the session while input was still
+                    # flowing: an interruption, not a completion. Before this
+                    # was classified explicitly, a mid-call close truncated
+                    # the transcript silently and reported success.
+                    raise APIConnectionError(
+                        "server closed the connection before end of input"
+                    )
+
+            self._session_complete = True
+
+            if self._speaking:
+                self._speaking = False
+                logger.debug(
+                    f"Stream {self._session_id} emitting END_OF_SPEECH"
+                )
+                self._event_ch.send_nowait(
+                    SpeechEvent(
+                        type=SpeechEventType.END_OF_SPEECH,
+                        request_id=self._session_id,
+                    )
+                )
+
+            logger.debug(f"Stream {self._session_id} session complete")
+
+        finally:
+            for task in (send_task, recv_task):
                 if not task.done():
                     task.cancel()
-                    try:
+                    with contextlib.suppress(asyncio.CancelledError):
                         await task
-                    except asyncio.CancelledError:
-                        pass
-            raise
-
-    def _calculate_backoff(self, attempt: int) -> float:
-        """
-        Calculate exponential backoff delay (HIGH-002 refactor).
-
-        Args:
-            attempt: Current reconnection attempt number (1-based)
-
-        Returns:
-            Backoff delay in seconds (capped at 10s)
-        """
-        return min(1.0 * (1.5 ** attempt), 10.0)
-
-    async def _run(self) -> None:
-        """
-        Main processing loop with reconnection logic (HIGH-002 refactored).
-
-        Orchestrates concurrent send/receive tasks and handles connection failures
-        with automatic reconnection. Complexity reduced by extracting:
-        - _acquire_connection(): Connection pool acquisition
-        - _release_connection(): Connection pool release
-        - _run_stream_tasks(): Task orchestration
-        - _calculate_backoff(): Backoff calculation
-        """
-        reconnect_attempts = 0
-        max_attempts = self._conn_options.max_retry
-
-        logger.debug(f"Stream {self._session_id} starting")
-
-        while reconnect_attempts <= max_attempts:
-            try:
-                await self._acquire_connection()
-
-                # Reset reconnection counter on successful connection
-                reconnect_attempts = 0
-
-                # Run concurrent send/receive tasks
-                await self._run_stream_tasks()
-
-                # Normal completion - emit END_OF_SPEECH if we were speaking
-                # (Voxist doesn't signal end of utterance, client closes connection)
-                if self._speaking:
-                    self._speaking = False
-                    logger.debug(f"Stream {self._session_id} emitting END_OF_SPEECH on close")
-                    self._event_ch.send_nowait(
-                        SpeechEvent(
-                            type=SpeechEventType.END_OF_SPEECH,
-                            request_id=self._session_id,
-                        )
-                    )
-
-                logger.info(f"Stream {self._session_id} completed normally")
-                break
-
-            except Exception as e:
-                logger.error(f"Stream {self._session_id} error: {e}")
-
-                if reconnect_attempts >= max_attempts:
-                    logger.error(
-                        f"Stream {self._session_id} exceeded max reconnect attempts"
-                    )
-                    raise
-
-                reconnect_attempts += 1
-                backoff = self._calculate_backoff(reconnect_attempts)
-                logger.info(
-                    f"Stream {self._session_id} reconnecting in {backoff:.1f}s "
-                    f"(attempt {reconnect_attempts}/{max_attempts})"
-                )
-                # Hand the connection back before waiting, not in the trailing
-                # finally: holding it across the backoff leaves it visible to
-                # the pool as reclaimable while this stream still owns it, so
-                # another stream can acquire the same socket and our release
-                # would then flip it to READY underneath that owner.
-                await self._release_connection()
-                await asyncio.sleep(backoff)
-
-            finally:
-                await self._release_connection()
-
-        logger.info(f"Stream {self._session_id} finished")
+            if not ws.closed:
+                with contextlib.suppress(Exception):
+                    await ws.close()
+            self._ws = None
 
     async def _send_audio_task(self) -> None:
         """
-        Task for sending audio frames to WebSocket.
+        Deliver audio to the socket; write "Done" when the input ends.
 
-        Processes frames through AudioProcessor and sends as binary Float32 data.
+        The backlog bound is applied on consumption: when the queue behind the
+        frame in hand exceeds the cap, the frame is discarded instead of sent,
+        so the loop drains the excess at full speed and keeps the most recent
+        audio. Nothing is ever removed from the channel out of order, so flush
+        sentinels are always honoured in sequence.
         """
-        try:
-            logger.debug(f"Stream {self._session_id} send task started, waiting for frames...")
-            frame_count = 0
+        frame_count = 0
 
-            async for data in self._input_ch:
-                frame_count += 1
-                if frame_count % 100 == 0:
-                    logger.debug(f"Stream {self._session_id} processing frame {frame_count}")
+        async for data in self._input_ch:
+            frame_count += 1
+            if frame_count % 100 == 0:
+                logger.debug(
+                    f"Stream {self._session_id} processing frame {frame_count}"
+                )
 
-                # Check for flush sentinel
-                if isinstance(data, self._FlushSentinel):
-                    logger.debug(f"Stream {self._session_id} flushing audio")
+            if isinstance(data, self._FlushSentinel):
+                # End of SEGMENT, not of session. Ship whatever the processor
+                # is holding so the engine has the full segment to finalize.
+                for chunk in self._audio_processor.flush():
+                    await self._send_audio_chunk(chunk)
+                await self._on_segment_end()
+                continue
 
-                    # Flush remaining audio from processor
-                    final_chunks = self._audio_processor.flush()
-                    for chunk in final_chunks:
-                        await self._send_audio_chunk(chunk)
-
-                    # Signal end of stream to Voxist
-                    if self._conn and self._conn.ws and not self._conn.ws.closed:
-                        await self._send_with_timeout(
-                            self._conn.ws.send_str("Done"), "Done signal"
-                        )
-                        logger.debug(f"Stream {self._session_id} sent Done signal")
-
+            if isinstance(data, rtc.AudioFrame):
+                if self._input_ch.qsize() > self.MAX_INPUT_BACKLOG_FRAMES:
+                    self._note_dropped_frame()
                     continue
 
-                # Process audio frame
-                if isinstance(data, rtc.AudioFrame):
-                    # CRIT-001: bound the unsent backlog. livekit's input channel
-                    # is unbounded and push_frame() never blocks, so a slow uplink
-                    # would otherwise grow it for the life of the call until the
-                    # process is OOM-killed.
-                    #
-                    # The bound is applied here, on consumption: when the backlog
-                    # is over the cap this frame is discarded instead of sent, so
-                    # the loop drains the excess at full speed and keeps the most
-                    # recent MAX_INPUT_BACKLOG_FRAMES. Discarding the frame in
-                    # hand - rather than reaching into the channel to trim it -
-                    # is what makes this safe: nothing is removed out of order,
-                    # markers below always take the branch above and are honoured
-                    # in sequence, and the loop's termination does not depend on
-                    # what it finds. An earlier version trimmed the channel
-                    # directly and had to re-queue markers, which reordered
-                    # utterance boundaries, silently destroyed markers once the
-                    # channel was closed, and could spin forever.
-                    #
-                    # Dropping audio is the right policy for live transcription:
-                    # frames this far behind the speaker would produce transcripts
-                    # too late to act on.
-                    if self._input_ch.qsize() > self.MAX_INPUT_BACKLOG_FRAMES:
-                        self._note_dropped_frame()
-                        continue
+                frame_bytes = bytes(data.data)
+                for chunk in self._audio_processor.process_audio_frame(frame_bytes):
+                    await self._send_audio_chunk(chunk)
+            else:
+                logger.warning(
+                    f"Stream {self._session_id} unexpected data type: {type(data)}"
+                )
 
-                    # Convert and chunk audio
-                    frame_bytes = bytes(data.data)
-                    chunks = self._audio_processor.process_audio_frame(frame_bytes)
+        # Input channel closed: the session is over. end_input() pushed a
+        # final sentinel before closing, so the processor is already flushed;
+        # a second flush() returning [] is the expected no-op.
+        for chunk in self._audio_processor.flush():
+            await self._send_audio_chunk(chunk)
 
-                    if chunks:
-                        logger.debug(
-                            f"Stream {self._session_id} got {len(chunks)} chunks"
-                        )
+        if self._ws is not None and not self._ws.closed:
+            await self._send_with_timeout(
+                self._ws.send_str("Done"), "Done signal"
+            )
+            self._done_sent = True
+            logger.debug(f"Stream {self._session_id} sent Done signal")
+        elif not self._done_sent:
+            # No socket to finalize on - the session cannot complete cleanly.
+            raise APIConnectionError(
+                "connection lost before the Done signal could be sent"
+            )
 
-                    # Send all chunks
-                    for chunk in chunks:
-                        await self._send_audio_chunk(chunk)
-                else:
-                    logger.warning(f"Stream {self._session_id} unexpected data type: {type(data)}")
+    async def _on_segment_end(self) -> None:
+        """
+        Hook for the flush policy. Currently: nothing.
 
-            logger.debug(f"Stream {self._session_id} send task completed")
-
-        except Exception as e:
-            logger.error(f"Stream {self._session_id} send task error: {e}")
-            raise
+        The engine emits finals per silence-delimited segment on its own (the
+        gateway threads precedingContext across finals - multi-final sessions
+        are its normal operation), so a segment boundary needs no signal. If
+        the live probe (scratchpad/probe_finals.py) ever shows an engine that
+        only finalizes on "Done", this hook is where the policy changes:
+        send "Done", drain, and rotate the socket - without touching the rest
+        of the loop.
+        """
 
     @property
     def dropped_frames(self) -> int:
         """
         Audio frames discarded to bound the input backlog.
 
-        Non-zero means the transcript for this stream has gaps: the uplink could
-        not keep up and audio was deliberately dropped. Exposed so a caller can
-        tell a lossy transcript from a complete one - the loss is otherwise only
-        visible in the logs, and the emitted events look normal.
+        Non-zero means the transcript for this stream has gaps: the uplink
+        could not keep up and audio was deliberately dropped. Exposed so a
+        caller can tell a lossy transcript from a complete one - the loss is
+        otherwise only visible in the logs, and the emitted events look
+        normal.
         """
         return self._dropped_frames
 
@@ -476,9 +366,10 @@ class VoxistSTTStream(RecognizeStream):
         """
         Count a dropped frame and report it, rate-limited.
 
-        The drop condition persists for as long as the uplink is behind, and the
-        send loop iterates per 10ms frame, so logging every drop would emit ~100
-        lines/second per stream during exactly the overload being reported.
+        The drop condition persists for as long as the uplink is behind, and
+        the send loop iterates per 10ms frame, so logging every drop would
+        emit ~100 lines/second per stream during exactly the overload being
+        reported.
         """
         self._dropped_frames += 1
 
@@ -503,18 +394,18 @@ class VoxistSTTStream(RecognizeStream):
         Await a WebSocket send, bounded by SEND_TIMEOUT_SECONDS.
 
         Every send on this stream goes through here. aiohttp's drain has no
-        timeout of its own, so an unbounded send blocks the send loop until the
-        receive watchdog fires 30s later - during which nothing is consumed from
-        the input channel and the backlog grows unchecked. Routing all sends
-        through one helper keeps the bound from being applied only to some of
-        them.
+        timeout of its own, so an unbounded send would block the send loop
+        indefinitely while the input backlog grows. On a stall the transport
+        is aborted - a cancelled send may have left a frame mid-flight, so
+        the socket is no longer safe to write to - and the failure surfaces
+        as APIConnectionError for the framework to retry.
 
         Args:
             coro: The send coroutine to await
             what: Short description for the error path (e.g. "audio chunk")
 
         Raises:
-            ConnectionError: If the send stalls past SEND_TIMEOUT_SECONDS.
+            APIConnectionError: If the send stalls past SEND_TIMEOUT_SECONDS.
         """
         try:
             await asyncio.wait_for(coro, timeout=self.SEND_TIMEOUT_SECONDS)
@@ -523,54 +414,29 @@ class VoxistSTTStream(RecognizeStream):
             logger.warning(
                 f"Stream {self._session_id} send stalled for "
                 f"{self.SEND_TIMEOUT_SECONDS}s sending {what} "
-                f"(write buffer={buffer_size}B); treating the connection as broken"
+                f"(write buffer={buffer_size}B); abandoning the connection"
             )
-            await self._abandon_connection()
-            raise ConnectionError(
+            transport = self._get_transport()
+            if transport is not None:
+                transport.abort()  # immediate, does not attempt to flush
+            raise APIConnectionError(
                 "WebSocket send timeout - connection stalled"
             ) from e
-
-    async def _abandon_connection(self) -> None:
-        """
-        Give up on the current connection so the pool recycles it.
-
-        A stalled socket is not a closed socket, so without this the pool would
-        hand it straight to the next stream, which would stall in turn. The pool
-        owns the state transition and the reconnect - the stream must not write
-        ConnectionState itself, or release_connection() would find the
-        connection no longer IN_USE and skip its own bookkeeping entirely.
-
-        The transport is aborted because a cancelled send may have left a frame
-        mid-flight, so this connection is no longer safe to write to.
-        """
-        if not self._conn:
-            return
-
-        transport = self._get_transport()
-        if transport is not None:
-            transport.abort()  # immediate, does not attempt to flush
-
-        await self._pool.mark_broken(self._conn)
 
     def _get_transport(self) -> asyncio.Transport | None:
         """
         Reach the asyncio transport underlying the WebSocket, for diagnostics.
 
-        Prefers a public accessor if the installed aiohttp grows one; otherwise
-        walks ws._response.connection, which is not public API. Used only for
-        observability - nothing in the send path depends on the result, so a
-        None here degrades logging, never behaviour.
-
-        Returns:
-            The transport, or None if it cannot be reached or is closing.
+        Prefers a public accessor if the installed aiohttp grows one;
+        otherwise walks ws._response.connection, which is not public API.
+        Used only for observability and the stall-abort - a None here degrades
+        logging, never behaviour.
         """
-        if not self._conn or not self._conn.ws:
+        ws = self._ws
+        if ws is None:
             return None
 
-        ws = self._conn.ws
         transport = None
-
-        # Public accessor, if this aiohttp has one.
         getter = getattr(ws, "get_transport", None)
         if callable(getter):
             try:
@@ -579,9 +445,6 @@ class VoxistSTTStream(RecognizeStream):
                 transport = None
 
         if transport is None:
-            # Private fallback. get_extra_info("transport") is not an option:
-            # asyncio transports carry no "transport" extra-info key, so it
-            # always returns None.
             try:
                 connection = ws._response.connection  # type: ignore[attr-defined]
                 transport = connection.transport if connection is not None else None
@@ -589,10 +452,6 @@ class VoxistSTTStream(RecognizeStream):
                 transport = None
 
         if transport is not None:
-            # Guarded: `getter` is any callable named get_transport, so the
-            # result is not guaranteed to be a transport. This method is
-            # documented as observability-only and must never raise into the
-            # send path.
             try:
                 if transport.is_closing():
                     return None
@@ -600,14 +459,12 @@ class VoxistSTTStream(RecognizeStream):
             except (AttributeError, RuntimeError):
                 transport = None
 
-        # Log once per stream: a silent permanent failure would hide the loss of
-        # every buffer metric behind an aiohttp upgrade.
         if not self._transport_lookup_failed:
             self._transport_lookup_failed = True
             logger.debug(
                 f"Stream {self._session_id} cannot reach the WebSocket "
-                "transport; write-buffer metrics unavailable for this "
-                "stream (aiohttp internals may have changed)"
+                "transport; write-buffer metrics unavailable for this stream "
+                "(aiohttp internals may have changed)"
             )
         return None
 
@@ -615,12 +472,9 @@ class VoxistSTTStream(RecognizeStream):
         """
         Measure the transport write buffer size, for observability only.
 
-        Deliberately NOT used for flow control. Two earlier versions got that
-        wrong: first by accumulating half of every chunk ever sent into a
-        counter that never decayed, then by comparing the real size against
-        thresholds calibrated for a plain socket while production runs TLS.
-        Backpressure belongs to aiohttp, which drains inside send_bytes() using
-        the transport's own pause state rather than any absolute byte count.
+        Deliberately NOT used for flow control: backpressure belongs to
+        aiohttp, which drains inside send_bytes() using the transport's own
+        pause state rather than any absolute byte count.
 
         Returns:
             Buffer size in bytes, or 0 if it cannot be measured.
@@ -628,7 +482,6 @@ class VoxistSTTStream(RecognizeStream):
         transport = self._get_transport()
         if transport is None:
             return 0
-
         try:
             return int(transport.get_write_buffer_size())
         except (AttributeError, RuntimeError):
@@ -638,153 +491,63 @@ class VoxistSTTStream(RecognizeStream):
         """
         Send an Int16 PCM audio chunk to the WebSocket.
 
-        Backpressure is aiohttp's: this await drains while the transport is
-        paused, which is correct for both plain and TLS transports because it
-        follows the transport's own pause state instead of a fixed threshold.
-
-        CRIT-001: the send is bounded by SEND_TIMEOUT_SECONDS so a stalled
-        uplink cannot block the send loop indefinitely; memory is bounded
-        separately by the input backlog cap in _send_audio_task.
-
-        Args:
-            audio_int16: Int16 NumPy array to send (Voxist expects raw Int16 PCM)
-
         Raises:
-            ConnectionError: If the send stalls past SEND_TIMEOUT_SECONDS.
-            OwnershipViolationError: If the stream does not own the connection.
+            APIConnectionError: The socket is gone or the send stalled. Not
+                skippable: silently dropping chunks on a closed socket once
+                made a mid-call close look like a clean end of input, so the
+                stream "completed" with a truncated transcript.
         """
-        if not self._conn or not self._conn.ws:
-            logger.warning(f"Stream {self._session_id} no connection, skipping chunk")
-            return
-
-        if self._conn.ws.closed:
-            logger.warning(f"Stream {self._session_id} WebSocket closed, skipping chunk")
-            return
-
-        # SECURITY: Validate exclusive ownership before touching shared
-        # connection state (VUL-003). Checked before the send so a violation is
-        # reported even when the send itself fails.
-        if not self._owns_connection:
-            raise OwnershipViolationError(
-                f"Stream {self._session_id} updating buffered_amount without ownership - "
-                "potential race condition. This indicates a bug in stream lifecycle."
+        if self._ws is None or self._ws.closed:
+            raise APIConnectionError(
+                "WebSocket closed while sending audio - connection lost"
             )
 
         audio_bytes = audio_int16.tobytes()
         await self._send_with_timeout(
-            self._conn.ws.send_bytes(audio_bytes), "audio chunk"
+            self._ws.send_bytes(audio_bytes), "audio chunk"
         )
-
-        logger.debug(f"Stream {self._session_id} sent {len(audio_bytes)} bytes to WebSocket")
-
-        # Diagnostic snapshot only. The pool no longer selects on this value;
-        # it round-robins, because a post-send measurement is ~0 for every
-        # healthy connection and cannot distinguish between them.
-        self._conn.buffered_amount = self._get_write_buffer_size()
 
     async def _recv_results_task(self) -> None:
         """
-        Task for receiving transcription results from WebSocket.
+        Receive transcription results until the server closes the socket.
 
-        Processes JSON messages and emits LiveKit SpeechEvent objects.
-        Uses RECEIVE_TIMEOUT_SECONDS to detect stalled connections.
+        No receive watchdog during streaming: the engine is silent while the
+        user is silent, and aiohttp's heartbeat already closes the socket on a
+        missed pong, which ends this loop. The only bounded wait is the
+        post-Done drain in _run.
         """
-        RECEIVE_TIMEOUT_SECONDS = self.RECEIVE_TIMEOUT_SECONDS
-
-        try:
-            logger.debug(f"Stream {self._session_id} receive task started")
-
-            if not self._conn or not self._conn.ws:
-                raise ConnectionError("No active connection")
-
-            # Use explicit receive loop with timeout instead of async for
-            # This allows us to detect stalled connections
-            while not self._conn.ws.closed:
+        assert self._ws is not None
+        async for msg in self._ws:
+            if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
-                    msg = await asyncio.wait_for(
-                        self._conn.ws.receive(),
-                        timeout=RECEIVE_TIMEOUT_SECONDS
-                    )
-                except asyncio.TimeoutError as e:
-                    logger.warning(
-                        f"Stream {self._session_id} receive timeout after "
-                        f"{RECEIVE_TIMEOUT_SECONDS}s - connection may be stalled"
-                    )
-                    # Same treatment as a stalled send: a socket that stops
-                    # answering is not a closed socket, so without this the pool
-                    # returns it to READY and the next stream inherits the stall.
-                    # ws.receive() was also cancelled mid-await, which leaves
-                    # aiohttp's reader in an undefined state.
-                    await self._abandon_connection()
-                    raise ConnectionError(
-                        "WebSocket receive timeout - connection stalled"
-                    ) from e
-
-                # Any message is proof the socket is alive. The pool's heartbeat
-                # loop only refreshes last_heartbeat for READY connections, so
-                # without this a long call would hand back a connection with a
-                # timestamp older than the staleness threshold and the pool
-                # would tear down a perfectly healthy socket.
-                if self._conn:
-                    self._conn.last_heartbeat = time.time()
-
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    # Parse JSON message
-                    logger.debug(
-                        f"Stream {self._session_id} received from Voxist: {msg.data[:200]}"
-                    )
-                    try:
-                        data = json.loads(msg.data)
-                        await self._process_result(data)
-                    except json.JSONDecodeError:
-                        # Log details internally (truncated to avoid log bloat)
-                        logger.error(
-                            f"Stream {self._session_id} invalid JSON received"
-                        )
-                        logger.debug(
-                            f"Stream {self._session_id} invalid JSON: {msg.data[:80]}"
-                        )
-                        continue
-
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    # Log full details internally, but sanitize user-facing error
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
                     logger.error(
-                        f"Stream {self._session_id} WebSocket error: {msg.data}"
+                        f"Stream {self._session_id} invalid JSON received"
                     )
-                    raise ConnectionError("WebSocket connection error occurred")
+                    logger.debug(
+                        f"Stream {self._session_id} invalid JSON: {msg.data[:80]}"
+                    )
+                    continue
+                await self._process_result(data)
+            elif msg.type == aiohttp.WSMsgType.ERROR:
+                raise APIConnectionError("WebSocket connection error occurred")
 
-                elif msg.type == aiohttp.WSMsgType.CLOSED:
-                    logger.debug(f"Stream {self._session_id} WebSocket closed by server")
-                    break
-
-                elif msg.type == aiohttp.WSMsgType.CLOSING:
-                    logger.debug(f"Stream {self._session_id} WebSocket closing")
-                    break
-
-            logger.debug(f"Stream {self._session_id} receive task completed")
-
-        except Exception as e:
-            logger.error(f"Stream {self._session_id} receive task error: {e}")
-            raise
+        logger.debug(
+            f"Stream {self._session_id} server closed the socket"
+        )
 
     async def _process_result(self, data: dict):
         """
-        Process transcription result from Voxist and emit appropriate events.
+        Process a transcription result from Voxist and emit events.
 
         Voxist Message Format:
             {"type": "partial"|"final", "text": "...", "confidence": 0.95, ...}
-            {"status": "connected"}
 
         Args:
             data: Parsed JSON message from Voxist
         """
         msg_type = data.get("type")
-        msg_status = data.get("status")
-
-        # Connection confirmation
-        if msg_status == "connected":
-            logger.debug(f"Stream {self._session_id} connection confirmed")
-            return
 
         # Detect start of speech
         text = data.get("text", "").strip()
@@ -834,16 +597,18 @@ class VoxistSTTStream(RecognizeStream):
                     ],
                 )
                 self._event_ch.send_nowait(event)
-                # Note: END_OF_SPEECH is NOT emitted here because Voxist sends
-                # multiple segments during continuous speech. END_OF_SPEECH is
-                # only emitted when the stream is explicitly closed (see _run)
+                # END_OF_SPEECH is NOT emitted here: the engine sends one
+                # final per segment during continuous speech. It is emitted
+                # when the session completes (see _run).
 
-        # Error handling
+        # Server-reported error
         elif msg_type == "error":
             error_msg = data.get("message", "Unknown error")
             logger.error(f"Stream {self._session_id} Voxist error: {error_msg}")
-            raise Exception(f"Voxist error: {error_msg}")
+            raise APIConnectionError(f"Voxist error: {error_msg}")
 
         # Unknown message type
         elif msg_type:
-            logger.warning(f"Stream {self._session_id} unknown message type: {msg_type}")
+            logger.warning(
+                f"Stream {self._session_id} unknown message type: {msg_type}"
+            )

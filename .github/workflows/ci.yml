@@ -30,6 +30,13 @@ jobs:
         run: |
           pytest --cov=livekit.plugins.voxist --cov-report=xml -v -m "not integration"
 
+      # The integration suite drives the whole pipeline against a local mock
+      # server and needs no credentials. It was once excluded from CI, which is
+      # how it stayed red long enough to hide a dropped-transcript bug.
+      - name: Run integration tests
+        run: |
+          pytest -v -m integration
+
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         if: matrix.python-version == '3.11'

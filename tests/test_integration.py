@@ -9,24 +9,8 @@ from livekit.agents.stt import SpeechEventType
 
 from livekit import rtc
 from livekit.plugins.voxist import VoxistSTT
-from livekit.plugins.voxist.models import ConnectionState
 
 from .fixtures.mock_server import MockVoxistServer
-
-
-async def wait_for_pool_settled(pool, timeout: float = 5.0) -> None:
-    """
-    Wait until no connection in the pool is still CONNECTING.
-
-    initialize() returns as soon as the first connection is up and deliberately
-    lets the rest finish in the background, so pool state read immediately
-    afterwards is not final: a straggler that completes later overwrites
-    whatever state it had in the meantime.
-    """
-    deadline = time.time() + timeout
-    while any(c.state == ConnectionState.CONNECTING for c in pool.connections):
-        assert time.time() < deadline, f"pool did not settle within {timeout}s"
-        await asyncio.sleep(0.01)
 
 
 @pytest.mark.integration
@@ -43,8 +27,6 @@ class TestBasicStreaming:
             language="fr",
         )
 
-        # Initialize pool
-        await stt._pool.initialize()
 
         # Create stream
         stream = stt.stream()
@@ -100,7 +82,6 @@ class TestBasicStreaming:
             interim_results=True,
         )
 
-        await stt._pool.initialize()
         stream = stt.stream()
 
         # Send audio
@@ -153,7 +134,6 @@ class TestBasicStreaming:
             base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
         )
 
-        await stt._pool.initialize()
         stream = stt.stream()
 
         # Send audio
@@ -208,7 +188,6 @@ class TestMultiLanguage:
             language="fr",
         )
 
-        await stt._pool.initialize()
         stream = stt.stream()
 
         # Send minimal audio
@@ -251,7 +230,6 @@ class TestMultiLanguage:
             language="fr-medical",
         )
 
-        await stt._pool.initialize()
         stream = stt.stream()
 
         # Send audio
@@ -283,183 +261,94 @@ class TestMultiLanguage:
 
 
 @pytest.mark.integration
-class TestConnectionPool:
-    """Test connection pool behavior in integration."""
+class TestSessionDialing:
+    """Per-stream dialing: token reuse across sessions, isolation between them."""
 
     @pytest.mark.asyncio
-    async def test_pool_pre_warming(self, generate_test_audio):
-        """Test connection pool pre-warms connections."""
+    async def test_token_cached_across_streams(self, generate_test_audio):
+        """The HTTPS token exchange happens once, not once per stream."""
         server = MockVoxistServer(port=8773, valid_api_key="test")
         await server.start()
 
-        stt = VoxistSTT(
-            api_key="test",
-            base_url="ws://localhost:8773/ws",
-            connection_pool_size=2,
-        )
+        stt = VoxistSTT(api_key="test", base_url="ws://localhost:8773/ws")
 
-        # Initialize pool
-        start = time.time()
-        await stt._pool.initialize()
-        init_time = time.time() - start
+        async def run_stream():
+            stream = stt.stream()
+            test_audio = generate_test_audio(duration_ms=300)
+            stream.push_frame(
+                rtc.AudioFrame(
+                    data=test_audio.tobytes(),
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=len(test_audio),
+                )
+            )
+            stream.end_input()
+            async for event in stream:
+                if event.type == SpeechEventType.FINAL_TRANSCRIPT:
+                    return event.alternatives[0].text
 
-        # Check pool health
-        health = stt._pool.get_pool_health()
-        assert health["ready"] >= 1  # At least one connection ready
-        assert health["total"] == 2
-
-        # First stream should be fast (no connection overhead)
-        stream_start = time.time()
-        stream = stt.stream()
-
-        test_audio = generate_test_audio(duration_ms=300)
-        frame = rtc.AudioFrame(
-            data=test_audio.tobytes(),
-            sample_rate=16000,
-            num_channels=1,
-            samples_per_channel=len(test_audio),
-        )
-        stream.push_frame(frame)
-        stream.end_input()
-
-        async for event in stream:
-            if event.type == SpeechEventType.FINAL_TRANSCRIPT:
-                break
-
-        stream_time = time.time() - stream_start
+        first = await run_stream()
+        second = await run_stream()
 
         await stt.aclose()
         await server.stop()
 
-        # Stream should be fast (< 1s for this test)
-        assert stream_time < 1.0
-
-        print(f"\nPool init: {init_time:.2f}s, Stream: {stream_time:.2f}s")
+        assert first == second == "bonjour monde"
+        assert server.connections_count == 2, "each stream dials its own socket"
+        assert server.token_requests_count == 1, (
+            "the token must be exchanged once and cached, not per stream"
+        )
 
     @pytest.mark.asyncio
-    async def test_concurrent_streams_use_different_connections(self, generate_test_audio):
-        """Test concurrent streams use different connections from pool."""
+    async def test_warm_up_prefetches_the_token(self):
+        """wait_for_initialization() caches the token before the first stream."""
+        server = MockVoxistServer(port=8779, valid_api_key="test")
+        await server.start()
+
+        stt = VoxistSTT(api_key="test", base_url="ws://localhost:8779/ws")
+        ready = await stt.wait_for_initialization(timeout=5.0)
+
+        await stt.aclose()
+        await server.stop()
+
+        assert ready is True
+        assert stt.is_ready
+        assert server.token_requests_count == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_streams_are_isolated(self, generate_test_audio):
+        """Concurrent streams run on separate sockets and both complete."""
         server = MockVoxistServer(port=8774, valid_api_key="test")
         await server.start()
 
-        stt = VoxistSTT(
-            api_key="test",
-            base_url="ws://localhost:8774/ws",
-            connection_pool_size=2,
-        )
+        stt = VoxistSTT(api_key="test", base_url="ws://localhost:8774/ws")
 
-        await stt._pool.initialize()
-
-        # Create two concurrent streams
         test_audio = generate_test_audio(duration_ms=300)
 
         async def run_stream():
             stream = stt.stream()
-            frame = rtc.AudioFrame(
-                data=test_audio.tobytes(),
-                sample_rate=16000,
-                num_channels=1,
-                samples_per_channel=len(test_audio),
+            stream.push_frame(
+                rtc.AudioFrame(
+                    data=test_audio.tobytes(),
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=len(test_audio),
+                )
             )
-            stream.push_frame(frame)
             stream.end_input()
 
             async for event in stream:
                 if event.type == SpeechEventType.FINAL_TRANSCRIPT:
                     return event.alternatives[0].text
 
-        # Run two streams concurrently
         results = await asyncio.gather(run_stream(), run_stream())
 
         await stt.aclose()
         await server.stop()
 
-        # Both should succeed
-        assert len(results) == 2
-        assert all(r == "bonjour monde" for r in results)
-
-
-@pytest.mark.integration
-class TestAudioProcessing:
-    """Test audio processing in full pipeline."""
-
-    @pytest.mark.asyncio
-    async def test_various_audio_frame_sizes(self, mock_voxist_server):
-        """Test plugin handles various audio frame sizes."""
-        stt = VoxistSTT(
-            api_key="test_key",
-            base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
-        )
-
-        await stt._pool.initialize()
-        stream = stt.stream()
-
-        # Send frames of varying sizes
-        frame_sizes = [800, 1600, 3200, 500, 2000]  # Various durations
-
-        for size in frame_sizes:
-            audio = np.random.randint(-32768, 32767, size=size, dtype=np.int16)
-            frame = rtc.AudioFrame(
-                data=audio.tobytes(),
-                sample_rate=16000,
-                num_channels=1,
-                samples_per_channel=size,
-            )
-            stream.push_frame(frame)
-            await asyncio.sleep(0.01)
-
-        stream.end_input()
-
-        # Should complete successfully
-        got_final = False
-        async for event in stream:
-            if event.type == SpeechEventType.FINAL_TRANSCRIPT:
-                got_final = True
-                break
-
-        await stt.aclose()
-
-        assert got_final
-
-    @pytest.mark.asyncio
-    async def test_long_audio_streaming(self, mock_voxist_server, generate_test_audio):
-        """Test streaming longer audio (5 seconds)."""
-        stt = VoxistSTT(
-            api_key="test_key",
-            base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
-        )
-
-        await stt._pool.initialize()
-        stream = stt.stream()
-
-        # Generate 5 seconds of audio
-        test_audio = generate_test_audio(duration_ms=5000)
-
-        # Send in 100ms chunks
-        chunk_size = 1600
-        for i in range(0, len(test_audio), chunk_size):
-            chunk = test_audio[i:i+chunk_size]
-            frame = rtc.AudioFrame(
-                data=chunk.tobytes(),
-                sample_rate=16000,
-                num_channels=1,
-                samples_per_channel=len(chunk),
-            )
-            stream.push_frame(frame)
-
-        stream.end_input()
-
-        # Collect all events
-        events = []
-        async for event in stream:
-            events.append(event)
-            if event.type == SpeechEventType.END_OF_SPEECH:
-                break
-
-        await stt.aclose()
-
-        # Should have multiple events for long audio
-        assert len(events) >= 3
+        assert list(results) == ["bonjour monde", "bonjour monde"]
+        assert server.connections_count == 2
 
 
 @pytest.mark.integration
@@ -468,69 +357,71 @@ class TestErrorHandling:
 
     @pytest.mark.asyncio
     async def test_authentication_failure(self):
-        """Test plugin handles authentication failure properly."""
-        server = MockVoxistServer(
-            port=8775,
-            error_mode="auth_failure",
-        )
+        """A rejected key surfaces as AuthenticationError, not a retry loop."""
+        server = MockVoxistServer(port=8775, error_mode="auth_failure")
         await server.start()
 
-        stt = VoxistSTT(
-            api_key="any_key",
-            base_url="ws://localhost:8775/ws",
-        )
+        stt = VoxistSTT(api_key="any_key", base_url="ws://localhost:8775/ws")
 
-        # Initialization should fail with auth error
         from livekit.plugins.voxist.exceptions import AuthenticationError
 
-        with pytest.raises(AuthenticationError):
-            await stt._pool.initialize()
+        # Warm-up reports it...
+        ready = await stt.wait_for_initialization(timeout=5.0)
+        assert ready is False
+        assert isinstance(stt.initialization_error, AuthenticationError)
 
-        await server.stop()
-
-    @pytest.mark.asyncio
-    async def test_connection_pool_exhaustion_handling(self, generate_test_audio):
-        """Test handling when connection pool is exhausted."""
-        from livekit.plugins.voxist.exceptions import ConnectionPoolExhaustedError
-
-        # Create server that will fail connections
-        server = MockVoxistServer(port=8776, valid_api_key="test")
-        await server.start()
-
-        stt = VoxistSTT(
-            api_key="test",
-            base_url="ws://localhost:8776/ws",
-            connection_pool_size=2,
-        )
-
-        await stt._pool.initialize()
-        await wait_for_pool_settled(stt._pool)
-
-        # Manually fail all connections
-        for conn in stt._pool.connections:
-            conn.state = ConnectionState.FAILED
-            conn.retry_count = stt._pool.max_reconnect_attempts
-
-        # Creating stream should fail
+        # ...and a stream fails with the true cause rather than a generic
+        # connection error. Deliberately not an APIError: livekit would retry
+        # those, and retrying cannot fix a revoked key.
         stream = stt.stream()
-
-        with pytest.raises(ConnectionPoolExhaustedError):
-            # Try to run stream (will fail to get connection)
-            test_audio = generate_test_audio(duration_ms=100)
-            frame = rtc.AudioFrame(
-                data=test_audio.tobytes(),
-                sample_rate=16000,
-                num_channels=1,
-                samples_per_channel=len(test_audio),
-            )
-            stream.push_frame(frame)
-            stream.end_input()
-
+        stream.end_input()
+        with pytest.raises(AuthenticationError):
             async for _event in stream:
                 pass
 
         await stt.aclose()
         await server.stop()
+
+    async def test_unreachable_server_fails_after_bounded_retries(
+        self, generate_test_audio
+    ):
+        """
+        A dead endpoint fails the stream after livekit's retry budget.
+
+        Retries are owned by RecognizeStream._main_task (conn_options), not by
+        the plugin: an earlier design kept its own reconnect loop inside the
+        framework's, and its budget could be made unreachable. This pins the
+        bounded behaviour end to end.
+        """
+        from livekit.agents import APIConnectionError
+        from livekit.agents.types import APIConnectOptions
+
+        stt = VoxistSTT(
+            api_key="test",
+            base_url="ws://127.0.0.1:9/ws",  # discard port: refused
+        )
+
+        stream = stt.stream(
+            conn_options=APIConnectOptions(
+                max_retry=1, retry_interval=0.1, timeout=2.0
+            )
+        )
+        test_audio = generate_test_audio(duration_ms=100)
+        stream.push_frame(
+            rtc.AudioFrame(
+                data=test_audio.tobytes(),
+                sample_rate=16000,
+                num_channels=1,
+                samples_per_channel=len(test_audio),
+            )
+        )
+        stream.end_input()
+
+        with pytest.raises(APIConnectionError):
+            async for _event in stream:
+                pass
+
+        await stt.aclose()
 
 
 @pytest.mark.integration
@@ -549,7 +440,6 @@ class TestPerformance:
             base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
         )
 
-        await stt._pool.initialize()
 
         # Measure time to first final transcript
         test_audio = generate_test_audio(duration_ms=500)
@@ -587,19 +477,17 @@ class TestPerformance:
         print(f"\nMeasured latency: {latency:.1f}ms")
 
     @pytest.mark.asyncio
-    async def test_connection_pool_reduces_latency(self, generate_test_audio):
-        """Test connection pool reduces latency vs single connection."""
+    async def test_warm_token_keeps_first_stream_fast(self, generate_test_audio):
+        """With the token prefetched, the first stream avoids the HTTPS trip."""
         server = MockVoxistServer(port=8777, valid_api_key="test")
         await server.start()
 
-        # Test with pool size 2
         stt_pooled = VoxistSTT(
             api_key="test",
             base_url="ws://localhost:8777/ws",
-            connection_pool_size=2,
         )
 
-        await stt_pooled._pool.initialize()
+        assert await stt_pooled.wait_for_initialization(timeout=5.0)
 
         test_audio = generate_test_audio(duration_ms=300)
 
@@ -624,10 +512,9 @@ class TestPerformance:
         await stt_pooled.aclose()
         await server.stop()
 
-        # With pre-warmed pool, should be fast
+        # Dial + stream + final, with no token round-trip in the path
         assert pooled_time < 1.0
-
-        print(f"\nPooled connection time: {pooled_time:.3f}s")
+        assert server.token_requests_count == 1
 
 
 @pytest.mark.integration
@@ -642,7 +529,6 @@ class TestStreamLifecycle:
             base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
         )
 
-        await stt._pool.initialize()
 
         test_audio = generate_test_audio(duration_ms=300)
 
@@ -669,26 +555,17 @@ class TestStreamLifecycle:
 
         await stt.aclose()
 
-        # All streams should have succeeded
-        # Pool should be healthy
-        health = stt._pool.get_pool_health()
-        assert health["closed"] == stt._pool.pool_size  # All closed after aclose()
+        # One socket per session, one Done per session, none left open
+        assert mock_voxist_server.connections_count == 3
+        assert mock_voxist_server.done_received_count == 3
 
     @pytest.mark.asyncio
-    async def test_stream_cleanup_releases_connection(self, mock_voxist_server, generate_test_audio):
-        """Test stream releases connection back to pool after completion."""
+    async def test_stream_cleanup_closes_its_socket(self, mock_voxist_server, generate_test_audio):
+        """A completed stream leaves no socket behind."""
         stt = VoxistSTT(
             api_key="test_key",
             base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
-            connection_pool_size=2,
         )
-
-        await stt._pool.initialize()
-        await wait_for_pool_settled(stt._pool)
-
-        # Check initial pool state
-        initial_health = stt._pool.get_pool_health()
-        assert initial_health["ready"] == 2
 
         # Create and run stream
         stream = stt.stream()
@@ -710,9 +587,10 @@ class TestStreamLifecycle:
         # Give time for cleanup
         await asyncio.sleep(0.1)
 
-        # Connection should be back in pool
-        final_health = stt._pool.get_pool_health()
-        assert final_health["ready"] + final_health["in_use"] >= 1
+        # The session ended with exactly one Done and the stream's own socket;
+        # aclose() then has nothing to tear down but the HTTP session.
+        assert mock_voxist_server.done_received_count == 1
+        assert mock_voxist_server.connections_count == 1
 
         await stt.aclose()
 

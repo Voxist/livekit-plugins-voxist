@@ -5,7 +5,7 @@ import os
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-from livekit.agents.stt import STT, STTCapabilities
+from livekit.agents.stt import STTCapabilities
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions
 
 from livekit.plugins.voxist import VoxistSTT
@@ -31,7 +31,7 @@ class TestVoxistSTTInitialization:
         assert stt._config["language"] == "fr"  # Default
         assert stt._config["sample_rate"] == 16000
         assert stt._config["interim_results"] is True
-        assert stt._pool is not None
+        assert stt._config is not None
 
     def test_initialization_from_environment(self):
         """Test VoxistSTT reads API key from environment."""
@@ -79,10 +79,13 @@ class TestVoxistSTTInitialization:
         assert stt._config["sample_rate"] == 22050
 
     def test_initialization_with_custom_pool_size(self):
-        """Test VoxistSTT with custom connection pool size."""
-        stt = VoxistSTT(api_key="test", connection_pool_size=3)
+        """connection_pool_size is accepted for backwards compatibility.
 
-        assert stt._pool.pool_size == 3
+        There is no pool anymore - one socket per stream - but constructors in
+        user code still pass it, so it must be accepted (and validated).
+        """
+        stt = VoxistSTT(api_key="test", connection_pool_size=3)
+        assert stt._config is not None
 
     def test_initialization_with_invalid_pool_size_raises(self):
         """Test VoxistSTT raises error for invalid pool size."""
@@ -120,8 +123,8 @@ class TestVoxistSTTInitialization:
         assert stt.capabilities.interim_results is False
         assert stt._config["interim_results"] is False
 
-    def test_initialization_creates_connection_pool(self):
-        """Test VoxistSTT creates ConnectionPool with correct params."""
+    def test_initialization_stores_dial_settings(self):
+        """Test VoxistSTT stores what the dialer needs."""
         stt = VoxistSTT(
             api_key="test",
             base_url="wss://custom.url/ws",
@@ -130,11 +133,9 @@ class TestVoxistSTTInitialization:
             heartbeat_interval=60.0,
         )
 
-        assert stt._pool.base_url == "wss://custom.url/ws"
-        assert stt._pool.api_key == "test"
-        assert stt._pool.pool_size == 3
-        assert stt._pool.connection_timeout == 5.0
-        assert stt._pool.heartbeat_interval == 60.0
+        assert stt._base_url == "wss://custom.url/ws"
+        assert stt._api_key == "test"
+        assert stt._heartbeat_interval == 60.0
 
 
 class TestVoxistSTTStreamCreation:
@@ -176,17 +177,29 @@ class TestVoxistSTTCleanup:
     """Test resource cleanup."""
 
     @pytest.mark.asyncio
-    async def test_aclose_closes_pool(self):
-        """Test aclose() closes connection pool."""
+    async def test_aclose_closes_owned_session(self):
+        """Test aclose() closes the HTTP session the plugin created."""
         stt = VoxistSTT(api_key="test")
 
-        # Mock the pool close method
-        stt._pool.close = AsyncMock()
+        session = AsyncMock()
+        session.closed = False
+        stt._session = session
+        stt._owns_session = True
 
         await stt.aclose()
 
-        # Should have called pool.close()
-        stt._pool.close.assert_called_once()
+        session.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aclose_leaves_user_session_open(self):
+        """A session supplied by the caller is theirs to close."""
+        session = AsyncMock()
+        session.closed = False
+        stt = VoxistSTT(api_key="test", http_session=session)
+
+        await stt.aclose()
+
+        session.close.assert_not_awaited()
 
 
 class TestVoxistSTTConfiguration:
@@ -203,7 +216,6 @@ class TestVoxistSTTConfiguration:
         )
 
         assert stt._config["language"] == "fr-medical"
-        assert stt._pool.pool_size == 3
 
     def test_english_configuration(self):
         """Test configuration for English transcription."""
@@ -228,7 +240,6 @@ class TestVoxistSTTConfiguration:
             assert stt._config["interim_results"] is True
             assert stt._config["chunk_duration_ms"] == 100
             assert stt._config["stride_overlap_ms"] == 20
-            assert stt._pool.pool_size == 2
 
     def test_maximal_configuration(self):
         """Test maximal configuration with all parameters."""
@@ -252,9 +263,7 @@ class TestVoxistSTTConfiguration:
         assert stt._config["sample_rate"] == 48000
         assert stt._base_url == "wss://custom.server.com/ws"
         assert stt._config["interim_results"] is False
-        assert stt._pool.pool_size == 5
-        assert stt._pool.connection_timeout == 15.0
-        assert stt._pool.heartbeat_interval == 45.0
+        assert stt._heartbeat_interval == 45.0
         assert stt._config["chunk_duration_ms"] == 200
         assert stt._config["stride_overlap_ms"] == 40
         assert stt._enable_metrics is False
@@ -325,14 +334,9 @@ class TestVoxistSTTIntegration:
             max_reconnect_attempts=15,
         )
 
-        pool = stt._pool
-
-        assert pool.api_key == "api_test"
-        assert pool.base_url == "wss://test.com/ws"
-        assert pool.pool_size == 3
-        assert pool.connection_timeout == 7.0
-        assert pool.heartbeat_interval == 25.0
-        assert pool.max_reconnect_attempts == 15
+        assert stt._api_key == "api_test"
+        assert stt._base_url == "wss://test.com/ws"
+        assert stt._heartbeat_interval == 25.0
 
 
 class TestVoxistSTTErrorHandling:
@@ -383,17 +387,16 @@ class TestVoxistSTTEdgeCases:
 
             assert stt._api_key == "param_key"
 
-    def test_minimum_pool_size(self):
-        """Test pool size of 1 is valid."""
-        stt = VoxistSTT(api_key="test", connection_pool_size=1)
+    def test_pool_size_bounds_accepted(self):
+        """The legacy bounds (1-5) construct successfully.
 
-        assert stt._pool.pool_size == 1
+        The parameter is compatibility-only now, but rejecting a value that
+        used to work would break existing constructor calls.
+        """
+        for size in (1, 5):
+            stt = VoxistSTT(api_key="test", connection_pool_size=size)
+            assert stt._config["language"] == "fr"
 
-    def test_maximum_pool_size(self):
-        """Test pool size of 5 is valid."""
-        stt = VoxistSTT(api_key="test", connection_pool_size=5)
-
-        assert stt._pool.pool_size == 5
 
     def test_minimum_chunk_duration(self):
         """Test minimum chunk duration (50ms)."""
@@ -427,7 +430,7 @@ class TestVoxistSTTEdgeCases:
         )
 
         assert stt._base_url == "wss://staging.voxist.com/ws"
-        assert stt._pool.base_url == "wss://staging.voxist.com/ws"
+        assert stt._base_url == "wss://staging.voxist.com/ws"
 
 
 class TestTaskLifecycle:
@@ -460,9 +463,6 @@ class TestTaskLifecycle:
         """Test that aclose cancels pending initialization task."""
         stt = VoxistSTT(api_key="test")
 
-        # Mock pool close
-        stt._pool.close = AsyncMock()
-
         await stt.aclose()
 
         # Task should be cancelled or done
@@ -484,11 +484,15 @@ class TestTaskLifecycle:
 
         stt = VoxistSTT(api_key="test")
 
-        # Mock pool to raise auth error
-        async def mock_init_raise_auth():
-            raise AuthenticationError("Invalid API key")
+        # Make the token pre-fetch raise an auth error
+        async def mock_ensure_dialer():
+            dialer = AsyncMock()
+            dialer._get_token_url.side_effect = AuthenticationError(
+                "Invalid API key"
+            )
+            return dialer
 
-        stt._pool.initialize = mock_init_raise_auth
+        stt._ensure_dialer = mock_ensure_dialer
 
         # The error should be stored/accessible, not just logged
         try:
@@ -563,7 +567,7 @@ class TestQUAL002InitializationState:
     async def test_wait_for_initialization_returns_bool(self):
         """Test that wait_for_initialization returns a boolean."""
         stt = VoxistSTT(api_key="test")
-        stt._pool.initialize = AsyncMock()
+        stt._ensure_dialer = AsyncMock(return_value=AsyncMock())
 
         result = await stt.wait_for_initialization(timeout=5.0)
 
@@ -575,7 +579,7 @@ class TestQUAL002InitializationState:
         from livekit.plugins.voxist import InitializationState
 
         stt = VoxistSTT(api_key="test")
-        stt._pool.initialize = AsyncMock()
+        stt._ensure_dialer = AsyncMock(return_value=AsyncMock())
         stt._init_state = InitializationState.NOT_STARTED
 
         result = await stt.wait_for_initialization(timeout=5.0)
@@ -616,10 +620,12 @@ class TestQUAL002InitializationState:
         stt._init_state = InitializationState.NOT_STARTED
 
         # Mock pool.initialize to never complete
-        async def slow_init():
+        async def slow_fetch():
             await asyncio.sleep(10)
 
-        stt._pool.initialize = slow_init
+        dialer = AsyncMock()
+        dialer._get_token_url = slow_fetch
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
 
         result = await stt.wait_for_initialization(timeout=0.1)
 
@@ -659,7 +665,6 @@ class TestQUAL002InitializationState:
 
         # Without initialization complete and pool not initialized
         stt._init_state = InitializationState.PENDING
-        stt._pool._initialized = False
 
         assert stt.is_ready is False
 
@@ -686,7 +691,9 @@ class TestQUAL002InitializationState:
         async def capture_state():
             states_during_init.append(stt.initialization_state)
 
-        stt._pool.initialize = capture_state
+        dialer = AsyncMock()
+        dialer._get_token_url = capture_state
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
         stt._init_state = InitializationState.PENDING
 
         await stt._initialize_pool()
@@ -701,10 +708,9 @@ class TestQUAL002InitializationState:
 
         stt = VoxistSTT(api_key="test")
 
-        async def raise_error():
-            raise ConnectionError("Network error")
-
-        stt._pool.initialize = raise_error
+        dialer = AsyncMock()
+        dialer._get_token_url.side_effect = ConnectionError("Network error")
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
         stt._init_state = InitializationState.PENDING
 
         await stt._initialize_pool()
@@ -720,10 +726,9 @@ class TestQUAL002InitializationState:
         stt = VoxistSTT(api_key="test")
         stt._init_state = InitializationState.NOT_STARTED
 
-        async def raise_error():
-            raise ValueError("Init failed")
-
-        stt._pool.initialize = raise_error
+        dialer = AsyncMock()
+        dialer._get_token_url.side_effect = ValueError("Init failed")
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
 
         with pytest.raises(InitializationError):
             await stt.__aenter__()
@@ -738,7 +743,7 @@ class TestContextManager:
         stt = VoxistSTT(api_key="test")
 
         # Mock pool initialize to avoid actual connection
-        stt._pool.initialize = AsyncMock()
+        stt._ensure_dialer = AsyncMock(return_value=AsyncMock())
 
         result = await stt.__aenter__()
 
@@ -750,13 +755,12 @@ class TestContextManager:
         stt = VoxistSTT(api_key="test")
 
         # Mock pool
-        stt._pool.initialize = AsyncMock()
-        stt._pool._initialized = False
+        stt._ensure_dialer = AsyncMock(return_value=AsyncMock())
 
         await stt.__aenter__()
 
         # Pool should be initialized
-        stt._pool.initialize.assert_called()
+        stt._ensure_dialer.assert_called()
 
     @pytest.mark.asyncio
     async def test_aexit_calls_aclose(self):
@@ -777,14 +781,13 @@ class TestContextManager:
         stt = VoxistSTT(api_key="test")
 
         # Mock pool operations
-        stt._pool.initialize = AsyncMock()
-        stt._pool.close = AsyncMock()
+        stt._ensure_dialer = AsyncMock(return_value=AsyncMock())
 
         async with stt as instance:
             assert instance is stt
 
         # Should have closed
-        stt._pool.close.assert_called()
+        assert stt._init_task is None or stt._init_task.done()
 
     @pytest.mark.asyncio
     async def test_aexit_cleanup_on_exception(self):
@@ -792,8 +795,7 @@ class TestContextManager:
         stt = VoxistSTT(api_key="test")
 
         # Mock pool operations
-        stt._pool.initialize = AsyncMock()
-        stt._pool.close = AsyncMock()
+        stt._ensure_dialer = AsyncMock(return_value=AsyncMock())
 
         try:
             async with stt:
@@ -802,7 +804,7 @@ class TestContextManager:
             pass
 
         # Should still have cleaned up
-        stt._pool.close.assert_called()
+        assert stt._init_task is None or stt._init_task.done()
 
 
 class TestSEC002LanguageValidation:
@@ -902,7 +904,9 @@ class TestSEC002LanguageValidation:
     def test_all_supported_languages_pass_format_validation(self):
         """Test that all SUPPORTED_LANGUAGES pass format validation."""
         for lang in SUPPORTED_LANGUAGES.keys():
-            assert validate_language_format(lang) is True, f"Supported language '{lang}' failed format validation"
+            assert validate_language_format(lang) is True, (
+                f"Supported language '{lang}' failed format validation"
+            )
 
     def test_stream_rejects_injection_in_language_override(self):
         """Test that stream() rejects injection attempts in language override."""
@@ -921,47 +925,22 @@ class TestSEC002LanguageValidation:
 
     @pytest.mark.asyncio
     @pytest.mark.no_auto_mock_token  # Need real _get_ws_token to test validation
-    async def test_connection_pool_validates_language_format(self):
-        """Test that ConnectionPool validates language format in _get_ws_token."""
-        from livekit.plugins.voxist.connection_pool import ConnectionPool
+    async def test_stream_validates_language_format_before_dialing(self):
+        """Injection-shaped language codes are rejected before any network use."""
+        stt = VoxistSTT(api_key="test_key")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
 
-        pool = ConnectionPool(
-            base_url="wss://test.com/ws",
-            api_key="test_key",
-            pool_size=1,
-        )
-
-        # Create a mock session (needed for the HTTP request part, but validation happens first)
-        mock_session = AsyncMock()
-        pool._session = mock_session
-
-        # Should raise LanguageNotSupportedError for invalid format
-        # This happens BEFORE any network call because format validation is first
-        with pytest.raises(LanguageNotSupportedError, match="invalid format"):
-            await pool._get_ws_token("fr; DROP TABLE", 16000)
-
-        # Clean up - set closing flag to avoid heartbeat issues
-        pool._closing = True
-        mock_session.closed = False
-        mock_session.close = AsyncMock()
+        with pytest.raises(LanguageNotSupportedError, match="invalid format|not supported"):
+            stt.stream(language="fr; DROP TABLE")
 
 
 class TestShutdownAndTLSConfiguration:
     """Shutdown ordering, and reaching a deployment behind a private CA."""
 
     @pytest.mark.asyncio
-    async def test_streams_closed_before_pool(self):
-        """
-        Streams must be closed before the pool.
-
-        pool.close() only touches connections whose socket is still open, so
-        closing it first leaves a connection whose socket already died in
-        IN_USE. The stream's later release then schedules a reconnect against
-        an already-closed ClientSession, retrying with backoff for minutes
-        after aclose() returned.
-        """
-        order = []
-
+    async def test_aclose_is_idempotent(self):
+        """aclose() twice must not raise - agents tear down defensively."""
         stt = VoxistSTT(api_key="test_key", base_url="ws://localhost:9/ws")
         if stt._init_task is not None:
             stt._init_task.cancel()
@@ -970,28 +949,18 @@ class TestShutdownAndTLSConfiguration:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        async def note_pool_close():
-            order.append("pool")
+        await stt.aclose()
+        await stt.aclose()
 
-        stt._pool.close = note_pool_close
-
-        with patch.object(
-            STT, "aclose", new=AsyncMock(side_effect=lambda: order.append("streams"))
-        ):
-            await stt.aclose()
-
-        assert order == ["streams", "pool"], (
-            f"expected streams closed before the pool, got {order}"
-        )
-
-    def test_ssl_context_is_forwarded_to_the_pool(self):
+    @pytest.mark.asyncio
+    async def test_ssl_context_is_forwarded_to_the_dialer(self):
         """
-        An explicit SSL context must reach the pool.
+        An explicit SSL context must reach the dialer.
 
-        Certificate verification is never disabled now, so without this
-        passthrough a deployment whose certificate is signed by a private CA is
-        unreachable through the public API - there is no other way to inject a
-        trust store.
+        Certificate verification is never disabled, so without this
+        passthrough a deployment whose certificate is signed by a private CA
+        is unreachable through the public API - there is no other way to
+        inject a trust store.
         """
         import ssl as ssl_module
 
@@ -1004,5 +973,7 @@ class TestShutdownAndTLSConfiguration:
         if stt._init_task is not None:
             stt._init_task.cancel()
 
-        assert stt._pool._ssl_context is ctx
-        assert stt._pool._ssl_param() is ctx
+        dialer = await stt._ensure_dialer()
+        assert dialer._ssl_param() is ctx
+
+        await stt.aclose()

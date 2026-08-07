@@ -2,10 +2,10 @@
 LiveKit STT plugin for Voxist ASR.
 
 Features:
-- Connection pooling for ultra-low latency (< 300ms)
+- One WebSocket per stream, aligned with the gateway's session protocol
 - Support for 8+ languages including French medical
 - Automatic text2num and medical units processing
-- Production-ready reliability with auto-reconnection
+- Reliability owned by livekit's own retry (conn_options.max_retry)
 
 Example:
     from livekit import agents

@@ -14,8 +14,8 @@ def auto_mock_token_exchange(request):
     """
     Automatically mock _get_ws_token for all tests to bypass HTTP token exchange.
 
-    This is needed because the SEC-001 fix adds token exchange via HTTPS before
-    WebSocket connection. Tests don't have a real HTTP server, so we mock this.
+    This is needed because the SEC-001 token exchange happens over HTTPS before
+    the WebSocket dial. Tests don't have a real HTTP server, so we mock this.
 
     To skip this fixture, mark test with:
     - @pytest.mark.no_auto_mock_token - for tests that need to test token exchange directly
@@ -28,12 +28,12 @@ def auto_mock_token_exchange(request):
         yield
         return
 
-    from livekit.plugins.voxist.connection_pool import ConnectionPool
+    from livekit.plugins.voxist.connection import VoxistDialer
 
-    async def _mock_get_ws_token(self, language: str, sample_rate: int) -> str:
-        return f"ws://localhost:8765/ws?token=mock_jwt_token&lang={language}&sample_rate={sample_rate}"
+    async def _mock_get_token_url(self) -> str:
+        return "ws://localhost:8765/ws?token=mock_jwt_token"
 
-    with patch.object(ConnectionPool, '_get_ws_token', _mock_get_ws_token):
+    with patch.object(VoxistDialer, '_get_token_url', _mock_get_token_url):
         yield
 
 
@@ -61,12 +61,12 @@ def mock_token_exchange_for_server():
 
     @contextmanager
     def _mock_for_server(server):
-        from livekit.plugins.voxist.connection_pool import ConnectionPool
+        from livekit.plugins.voxist.connection import VoxistDialer
 
-        async def _mock_get_ws_token(self, language: str, sample_rate: int) -> str:
-            return f"ws://{server.host}:{server.port}/ws?token=mock_jwt_token&lang={language}&sample_rate={sample_rate}"
+        async def _mock_get_token_url(self) -> str:
+            return f"ws://{server.host}:{server.port}/ws?token=mock_jwt_token"
 
-        with patch.object(ConnectionPool, '_get_ws_token', _mock_get_ws_token):
+        with patch.object(VoxistDialer, '_get_token_url', _mock_get_token_url):
             yield
 
     return _mock_for_server

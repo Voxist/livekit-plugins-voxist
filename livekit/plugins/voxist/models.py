@@ -3,10 +3,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from enum import Enum
-
-import aiohttp
 
 # SEC-002 FIX: Regex pattern for language code validation
 # Matches formats like: fr, en, de, fr-FR, en-US, fr-medical
@@ -57,38 +53,6 @@ def sanitize_url_param(value: str) -> str:
     """
     from urllib.parse import quote
     return quote(str(value), safe='')
-
-
-class ConnectionState(Enum):
-    """WebSocket connection states."""
-    CONNECTING = "connecting"
-    READY = "ready"
-    IN_USE = "in_use"
-    CLOSING = "closing"
-    CLOSED = "closed"
-    FAILED = "failed"
-    RECONNECTING = "reconnecting"
-
-
-@dataclass
-class Connection:
-    """
-    Represents a single WebSocket connection in the pool.
-
-    Attributes:
-        id: Unique connection identifier (0-indexed)
-        ws: aiohttp WebSocket connection (None if not connected)
-        state: Current connection state
-        retry_count: Number of reconnection attempts
-        last_heartbeat: Timestamp of last successful heartbeat
-        buffered_amount: Estimated buffered bytes (for backpressure)
-    """
-    id: int
-    ws: aiohttp.ClientWebSocketResponse | None = None
-    state: ConnectionState = ConnectionState.CLOSED
-    retry_count: int = 0
-    last_heartbeat: float = 0.0
-    buffered_amount: int = 0
 
 
 # Supported languages with descriptions

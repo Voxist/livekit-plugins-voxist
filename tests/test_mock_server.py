@@ -42,11 +42,46 @@ async def collect_json(ws, timeout=2.0):
 class TestMockServerBasics:
     @pytest.mark.asyncio
     async def test_server_starts_and_stops(self):
-        server = MockVoxistServer(port=8766)
+        server = MockVoxistServer()
         await server.start()
         assert server.runner is not None
         assert server.site is not None
+        assert server.port != 0, "start() must publish the real bound port"
         await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_two_default_servers_run_concurrently(self):
+        """
+        Two servers with default args coexist - impossible with a fixed
+        default port. Proves the ephemeral-port default (port=0) end to end:
+        distinct real ports after start(), and both actually serving (the
+        token endpoint answers on each, advertising its own port).
+        """
+        server_a = MockVoxistServer()
+        server_b = MockVoxistServer()
+        await server_a.start()
+        try:
+            await server_b.start()
+            try:
+                assert server_a.port != 0 and server_b.port != 0
+                assert server_a.port != server_b.port
+
+                async with aiohttp.ClientSession() as session:
+                    for srv in (server_a, server_b):
+                        async with session.get(
+                            f"http://{srv.host}:{srv.port}/websocket",
+                            headers={srv.api_key_header: srv.valid_api_key},
+                        ) as resp:
+                            assert resp.status == 200
+                            body = await resp.json()
+                            assert f":{srv.port}/ws" in body["url"], (
+                                "token endpoint must advertise the port the "
+                                "server actually bound"
+                            )
+            finally:
+                await server_b.stop()
+        finally:
+            await server_a.stop()
 
     @pytest.mark.asyncio
     async def test_no_greeting_on_connect(self, mock_voxist_server):
@@ -186,11 +221,11 @@ class TestMockServerBasics:
 class TestMockServerErrorSimulation:
     @pytest.mark.asyncio
     async def test_server_auth_failure_mode(self):
-        server = MockVoxistServer(port=8767, error_mode="auth_failure")
+        server = MockVoxistServer(error_mode="auth_failure")
         await server.start()
         try:
             async with aiohttp.ClientSession() as session:
-                url = "ws://localhost:8767/ws?api_key=anything"
+                url = f"ws://{server.host}:{server.port}/ws?api_key=anything"
                 async with session.ws_connect(url) as ws:
                     msg = await ws.receive()
                     assert msg.type == aiohttp.WSMsgType.CLOSE
@@ -208,12 +243,12 @@ class TestFinalsWithoutDoneToggle:
 
     @pytest.mark.asyncio
     async def test_silence_does_not_finalize_when_disabled(self):
-        server = MockVoxistServer(port=8768, valid_api_key="test_key")
+        server = MockVoxistServer(valid_api_key="test_key")
         server.finals_without_done = False
         await server.start()
         try:
             async with aiohttp.ClientSession() as session:
-                url = "ws://localhost:8768/ws?api_key=test_key&lang=fr"
+                url = f"ws://{server.host}:{server.port}/ws?api_key=test_key&lang=fr"
                 async with session.ws_connect(url) as ws:
                     for _ in range(3):
                         await ws.send_bytes(speech_frame())

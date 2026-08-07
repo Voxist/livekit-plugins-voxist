@@ -6,6 +6,7 @@ import time
 import numpy as np
 import pytest
 from livekit.agents.stt import SpeechEventType
+from livekit.agents.types import APIConnectOptions
 
 from livekit import rtc
 from livekit.plugins.voxist import VoxistSTT
@@ -176,7 +177,6 @@ class TestMultiLanguage:
     async def test_french_language(self, generate_test_audio):
         """Test French language transcription."""
         server = MockVoxistServer(
-            port=8771,
             valid_api_key="test",
             transcription_text="bonjour le monde",
         )
@@ -184,7 +184,7 @@ class TestMultiLanguage:
 
         stt = VoxistSTT(
             api_key="test",
-            base_url="ws://localhost:8771/ws",
+            base_url=f"ws://{server.host}:{server.port}/ws",
             language="fr",
         )
 
@@ -218,7 +218,6 @@ class TestMultiLanguage:
     async def test_medical_french_language(self, generate_test_audio):
         """Test French medical language configuration."""
         server = MockVoxistServer(
-            port=8772,
             valid_api_key="test",
             transcription_text="20 milligrammes",  # Simulated text2num output
         )
@@ -226,7 +225,7 @@ class TestMultiLanguage:
 
         stt = VoxistSTT(
             api_key="test",
-            base_url="ws://localhost:8772/ws",
+            base_url=f"ws://{server.host}:{server.port}/ws",
             language="fr-medical",
         )
 
@@ -267,13 +266,15 @@ class TestSessionDialing:
     @pytest.mark.asyncio
     async def test_token_cached_across_streams(self, generate_test_audio):
         """The HTTPS token exchange happens once, not once per stream."""
-        server = MockVoxistServer(port=8773, valid_api_key="test")
+        server = MockVoxistServer(valid_api_key="test")
         await server.start()
 
-        stt = VoxistSTT(api_key="test", base_url="ws://localhost:8773/ws")
+        stt = VoxistSTT(
+            api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
+        )
 
         async def run_stream():
-            stream = stt.stream()
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
             test_audio = generate_test_audio(duration_ms=300)
             stream.push_frame(
                 rtc.AudioFrame(
@@ -303,10 +304,12 @@ class TestSessionDialing:
     @pytest.mark.asyncio
     async def test_warm_up_prefetches_the_token(self):
         """wait_for_initialization() caches the token before the first stream."""
-        server = MockVoxistServer(port=8779, valid_api_key="test")
+        server = MockVoxistServer(valid_api_key="test")
         await server.start()
 
-        stt = VoxistSTT(api_key="test", base_url="ws://localhost:8779/ws")
+        stt = VoxistSTT(
+            api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
+        )
         ready = await stt.wait_for_initialization(timeout=5.0)
 
         await stt.aclose()
@@ -319,15 +322,17 @@ class TestSessionDialing:
     @pytest.mark.asyncio
     async def test_concurrent_streams_are_isolated(self, generate_test_audio):
         """Concurrent streams run on separate sockets and both complete."""
-        server = MockVoxistServer(port=8774, valid_api_key="test")
+        server = MockVoxistServer(valid_api_key="test")
         await server.start()
 
-        stt = VoxistSTT(api_key="test", base_url="ws://localhost:8774/ws")
+        stt = VoxistSTT(
+            api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
+        )
 
         test_audio = generate_test_audio(duration_ms=300)
 
         async def run_stream():
-            stream = stt.stream()
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
             stream.push_frame(
                 rtc.AudioFrame(
                     data=test_audio.tobytes(),
@@ -358,10 +363,12 @@ class TestErrorHandling:
     @pytest.mark.asyncio
     async def test_authentication_failure(self):
         """A rejected key surfaces as AuthenticationError, not a retry loop."""
-        server = MockVoxistServer(port=8775, error_mode="auth_failure")
+        server = MockVoxistServer(error_mode="auth_failure")
         await server.start()
 
-        stt = VoxistSTT(api_key="any_key", base_url="ws://localhost:8775/ws")
+        stt = VoxistSTT(
+            api_key="any_key", base_url=f"ws://{server.host}:{server.port}/ws"
+        )
 
         from livekit.plugins.voxist.exceptions import AuthenticationError
 
@@ -479,12 +486,12 @@ class TestPerformance:
     @pytest.mark.asyncio
     async def test_warm_token_keeps_first_stream_fast(self, generate_test_audio):
         """With the token prefetched, the first stream avoids the HTTPS trip."""
-        server = MockVoxistServer(port=8777, valid_api_key="test")
+        server = MockVoxistServer(valid_api_key="test")
         await server.start()
 
         stt_pooled = VoxistSTT(
             api_key="test",
-            base_url="ws://localhost:8777/ws",
+            base_url=f"ws://{server.host}:{server.port}/ws",
         )
 
         assert await stt_pooled.wait_for_initialization(timeout=5.0)
@@ -532,9 +539,10 @@ class TestStreamLifecycle:
 
         test_audio = generate_test_audio(duration_ms=300)
 
-        # Run 3 streams sequentially
+        # Run 3 streams sequentially. max_retry=0: a silent re-dial would
+        # inflate connections_count and mask a mid-session failure.
         for i in range(3):
-            stream = stt.stream()
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
 
             frame = rtc.AudioFrame(
                 data=test_audio.tobytes(),
@@ -567,8 +575,9 @@ class TestStreamLifecycle:
             base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
         )
 
-        # Create and run stream
-        stream = stt.stream()
+        # Create and run stream; no retries, so a socket-lifecycle failure
+        # surfaces instead of being recovered into a false pass.
+        stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
 
         test_audio = generate_test_audio(duration_ms=300)
         frame = rtc.AudioFrame(
@@ -612,7 +621,6 @@ class TestMultiTurnConversation:
     @pytest.mark.asyncio
     async def test_two_turns_produce_two_finals(self, generate_test_audio):
         server = MockVoxistServer(
-            port=8795,
             valid_api_key="test",
             transcription_text="bonjour le monde",
         )
@@ -621,11 +629,18 @@ class TestMultiTurnConversation:
         try:
             stt = VoxistSTT(
                 api_key="test",
-                base_url="ws://localhost:8795/ws",
+                base_url=f"ws://{server.host}:{server.port}/ws",
                 language="fr",
             )
 
-            stream = stt.stream()
+            # max_retry=0 keeps this test honest: with livekit's default
+            # retry budget, a flush() that regressed to sending "Done" (the
+            # server then closes the socket) would be silently re-dialed and
+            # turn 2 would arrive on a SECOND socket - >=2 finals plus
+            # END_OF_SPEECH would still be observed and the regression would
+            # pass. With no retries, any mid-conversation failure surfaces,
+            # and the socket/Done invariants below pin the architecture.
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
 
             def push(samples):
                 stream.push_frame(
@@ -677,6 +692,22 @@ class TestMultiTurnConversation:
                 e for e in events if e.type == SpeechEventType.END_OF_SPEECH
             ]
             assert end_events, "stream ended without END_OF_SPEECH"
+
+            # The architectural invariants, asserted directly: the whole
+            # conversation rides ONE socket, and "Done" is the end-of-SESSION
+            # signal, written exactly once at end_input(). If flush() ever
+            # ends the session again, these fail even if event counts look
+            # healthy.
+            assert server.connections_count == 1, (
+                f"{server.connections_count} sockets for one conversation: "
+                "the session was ended and re-dialed mid-stream - flush() "
+                "must not end the session"
+            )
+            assert server.done_received_count == 1, (
+                f"Done received {server.done_received_count} times; it is "
+                "the end-of-session signal and must be sent exactly once, "
+                "at end_input() - never at a flush() turn boundary"
+            )
         finally:
             await server.stop()
 
@@ -684,7 +715,6 @@ class TestMultiTurnConversation:
     async def test_session_ends_cleanly_after_done(self, generate_test_audio):
         """After end_input, Done is sent once and the server closes the socket."""
         server = MockVoxistServer(
-            port=8796,
             valid_api_key="test",
             transcription_text="fin de session",
         )
@@ -693,10 +723,12 @@ class TestMultiTurnConversation:
         try:
             stt = VoxistSTT(
                 api_key="test",
-                base_url="ws://localhost:8796/ws",
+                base_url=f"ws://{server.host}:{server.port}/ws",
                 language="fr",
             )
-            stream = stt.stream()
+            # No retries: a re-dial would hide a lifecycle failure behind a
+            # second socket and a second Done.
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
 
             speech = generate_test_audio(duration_ms=500)
             stream.push_frame(
@@ -718,6 +750,10 @@ class TestMultiTurnConversation:
             assert server.done_received_count == 1, (
                 f"Done sent {server.done_received_count} times; it is the "
                 "end-of-session signal and must be sent exactly once"
+            )
+            assert server.connections_count == 1, (
+                f"{server.connections_count} sockets for one session: the "
+                "stream must live and die on a single connection"
             )
         finally:
             await server.stop()

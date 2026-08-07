@@ -78,6 +78,19 @@ class MockVoxistServer:
         self.transcription_text = transcription_text
         self.transcription_confidence = transcription_confidence
         self.send_interim = send_interim
+        # Gateway realism: the engine emits a final per silence-delimited
+        # segment (banafo does its own endpointing; the gateway threads
+        # precedingContext across finals), and the gateway closes the client
+        # socket when the engine closes after "Done"
+        # (simple-websocket-proxy.gateway.ts:899). Tests may flip
+        # finals_without_done to model an engine that only finalizes on Done.
+        self.finals_without_done = True
+        self.silence_ms_to_finalize = 300
+        # Observability for tests: what the server actually saw
+        self.connected_languages: list[str | None] = []
+        self.done_received_count = 0
+        self.finals_sent = 0
+        self.segments_finalized: list[int] = []  # speech bytes per segment
         self.interim_delay_ms = interim_delay_ms
         self.error_mode = error_mode
         self.on_audio_received = on_audio_received
@@ -151,82 +164,89 @@ class MockVoxistServer:
                 await ws.close(code=1008, message=b"Invalid API key")
                 return ws
 
-            # Send connection confirmation (matches your backend)
-            await ws.send_json({"status": "connected"})
+            # The real gateway sends NO confirmation frame on connect: the only
+            # things a client ever receives are transcription results (and a
+            # pub/sub redirect). The {"status": "connected"} this mock used to
+            # send was a fiction that made the mock more talkative than
+            # production and kept an unreachable plugin branch looking alive.
 
-            # SEC-002 moved lang/sample_rate onto the WebSocket URL, so a
-            # stream is configured at handshake time and the plugin sends no
-            # config message. The legacy message is still honoured below.
-            config_received = "lang" in request.query
-            audio_buffer = []
+            self.connected_languages.append(request.query.get("lang"))
 
-            # Process messages
-            async for msg in ws:
-                # JSON messages (config or "Done" signal)
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    try:
-                        data = json.loads(msg.data)
+            # Engine-side segmentation state, mirroring banafo endpointing:
+            # a run of silence after speech finalizes the segment.
+            speech_bytes = 0
+            silence_run_ms = 0
+            sample_rate = int(request.query.get("sample_rate", "16000"))
+            bytes_per_ms = sample_rate * 2 // 1000
+            interim_sent_for_segment = False
 
-                        # Config message
-                        if "config" in data:
-                            config_received = True
-
-                    except json.JSONDecodeError:
-                        # Handle "Done" string
-                        if "Done" in msg.data:
-                            # Client signaling end of audio
-                            break
-
-                # Binary messages (Int16 or Float32 audio)
-                elif msg.type == aiohttp.WSMsgType.BINARY:
-                    self.audio_frames_received += 1
-                    self.total_audio_bytes += len(msg.data)
-
-                    # Parse audio (Int16 = 2 bytes/sample, Float32 = 4 bytes/sample)
-                    # Plugin sends Int16 PCM audio
-                    num_samples = len(msg.data) // 2  # Int16
-                    audio_buffer.append(msg.data)
-
-                    # Call callback if provided
-                    if self.on_audio_received:
-                        self.on_audio_received(msg.data, num_samples)
-
-                    # Simulate processing and send results
-                    # Send interim result after short delay
-                    if self.send_interim and len(audio_buffer) == 1:
-                        await asyncio.sleep(self.interim_delay_ms / 1000.0)
-
-                        await ws.send_json({
-                            "type": "partial",
-                            "text": self.transcription_text.split()[0],  # First word
-                            "confidence": self.transcription_confidence - 0.1,
-                        })
-
-                    # Send final result after accumulating some audio
-                    if len(audio_buffer) >= 3:
-                        await asyncio.sleep(self.processing_delay_ms / 1000.0)
-
-                        await ws.send_json({
-                            "type": "final",
-                            "text": self.transcription_text,
-                            "confidence": self.transcription_confidence,
-                        })
-
-                        # Reset for next utterance
-                        audio_buffer = []
-
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    break
-
-            # If we have remaining audio, send final result
-            if audio_buffer and config_received:
-                await asyncio.sleep(self.processing_delay_ms / 1000.0)
-
+            async def finalize_segment() -> None:
+                nonlocal speech_bytes, silence_run_ms, interim_sent_for_segment
+                if speech_bytes == 0:
+                    return
+                if self.processing_delay_ms:
+                    await asyncio.sleep(self.processing_delay_ms / 1000.0)
+                self.segments_finalized.append(speech_bytes)
+                self.finals_sent += 1
                 await ws.send_json({
                     "type": "final",
                     "text": self.transcription_text,
                     "confidence": self.transcription_confidence,
                 })
+                speech_bytes = 0
+                silence_run_ms = 0
+                interim_sent_for_segment = False
+
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        json.loads(msg.data)
+                        # Config messages are accepted (the gateway supports
+                        # them) but nothing here depends on one: lang and
+                        # sample_rate arrive on the URL.
+                        continue
+                    except json.JSONDecodeError:
+                        pass
+
+                    # Done = end of SESSION, not end of utterance. The gateway
+                    # forwards it to the engine, the engine flushes and closes,
+                    # and the gateway then closes the client socket.
+                    if "Done" in msg.data:
+                        self.done_received_count += 1
+                        await finalize_segment()
+                        break
+
+                elif msg.type == aiohttp.WSMsgType.BINARY:
+                    self.audio_frames_received += 1
+                    self.total_audio_bytes += len(msg.data)
+
+                    if self.on_audio_received:
+                        self.on_audio_received(msg.data, len(msg.data) // 2)
+
+                    is_silence = not any(msg.data)
+                    if is_silence:
+                        if speech_bytes and self.finals_without_done:
+                            silence_run_ms += len(msg.data) // bytes_per_ms
+                            if silence_run_ms >= self.silence_ms_to_finalize:
+                                await finalize_segment()
+                    else:
+                        silence_run_ms = 0
+                        speech_bytes += len(msg.data)
+                        if self.send_interim and not interim_sent_for_segment:
+                            interim_sent_for_segment = True
+                            if self.interim_delay_ms:
+                                await asyncio.sleep(self.interim_delay_ms / 1000.0)
+                            await ws.send_json({
+                                "type": "partial",
+                                "text": self.transcription_text.split()[0],
+                                "confidence": self.transcription_confidence - 0.1,
+                            })
+
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    break
+
+            # Close like the gateway: client.close() once the engine is done.
+            await ws.close()
 
         except Exception as e:
             # Log error but don't crash server

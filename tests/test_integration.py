@@ -715,3 +715,131 @@ class TestStreamLifecycle:
         assert final_health["ready"] + final_health["in_use"] >= 1
 
         await stt.aclose()
+
+
+@pytest.mark.integration
+class TestMultiTurnConversation:
+    """
+    The test that gates the architecture: a VAD-driven multi-turn stream.
+
+    livekit's turn detection calls flush() at each speech end WITHOUT closing
+    the input (only end_input() closes it), and the engine emits a final per
+    silence-delimited segment on ONE socket. The pooled architecture conflated
+    flush() with end-of-session ("Done"), after which the gateway closes the
+    socket - so everything after the first turn was lost, misclassified, or
+    fed through reconnect machinery. This test drives two turns end to end and
+    accepts nothing less than both transcripts and a clean completion.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_turns_produce_two_finals(self, generate_test_audio):
+        server = MockVoxistServer(
+            port=8795,
+            valid_api_key="test",
+            transcription_text="bonjour le monde",
+        )
+        await server.start()
+
+        try:
+            stt = VoxistSTT(
+                api_key="test",
+                base_url="ws://localhost:8795/ws",
+                language="fr",
+            )
+
+            stream = stt.stream()
+
+            def push(samples):
+                stream.push_frame(
+                    rtc.AudioFrame(
+                        data=samples.tobytes(),
+                        sample_rate=16000,
+                        num_channels=1,
+                        samples_per_channel=len(samples),
+                    )
+                )
+
+            speech = generate_test_audio(duration_ms=600)
+            silence = np.zeros(16000 // 2, dtype=np.int16)  # 500ms
+
+            # Turn 1: speech, trailing silence, VAD end-of-turn
+            push(speech)
+            push(silence)
+            stream.flush()
+
+            # Turn 2 on the same stream
+            await asyncio.sleep(0.3)
+            push(speech)
+            push(silence)
+            stream.flush()
+
+            # End of session
+            stream.end_input()
+
+            events = []
+            async def collect():
+                async for event in stream:
+                    events.append(event)
+            await asyncio.wait_for(collect(), timeout=15.0)
+
+            await stt.aclose()
+
+            finals = [
+                e for e in events
+                if e.type == SpeechEventType.FINAL_TRANSCRIPT
+            ]
+            assert len(finals) >= 2, (
+                f"expected a final per turn, got {len(finals)}: the second "
+                "turn was lost - flush() must not end the session"
+            )
+            for f in finals:
+                assert f.alternatives[0].text == "bonjour le monde"
+
+            end_events = [
+                e for e in events if e.type == SpeechEventType.END_OF_SPEECH
+            ]
+            assert end_events, "stream ended without END_OF_SPEECH"
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_session_ends_cleanly_after_done(self, generate_test_audio):
+        """After end_input, Done is sent once and the server closes the socket."""
+        server = MockVoxistServer(
+            port=8796,
+            valid_api_key="test",
+            transcription_text="fin de session",
+        )
+        await server.start()
+
+        try:
+            stt = VoxistSTT(
+                api_key="test",
+                base_url="ws://localhost:8796/ws",
+                language="fr",
+            )
+            stream = stt.stream()
+
+            speech = generate_test_audio(duration_ms=500)
+            stream.push_frame(
+                rtc.AudioFrame(
+                    data=speech.tobytes(),
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=len(speech),
+                )
+            )
+            stream.end_input()
+
+            async def drain():
+                async for _ in stream:
+                    pass
+            await asyncio.wait_for(drain(), timeout=15.0)
+            await stt.aclose()
+
+            assert server.done_received_count == 1, (
+                f"Done sent {server.done_received_count} times; it is the "
+                "end-of-session signal and must be sent exactly once"
+            )
+        finally:
+            await server.stop()

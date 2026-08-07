@@ -82,6 +82,11 @@ class Connection:
         retry_count: Number of reconnection attempts
         last_heartbeat: Timestamp of last successful heartbeat
         buffered_amount: Estimated buffered bytes (for backpressure)
+        applied_language: Language this socket is configured for, server-side.
+            Set from the connect URL, then updated when a stream renegotiates
+            it. Used to avoid renegotiating when it already matches - the
+            backend tears down and re-dials the ASR engine on a language
+            change, dropping audio while it reconnects.
     """
     id: int
     ws: aiohttp.ClientWebSocketResponse | None = None
@@ -89,6 +94,7 @@ class Connection:
     retry_count: int = 0
     last_heartbeat: float = 0.0
     buffered_amount: int = 0
+    applied_language: str | None = None
 
 
 # Supported languages with descriptions

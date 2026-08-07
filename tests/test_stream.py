@@ -1338,3 +1338,148 @@ class TestLanguageCodeHandling:
         ]
         assert languages, "no transcription event emitted"
         assert all(str(lang).lower() == "fr-medical" for lang in languages)
+
+
+class TestPerStreamLanguageOverride:
+    """
+    A per-stream language override must reach Voxist, not just the event label.
+
+    Connections are pooled and pre-warmed with the *pool's* language in the
+    connect URL. Before _apply_config() existed, stt.stream(language="en") on a
+    pool built with "fr" was transcribed by the French engine and labelled "en" -
+    confidently mislabelled output with no error anywhere. _send_config() was the
+    only thing that could have closed the gap and nothing ever called it.
+    """
+
+    @pytest.fixture
+    def mock_stt(self):
+        stt = Mock()
+        stt._config = {
+            "sample_rate": 48000,  # LiveKit input rate, deliberately != 16000
+            "chunk_duration_ms": 100,
+            "stride_overlap_ms": 20,
+            "interim_results": True,
+        }
+        stt._api_key = "test_key"
+        return stt
+
+    async def _stream(self, mock_stt, language, applied_language):
+        from livekit.agents.types import APIConnectOptions
+
+        pool = AsyncMock(spec=ConnectionPool)
+        stream = VoxistSTTStream(
+            stt=mock_stt,
+            pool=pool,
+            config=mock_stt._config,
+            language=language,
+            conn_options=APIConnectOptions(max_retry=3, retry_interval=1.0, timeout=10.0),
+        )
+        stream._task.cancel()
+        try:
+            await stream._task
+        except asyncio.CancelledError:
+            pass
+
+        conn = Connection(id=0, state=ConnectionState.IN_USE)
+        conn.ws = AsyncMock()
+        conn.ws.closed = False
+        conn.ws._response = None
+        del conn.ws.get_transport
+        conn.applied_language = applied_language
+        stream._conn = conn
+        stream._owns_connection = True
+        return stream, conn
+
+    @pytest.mark.asyncio
+    async def test_override_is_negotiated_on_the_socket(self, mock_stt):
+        """An override must be sent to the backend, not just labelled locally."""
+        stream, conn = await self._stream(mock_stt, language="en", applied_language="fr")
+
+        await stream._apply_config()
+
+        conn.ws.send_json.assert_awaited_once_with({"config": {"lang": "en"}})
+        assert conn.applied_language == "en"
+
+    @pytest.mark.asyncio
+    async def test_no_renegotiation_when_already_matching(self, mock_stt):
+        """
+        The common case must send nothing.
+
+        A language change makes the backend tear down and re-dial the ASR engine,
+        dropping audio while it reconnects, so renegotiating a socket that
+        already matches would cost audio for no reason.
+        """
+        stream, conn = await self._stream(mock_stt, language="fr", applied_language="fr")
+
+        await stream._apply_config()
+
+        conn.ws.send_json.assert_not_awaited()
+        assert conn.applied_language == "fr"
+
+    @pytest.mark.asyncio
+    async def test_sample_rate_is_never_sent(self, mock_stt):
+        """
+        The config must not carry sample_rate.
+
+        self._config["sample_rate"] is the LiveKit input rate (48000 here) while
+        the wire carries 16kHz, and the backend derives billed duration from the
+        rate it was last told - so sending it would under-report usage by 3x.
+        """
+        stream, conn = await self._stream(mock_stt, language="en", applied_language="fr")
+
+        await stream._apply_config()
+
+        payload = conn.ws.send_json.await_args.args[0]
+        assert "sample_rate" not in payload["config"]
+        assert payload == {"config": {"lang": "en"}}
+
+    @pytest.mark.asyncio
+    async def test_renegotiation_reapplied_after_reconnect(self, mock_stt):
+        """
+        A fresh socket must be renegotiated again.
+
+        _connect() stamps applied_language from the connect URL, so a reconnected
+        connection reverts to the pool's language; the override would be lost
+        mid-call without re-application.
+        """
+        stream, conn = await self._stream(mock_stt, language="en", applied_language="fr")
+        await stream._apply_config()
+        assert conn.ws.send_json.await_count == 1
+
+        # Reconnect: pool rebuilds the socket with its own language
+        conn.applied_language = "fr"
+        conn.ws = AsyncMock()
+        conn.ws.closed = False
+        conn.ws._response = None
+        del conn.ws.get_transport
+
+        await stream._apply_config()
+
+        conn.ws.send_json.assert_awaited_once_with({"config": {"lang": "en"}})
+
+    @pytest.mark.asyncio
+    async def test_stalled_config_send_abandons_connection(self, mock_stt, monkeypatch):
+        """A config send that stalls must fail like any other send, not hang."""
+        stream, conn = await self._stream(mock_stt, language="en", applied_language="fr")
+        monkeypatch.setattr(VoxistSTTStream, "SEND_TIMEOUT_SECONDS", 0.1)
+
+        async def never_completes(_payload):
+            await asyncio.Event().wait()
+
+        conn.ws.send_json = AsyncMock(side_effect=never_completes)
+
+        with pytest.raises(ConnectionError, match="send timeout"):
+            await asyncio.wait_for(stream._apply_config(), timeout=5.0)
+
+        # Not marked as applied, so the next acquire retries it
+        assert conn.applied_language == "fr"
+
+    @pytest.mark.asyncio
+    async def test_no_send_on_closed_socket(self, mock_stt):
+        """A closed socket is left alone; the pool will retire it."""
+        stream, conn = await self._stream(mock_stt, language="en", applied_language="fr")
+        conn.ws.closed = True
+
+        await stream._apply_config()
+
+        conn.ws.send_json.assert_not_awaited()

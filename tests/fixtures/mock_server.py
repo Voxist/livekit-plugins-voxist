@@ -78,6 +78,11 @@ class MockVoxistServer:
         self.transcription_text = transcription_text
         self.transcription_confidence = transcription_confidence
         self.send_interim = send_interim
+        # Observability for tests: languages seen on connect URLs, every config
+        # payload received, and the resulting engine language after each config.
+        self.connected_languages: list[str | None] = []
+        self.config_messages: list[dict] = []
+        self.engine_languages: list[str | None] = []
         self.interim_delay_ms = interim_delay_ms
         self.error_mode = error_mode
         self.on_audio_received = on_audio_received
@@ -160,6 +165,13 @@ class MockVoxistServer:
             config_received = "lang" in request.query
             audio_buffer = []
 
+            # Mirror the real gateway: the engine language comes from the
+            # connect URL and a {"config": {"lang": ...}} message can change it
+            # mid-session. Recorded so tests can assert what the engine actually
+            # transcribed with, rather than what the client believed.
+            self.connected_languages.append(request.query.get("lang"))
+            engine_language = request.query.get("lang")
+
             # Process messages
             async for msg in ws:
                 # JSON messages (config or "Done" signal)
@@ -170,6 +182,11 @@ class MockVoxistServer:
                         # Config message
                         if "config" in data:
                             config_received = True
+                            self.config_messages.append(data["config"])
+                            new_lang = data["config"].get("lang")
+                            if new_lang:
+                                engine_language = new_lang
+                            self.engine_languages.append(engine_language)
 
                     except json.JSONDecodeError:
                         # Handle "Done" string

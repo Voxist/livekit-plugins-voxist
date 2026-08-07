@@ -144,13 +144,12 @@ class VoxistSTTStream(RecognizeStream):
         # "fr-MEDICAL". Normalizing once here makes that visible instead of
         # leaving it an implicit side effect inside SpeechData.__post_init__.
         #
-        # WARNING: self._language is NOT sent to Voxist. The socket was opened
-        # by the pool with the pool-level language in the URL query, and this
-        # stream reuses a pooled socket without renegotiating. So a per-stream
-        # override - stt.stream(language="en") on a pool built with "fr" - is
-        # transcribed by the pool's engine while being labelled with the
-        # override here. Fixing that needs a config message on acquire; until
-        # then, do not treat this value as the language Voxist actually used.
+        # self._language is the language this stream asked for, and
+        # _apply_config() renegotiates the pooled socket to it on acquire, so
+        # the label here matches the engine that produced the transcript. Before
+        # that existed, a per-stream override never reached Voxist at all: the
+        # socket kept the pool's language and the output was labelled with the
+        # override regardless.
         self._speech_language = LanguageCode(language)
         self._enable_metrics = enable_metrics
 
@@ -325,6 +324,11 @@ class VoxistSTTStream(RecognizeStream):
             try:
                 await self._acquire_connection()
 
+                # Must precede _run_stream_tasks(): the backend drops audio that
+                # arrives before it knows the language, and a pooled socket may
+                # be configured for a different one.
+                await self._apply_config()
+
                 # Reset reconnection counter on successful connection
                 reconnect_attempts = 0
 
@@ -492,6 +496,49 @@ class VoxistSTTStream(RecognizeStream):
             "uplink is not keeping up with real time, so the transcript will "
             "have gaps"
         )
+
+    async def _apply_config(self) -> None:
+        """
+        Configure the acquired socket for this stream's language.
+
+        Connections are pooled and pre-warmed with the *pool's* language in the
+        connect URL, so a stream created with stt.stream(language=...) can be
+        handed a socket configured for something else. Until this existed the
+        override never reached Voxist: the audio was transcribed by whatever
+        engine the socket already had, while the emitted SpeechData carried the
+        requested language - confidently mislabelled output rather than an error.
+
+        Skipped when the socket already matches, because a language change makes
+        the backend tear down and re-dial the ASR engine, dropping audio for up
+        to several seconds. Pool and stream languages agree in the common case,
+        so this normally sends nothing.
+
+        sample_rate is deliberately omitted. The value on self._config is the
+        LiveKit *input* rate (often 48000) while the audio on the wire is
+        resampled to 16kHz, and the backend derives billed duration from the
+        rate it was last told - so sending it would under-report usage. Leaving
+        it out preserves the correct value from the connect URL.
+
+        Raises:
+            ConnectionError: If the config send stalls (via _send_with_timeout).
+        """
+        if not self._conn or not self._conn.ws or self._conn.ws.closed:
+            return
+
+        if self._conn.applied_language == self._language:
+            return
+
+        logger.debug(
+            f"Stream {self._session_id} renegotiating connection "
+            f"{self._conn.id} from language "
+            f"{self._conn.applied_language!r} to {self._language!r}"
+        )
+
+        await self._send_with_timeout(
+            self._conn.ws.send_json({"config": {"lang": self._language}}),
+            "language config",
+        )
+        self._conn.applied_language = self._language
 
     async def _send_with_timeout(self, coro: Awaitable[None], what: str) -> None:
         """

@@ -715,3 +715,121 @@ class TestStreamLifecycle:
         assert final_health["ready"] + final_health["in_use"] >= 1
 
         await stt.aclose()
+
+
+@pytest.mark.integration
+class TestPerStreamLanguageReachesServer:
+    """
+    End-to-end proof that a per-stream language override reaches the server.
+
+    This is the regression guard for a bug where stt.stream(language=...) was
+    only ever used to label emitted events: the pooled socket kept the pool's
+    language, so audio was transcribed by the wrong engine and reported under
+    the requested one, with no error on either side.
+    """
+
+    @pytest.mark.asyncio
+    async def test_override_reaches_the_engine(self, generate_test_audio):
+        """A stream language differing from the pool's must be negotiated."""
+        server = MockVoxistServer(
+            port=8791,
+            valid_api_key="test",
+            transcription_text="hello world",
+        )
+        await server.start()
+
+        try:
+            stt = VoxistSTT(
+                api_key="test",
+                base_url="ws://localhost:8791/ws",
+                language="fr",  # pool language
+            )
+            await stt._pool.initialize()
+
+            # Every pre-warmed socket was opened as French
+            assert server.connected_languages
+            assert all(lang == "fr" for lang in server.connected_languages)
+
+            stream = stt.stream(language="en")  # per-stream override
+
+            test_audio = generate_test_audio(duration_ms=500)
+            stream.push_frame(
+                rtc.AudioFrame(
+                    data=test_audio.tobytes(),
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=len(test_audio),
+                )
+            )
+            stream.end_input()
+
+            async for event in stream:
+                if event.type == SpeechEventType.FINAL_TRANSCRIPT:
+                    # The label the caller sees...
+                    assert event.alternatives[0].language.lower() == "en"
+                    break
+
+            await stt.aclose()
+
+            # ...must match what the engine was actually told to use.
+            assert server.config_messages, (
+                "no config message reached the server: the override was only "
+                "applied to the event label, not to the engine"
+            )
+            assert server.config_messages[-1].get("lang") == "en"
+            assert server.engine_languages[-1] == "en"
+
+            # And billed duration must not be corrupted by a wrong sample rate
+            assert all(
+                "sample_rate" not in cfg for cfg in server.config_messages
+            ), "sample_rate must not be sent; the backend bills on it"
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_matching_language_sends_no_config(self, generate_test_audio):
+        """
+        No renegotiation when the stream matches the pool.
+
+        A language change costs an engine re-dial and dropped audio server-side,
+        so the common case must not pay for it.
+        """
+        server = MockVoxistServer(
+            port=8792,
+            valid_api_key="test",
+            transcription_text="bonjour",
+        )
+        await server.start()
+
+        try:
+            stt = VoxistSTT(
+                api_key="test",
+                base_url="ws://localhost:8792/ws",
+                language="fr",
+            )
+            await stt._pool.initialize()
+
+            stream = stt.stream()  # no override
+
+            test_audio = generate_test_audio(duration_ms=500)
+            stream.push_frame(
+                rtc.AudioFrame(
+                    data=test_audio.tobytes(),
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=len(test_audio),
+                )
+            )
+            stream.end_input()
+
+            async for event in stream:
+                if event.type == SpeechEventType.FINAL_TRANSCRIPT:
+                    break
+
+            await stt.aclose()
+
+            assert server.config_messages == [], (
+                "renegotiated a socket that already had the right language"
+            )
+        finally:
+            await server.stop()

@@ -590,6 +590,9 @@ class ConnectionPool:
             conn.state = ConnectionState.READY
             conn.last_heartbeat = time.time()
             conn.retry_count = 0
+            # The URL carried this language, so that is what the socket is
+            # configured for until a stream renegotiates it.
+            conn.applied_language = language
             # Fresh WebSocket means a fresh transport, so any buffer reading
             # carried over from the previous socket is meaningless.
             conn.buffered_amount = 0

@@ -32,7 +32,9 @@ from .models import sanitize_url_param
 # Refresh the token this long before its expiry
 TOKEN_REFRESH_BUFFER_SECONDS = 300.0
 
-# A dial that cannot complete in this long means the endpoint is unreachable
+# Default bound for the token exchange and the WebSocket dial. Overridable
+# per plugin instance via VoxistSTT(connection_timeout=...), which threads
+# through to VoxistDialer(connection_timeout=...).
 DIAL_TIMEOUT_SECONDS = 10.0
 
 
@@ -55,12 +57,14 @@ class VoxistDialer:
         api_key_header: str = "X-LVL-KEY",
         ssl_context: ssl.SSLContext | None = None,
         heartbeat_interval: float = 30.0,
+        connection_timeout: float = DIAL_TIMEOUT_SECONDS,
     ) -> None:
         self._session = session
         self._base_url = base_url
         self._api_key = api_key
         self._api_key_header = api_key_header
         self._heartbeat_interval = heartbeat_interval
+        self._connection_timeout = connection_timeout
 
         # Certificate verification is never disabled. An explicit context is
         # the only way to trust a private CA; without one, aiohttp's default
@@ -148,16 +152,35 @@ class VoxistDialer:
             ):
                 return self._token_url
 
+            if self._session.closed:
+                # A retry racing shutdown must die as a mapped, retryable
+                # error, not as aiohttp's raw RuntimeError('Session is
+                # closed') - livekit only retries APIError subclasses, and
+                # the stream maps ConnectionError into one.
+                raise ConnectionError(
+                    "Token exchange impossible: the HTTP session is closed"
+                )
+
             http_url = f"{self._http_base_url()}/websocket"
             logger.debug(f"Exchanging API key for WebSocket token at {http_url}")
 
+            # Every transport-shaped failure must map to our ConnectionError:
+            # - aiohttp.ClientError: connection refused/reset, bad status
+            #   handling, ContentTypeError from resp.json() on a non-JSON body
+            # - asyncio.TimeoutError / TimeoutError: the ClientTimeout firing
+            #   (distinct classes on 3.10, unified on 3.11+)
+            # - json.JSONDecodeError: a 200 with a JSON content type but an
+            #   unparseable body
+            # - RuntimeError: the session closing between the check above and
+            #   the request (shutdown race)
+            # Anything escaping unmapped kills the stream with zero retries.
             try:
                 async with self._session.get(
                     http_url,
                     headers={self._api_key_header: self._api_key},
                     params={"engine": "voxist-rt"},
                     ssl=self._ssl_param(),
-                    timeout=aiohttp.ClientTimeout(total=10),
+                    timeout=aiohttp.ClientTimeout(total=self._connection_timeout),
                 ) as resp:
                     if resp.status in (401, 403):
                         raise AuthenticationError(
@@ -173,9 +196,19 @@ class VoxistDialer:
                             f"Token exchange failed with status {resp.status}"
                         )
                     data = await resp.json()
-            except aiohttp.ClientError as e:
-                raise ConnectionError(f"Token exchange failed: {e}") from e
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                TimeoutError,
+                json.JSONDecodeError,
+                RuntimeError,
+            ) as e:
+                raise ConnectionError(f"Token exchange failed: {e!r}") from e
 
+            if not isinstance(data, dict):
+                raise ConnectionError(
+                    "Token exchange returned a non-object JSON response"
+                )
             token_url = data.get("url")
             if not token_url:
                 raise ConnectionError("Token exchange response missing 'url' field")
@@ -183,6 +216,20 @@ class VoxistDialer:
             self._token_url = token_url
             self._token_expires_at = self._token_expiry_from_url(token_url, now)
             return token_url
+
+    async def _invalidate_token(self, rejected_url: str) -> None:
+        """
+        Drop the cached token, but only if it is still the rejected one.
+
+        Taken under _token_lock so a concurrent dial that already refetched a
+        fresh token is not clobbered: if the cache no longer holds the URL we
+        were rejected with, another stream beat us to the refetch and its
+        token must be preserved.
+        """
+        async with self._token_lock:
+            if self._token_url == rejected_url:
+                self._token_url = None
+                self._token_expires_at = 0.0
 
     async def dial(
         self, language: str, sample_rate: int
@@ -195,41 +242,80 @@ class VoxistDialer:
         where audio meets the wrong engine.
 
         Raises:
-            AuthenticationError: The key (or token) was rejected.
+            AuthenticationError: The key (or token) was rejected even with a
+                freshly exchanged token.
             ConnectionError: The dial failed for transport reasons.
         """
         token_url = await self._get_token_url()
+        refetched_token = False
 
-        safe_language = sanitize_url_param(language)
-        safe_rate = sanitize_url_param(str(sample_rate))
-        separator = "&" if "?" in token_url else "?"
-        ws_url = f"{token_url}{separator}lang={safe_language}&sample_rate={safe_rate}"
-
-        try:
-            ws = await asyncio.wait_for(
-                self._session.ws_connect(
-                    ws_url,
-                    heartbeat=self._heartbeat_interval,
-                    autoping=True,
-                    ssl=self._ssl_param(),
-                ),
-                timeout=DIAL_TIMEOUT_SECONDS,
+        while True:
+            safe_language = sanitize_url_param(language)
+            safe_rate = sanitize_url_param(str(sample_rate))
+            separator = "&" if "?" in token_url else "?"
+            ws_url = (
+                f"{token_url}{separator}lang={safe_language}"
+                f"&sample_rate={safe_rate}"
             )
-        except aiohttp.WSServerHandshakeError as e:
-            if e.status in (401, 403):
-                # An invalid token with a valid key means our cache went
-                # stale server-side; drop it so the next attempt refetches.
-                self._token_url = None
-                raise AuthenticationError(
-                    "WebSocket authentication failed"
-                ) from e
-            raise ConnectionError(f"WebSocket handshake failed: {e}") from e
-        except asyncio.TimeoutError as e:
-            raise ConnectionError(
-                f"WebSocket dial timed out after {DIAL_TIMEOUT_SECONDS}s"
-            ) from e
-        except aiohttp.ClientError as e:
-            raise ConnectionError(f"WebSocket dial failed: {e}") from e
 
-        logger.debug(f"Dialed Voxist WebSocket (lang={language})")
-        return ws
+            if self._session.closed:
+                # Same shutdown race as in the token exchange: surface a
+                # mapped, retryable error instead of a raw RuntimeError.
+                raise ConnectionError(
+                    "WebSocket dial impossible: the HTTP session is closed"
+                )
+
+            try:
+                ws = await asyncio.wait_for(
+                    self._session.ws_connect(
+                        ws_url,
+                        heartbeat=self._heartbeat_interval,
+                        autoping=True,
+                        ssl=self._ssl_param(),
+                    ),
+                    timeout=self._connection_timeout,
+                )
+            except aiohttp.WSServerHandshakeError as e:
+                if e.status not in (401, 403):
+                    raise ConnectionError(
+                        f"WebSocket handshake failed: {e}"
+                    ) from e
+
+                # A 401/403 here does NOT prove the API key is bad: this
+                # token may have been cached and invalidated server-side
+                # (expiry edge, gateway restart). Killing the stream with a
+                # fatal AuthenticationError on a stale CACHED token would
+                # punish a perfectly valid key. So: invalidate the cache
+                # (race-safely - see _invalidate_token), exchange the key for
+                # a fresh token ONCE, and redial. Only when the fresh token
+                # is also rejected is the credential itself the problem.
+                if not refetched_token:
+                    refetched_token = True
+                    await self._invalidate_token(token_url)
+                    fresh_url = await self._get_token_url()
+                    if fresh_url != token_url:
+                        logger.info(
+                            "WebSocket handshake rejected the cached token; "
+                            "redialing once with a freshly exchanged token"
+                        )
+                        token_url = fresh_url
+                        continue
+                    # The exchange handed back the identical token; redialing
+                    # with the same credential cannot end differently.
+                raise AuthenticationError(
+                    "WebSocket authentication failed with a freshly "
+                    "exchanged token"
+                ) from e
+            except asyncio.TimeoutError as e:
+                raise ConnectionError(
+                    f"WebSocket dial timed out after {self._connection_timeout}s"
+                ) from e
+            except aiohttp.ClientError as e:
+                raise ConnectionError(f"WebSocket dial failed: {e}") from e
+            except RuntimeError as e:
+                # aiohttp raises RuntimeError('Session is closed') when a
+                # dial races aclose(); map it so livekit can retry cleanly.
+                raise ConnectionError(f"WebSocket dial failed: {e}") from e
+
+            logger.debug(f"Dialed Voxist WebSocket (lang={language})")
+            return ws

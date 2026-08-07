@@ -1,14 +1,274 @@
 """Unit tests for VoxistDialer: token exchange, expiry, and dialing."""
 
+import asyncio
 import base64
 import json
 import ssl as ssl_module
+import time
+from unittest.mock import Mock
 
 import aiohttp
 import pytest
 
 from livekit.plugins.voxist.connection import VoxistDialer
 from livekit.plugins.voxist.exceptions import AuthenticationError, ConnectionError
+
+
+def handshake_error(status: int) -> aiohttp.WSServerHandshakeError:
+    return aiohttp.WSServerHandshakeError(
+        Mock(), (), status=status, message="handshake rejected"
+    )
+
+
+class FakeResponse:
+    """Async-context-manager response for FakeSession.get."""
+
+    def __init__(self, *, status=200, payload=None, json_exc=None, enter_exc=None):
+        self.status = status
+        self._payload = payload
+        self._json_exc = json_exc
+        self._enter_exc = enter_exc
+
+    async def __aenter__(self):
+        if self._enter_exc is not None:
+            raise self._enter_exc
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def json(self):
+        if self._json_exc is not None:
+            raise self._json_exc
+        return self._payload
+
+    async def text(self):
+        return "error body"
+
+
+class FakeSession:
+    """
+    Just enough of aiohttp.ClientSession for the dialer: get() hands back a
+    scripted response per call, ws_connect() a scripted result per call.
+    """
+
+    def __init__(self, responses=(), ws_results=()):
+        self.closed = False
+        self._responses = list(responses)
+        self._ws_results = list(ws_results)
+        self.get_calls: list = []
+        self.ws_calls: list = []
+
+    def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        return self._responses.pop(0)
+
+    async def ws_connect(self, url, **kwargs):
+        self.ws_calls.append((url, kwargs))
+        result = self._ws_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        if result == "hang":
+            await asyncio.Event().wait()
+        return result
+
+
+def token_response(token: str) -> FakeResponse:
+    return FakeResponse(payload={"url": f"wss://host/ws?token={token}"})
+
+
+def make_dialer(session, **kw) -> VoxistDialer:
+    return VoxistDialer(session=session, base_url="wss://host/ws", api_key="k", **kw)
+
+
+def prime_cache(dialer: VoxistDialer, token: str) -> str:
+    """Install a cached token that reads as valid for hours."""
+    url = f"wss://host/ws?token={token}"
+    dialer._token_url = url
+    dialer._token_expires_at = time.time() + 7200.0
+    return url
+
+
+@pytest.mark.no_auto_mock_token
+class TestStaleCachedTokenRedial:
+    """
+    A 401 handshake on a CACHED token must not be treated as a revoked API
+    key: the cache is invalidated, the key is exchanged for a fresh token
+    once, and the dial is retried. Only a fresh token's rejection is fatal.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stale_cached_token_is_refetched_and_redialed(self):
+        ws = object()
+        session = FakeSession(
+            responses=[token_response("fresh")],
+            ws_results=[handshake_error(401), ws],
+        )
+        dialer = make_dialer(session)
+        prime_cache(dialer, "stale")
+
+        result = await dialer.dial("fr", 16000)
+
+        assert result is ws
+        assert len(session.ws_calls) == 2
+        assert "token=stale" in session.ws_calls[0][0]
+        assert "token=fresh" in session.ws_calls[1][0]
+        assert len(session.get_calls) == 1, "exactly one refetch"
+        assert dialer._token_url is not None and "fresh" in dialer._token_url
+
+    @pytest.mark.asyncio
+    async def test_fresh_token_rejection_is_fatal(self):
+        """When even the freshly exchanged token 401s, the key is the
+        problem - AuthenticationError, and no endless redial loop."""
+        session = FakeSession(
+            responses=[token_response("fresh")],
+            ws_results=[handshake_error(401), handshake_error(401)],
+        )
+        dialer = make_dialer(session)
+        prime_cache(dialer, "stale")
+
+        with pytest.raises(AuthenticationError):
+            await dialer.dial("fr", 16000)
+
+        assert len(session.ws_calls) == 2, "exactly one redial, never a loop"
+        assert len(session.get_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_auth_handshake_failure_does_not_refetch(self):
+        session = FakeSession(ws_results=[handshake_error(500)])
+        dialer = make_dialer(session)
+        prime_cache(dialer, "any")
+
+        with pytest.raises(ConnectionError):
+            await dialer.dial("fr", 16000)
+        assert session.get_calls == []
+
+    @pytest.mark.asyncio
+    async def test_invalidate_preserves_a_concurrent_refetch(self):
+        """
+        Race safety: if another stream already replaced the cached token by
+        the time our 401 comes back, invalidating with OUR stale URL must
+        not clobber the newer token.
+        """
+        dialer = make_dialer(FakeSession())
+        newer = prime_cache(dialer, "newer")
+
+        await dialer._invalidate_token("wss://host/ws?token=stale")
+        assert dialer._token_url == newer, "the concurrent refetch survives"
+
+        await dialer._invalidate_token(newer)
+        assert dialer._token_url is None, "our own stale token is dropped"
+
+
+@pytest.mark.no_auto_mock_token
+class TestTokenExchangeErrorMapping:
+    """
+    Every transport-shaped failure of the exchange must surface as our
+    ConnectionError (which the stream maps to a retryable APIError) - never
+    as a raw TimeoutError/JSONDecodeError/RuntimeError that kills the
+    stream with zero retries.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "enter_exc",
+        [
+            asyncio.TimeoutError(),  # the 10s ClientTimeout firing
+            RuntimeError("Session is closed"),  # shutdown race
+        ],
+        ids=["timeout", "closed-session-race"],
+    )
+    async def test_request_failures_map_to_connection_error(self, enter_exc):
+        session = FakeSession(responses=[FakeResponse(enter_exc=enter_exc)])
+        dialer = make_dialer(session)
+
+        with pytest.raises(ConnectionError):
+            await dialer._get_token_url()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "json_exc",
+        [
+            json.JSONDecodeError("bad", "doc", 0),
+            aiohttp.ContentTypeError(Mock(), ()),
+        ],
+        ids=["invalid-json-body", "non-json-content-type"],
+    )
+    async def test_body_decode_failures_map_to_connection_error(self, json_exc):
+        session = FakeSession(responses=[FakeResponse(json_exc=json_exc)])
+        dialer = make_dialer(session)
+
+        with pytest.raises(ConnectionError):
+            await dialer._get_token_url()
+
+    @pytest.mark.asyncio
+    async def test_non_object_json_maps_to_connection_error(self):
+        session = FakeSession(responses=[FakeResponse(payload=["not", "a", "dict"])])
+        dialer = make_dialer(session)
+
+        with pytest.raises(ConnectionError):
+            await dialer._get_token_url()
+
+    @pytest.mark.asyncio
+    async def test_closed_session_raises_before_the_request(self):
+        session = FakeSession()
+        session.closed = True
+        dialer = make_dialer(session)
+
+        with pytest.raises(ConnectionError, match="session is closed"):
+            await dialer._get_token_url()
+
+    @pytest.mark.asyncio
+    async def test_dial_on_closed_session_maps_to_connection_error(self):
+        session = FakeSession()
+        session.closed = True
+        dialer = make_dialer(session)
+        prime_cache(dialer, "cached")  # skip the exchange, reach the dial
+
+        with pytest.raises(ConnectionError, match="session is closed"):
+            await dialer.dial("fr", 16000)
+
+    @pytest.mark.asyncio
+    async def test_dial_runtime_error_maps_to_connection_error(self):
+        """aiohttp raises RuntimeError('Session is closed') when the session
+        closes between our check and the connect."""
+        session = FakeSession(ws_results=[RuntimeError("Session is closed")])
+        dialer = make_dialer(session)
+        prime_cache(dialer, "cached")
+
+        with pytest.raises(ConnectionError):
+            await dialer.dial("fr", 16000)
+
+
+class TestConnectionTimeoutIsHonoured:
+    """connection_timeout was documented but silently ignored (dial and
+    token exchange both hardcoded 10s)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_auto_mock_token
+    async def test_token_exchange_uses_the_configured_timeout(self):
+        session = FakeSession(responses=[token_response("t")])
+        dialer = make_dialer(session, connection_timeout=3.5)
+
+        await dialer._get_token_url()
+
+        (_, kwargs) = session.get_calls[0]
+        assert kwargs["timeout"].total == 3.5
+
+    @pytest.mark.asyncio
+    @pytest.mark.no_auto_mock_token
+    async def test_dial_uses_the_configured_timeout(self):
+        session = FakeSession(ws_results=["hang"])
+        dialer = make_dialer(session, connection_timeout=0.1)
+        prime_cache(dialer, "cached")
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        with pytest.raises(ConnectionError, match="timed out after 0.1s"):
+            # bounded well below the old hardcoded 10s: if the parameter
+            # were still ignored, this would time out the test instead
+            await asyncio.wait_for(dialer.dial("fr", 16000), timeout=2.0)
+        assert loop.time() - start < 2.0
 
 
 def _url_with_exp(exp):

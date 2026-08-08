@@ -25,6 +25,7 @@ from .exceptions import (
     InitializationError,
     InsufficientBalanceError,
     LanguageNotSupportedError,
+    TranscriptLostError,
     VoxistError,
 )
 from .stt import InitializationState, VoxistSTT
@@ -38,6 +39,7 @@ __all__ = [
     "AuthenticationError",
     "InsufficientBalanceError",
     "ConnectionError",
+    "TranscriptLostError",
     "ConnectionPoolExhaustedError",
     "LanguageNotSupportedError",
     "ConfigurationError",

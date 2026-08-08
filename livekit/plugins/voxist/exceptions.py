@@ -150,6 +150,33 @@ class OwnershipViolationError(VoxistError):
     pass
 
 
+class TranscriptLostError(VoxistError):
+    """
+    Raised when streamed audio was consumed but produced no transcript, and
+    no retry can recover it.
+
+    Streamed audio cannot be replayed: once frames have left the input
+    channel, a fresh connection would receive nothing but a bare "Done" and
+    fabricate an empty success. When that state is reached with zero
+    FINAL_TRANSCRIPT events delivered, the session's content is gone.
+
+    Deliberately NOT an APIError (same design as AuthenticationError):
+    livekit's RecognizeStream._main_task retries every APIError - the
+    installed version does not consult `retryable` - so raising
+    APIError(retryable=False) here produced max_retry misleading
+    "recoverable" error events and ~4s of retry sleeps before the stream
+    finally died anyway. A non-APIError takes _main_task's terminal branch:
+    it emits exactly ONE error event (recoverable=False, verified in the
+    installed source) and kills the stream immediately with the true cause.
+
+    Resolution:
+    - Treat the session as lost; the audio must be re-captured, not retried
+    - Investigate the connection failure that consumed the audio (see the
+      preceding APIConnectionError in the logs)
+    """
+    pass
+
+
 class InitializationError(VoxistError):
     """
     Raised when plugin initialization fails and cannot recover.

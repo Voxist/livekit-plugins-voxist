@@ -14,6 +14,7 @@ from livekit.agents.types import APIConnectOptions
 
 from livekit import rtc
 from livekit.plugins.voxist.exceptions import ConnectionError as VoxistConnectionError
+from livekit.plugins.voxist.exceptions import TranscriptLostError
 from livekit.plugins.voxist.stream import VoxistSTTStream
 
 DEFAULT_CONFIG = {
@@ -42,6 +43,18 @@ async def make_stream(language="fr", dial=None, config=None):
     except asyncio.CancelledError:
         pass
     return stream
+
+
+def mock_event_ch(stream):
+    """
+    Replace the event channel with a Mock that still admits the REAL
+    flush()/end_input() paths: those call _check_not_closed(), and a bare
+    Mock's .closed attribute is truthy, which would make end_input() raise
+    and silently push tests back to hand-building channel state.
+    """
+    stream._event_ch = Mock()
+    stream._event_ch.closed = False
+    return stream._event_ch
 
 
 def attach_mock_ws(stream):
@@ -91,6 +104,8 @@ class FakeWS:
         self.sent_text: list[str] = []
         self.closed = False
         self.fail_on_text = False  # scripted failure: text sends reset
+        self.fail_on_bytes = False  # scripted failure: audio sends reset
+        self.hang_on_close = False  # scripted wedge: close() never returns
         self._response = None
 
     def feed_json(self, obj):
@@ -113,7 +128,7 @@ class FakeWS:
         return item
 
     async def send_bytes(self, data):
-        if self.closed:
+        if self.closed or self.fail_on_bytes:
             raise ConnectionResetError("closed")
         self.sent_bytes.append(data)
 
@@ -123,6 +138,10 @@ class FakeWS:
         self.sent_text.append(data)
 
     async def close(self):
+        if self.hang_on_close:
+            # A wedged peer never ACKs the close handshake; aiohttp would
+            # sit in ws.close() for its 10s default.
+            await asyncio.Event().wait()
         self.closed = True
         self.end()
 
@@ -130,6 +149,18 @@ class FakeWS:
 def frame(samples=160):
     return rtc.AudioFrame(
         data=np.zeros(samples, dtype=np.int16).tobytes(),
+        sample_rate=16000,
+        num_channels=1,
+        samples_per_channel=samples,
+    )
+
+
+def speech_frame(samples=1600):
+    """A frame that counts as real audio for stall detection (sine, loud)."""
+    t = np.arange(samples, dtype=np.float64)
+    data = (np.sin(2 * np.pi * 440 * t / 16000.0) * 20000).astype(np.int16)
+    return rtc.AudioFrame(
+        data=data.tobytes(),
         sample_rate=16000,
         num_channels=1,
         samples_per_channel=samples,
@@ -549,50 +580,60 @@ class TestRunOutcome:
         dial.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_drain_timeout_without_any_final_is_a_failure(self, monkeypatch):
+    async def test_drain_timeout_without_any_audio_stays_retryable(self, monkeypatch):
         """
-        A server that ignores Done and never produced a single final is a
-        FAILED session, not a silent success. Nothing was consumed here, so
-        the failure stays retryable (a fresh dial could legitimately work).
+        A server that ignores Done on a session that never carried audio is
+        a FAILED attempt, not a silent success - and since nothing was
+        consumed, the failure stays retryable (the retry completes empty via
+        the zero-audio short-circuit). end_input() lands AFTER the dial here:
+        landing before it would legitimately skip the dial entirely.
         """
         monkeypatch.setattr(VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.2)
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
-        stream._event_ch = Mock()
-
-        stream._input_ch.close()  # empty session, immediate Done
+        mock_event_ch(stream)
 
         loop = asyncio.get_running_loop()
         start = loop.time()
+        run_task = asyncio.create_task(stream._run())
+        await asyncio.sleep(0.05)  # dialed; the send loop is waiting on input
+        stream.end_input()
+
         with pytest.raises(APIConnectionError, match="no transcript"):
-            await asyncio.wait_for(stream._run(), timeout=5.0)
+            await asyncio.wait_for(run_task, timeout=5.0)
         elapsed = loop.time() - start
 
-        assert 0.2 <= elapsed < 3.0, "the drain must still be bounded"
+        assert elapsed < 3.0, "the drain must still be bounded"
         assert not stream._session_complete
         assert ws.sent_text == ["Done"]
 
     @pytest.mark.asyncio
-    async def test_drain_timeout_after_consumed_audio_is_not_retryable(
+    async def test_drain_timeout_after_consumed_audio_raises_transcript_lost(
         self, monkeypatch
     ):
         """
-        Same wedged server, but audio was consumed: a retry cannot replay
-        it, so the failure must carry retryable=False.
+        Wedged server after Done, audio consumed, nothing delivered: a retry
+        cannot replay the audio, and the installed _main_task retries EVERY
+        APIError regardless of retryable - so the honest failure must be a
+        non-APIError (TranscriptLostError): one terminal error event,
+        immediate death, no misleading "recoverable" events.
         """
         from livekit.agents import APIError
 
         monkeypatch.setattr(VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.2)
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
-        stream._event_ch = Mock()
+        mock_event_ch(stream)
 
-        stream._input_ch.send_nowait(frame(1600))
-        stream._input_ch.close()
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()
 
-        with pytest.raises(APIError) as excinfo:
+        with pytest.raises(TranscriptLostError) as excinfo:
             await asyncio.wait_for(stream._run(), timeout=5.0)
-        assert excinfo.value.retryable is False
+        assert not isinstance(excinfo.value, APIError), (
+            "TranscriptLostError must not be an APIError: the framework "
+            "would burn max_retry no-op attempts on it"
+        )
         assert not stream._session_complete
 
     @pytest.mark.asyncio
@@ -600,21 +641,21 @@ class TestRunOutcome:
         self, monkeypatch, caplog
     ):
         """
-        If finals already made it out, a wedged post-Done server costs at
-        most a trailing transcript: complete (with a warning), do not fail a
-        session whose data was delivered.
+        If finals already made it out for THIS attempt's audio, a wedged
+        post-Done server costs at most a trailing transcript: complete (with
+        a warning), do not fail a session whose data was delivered.
         """
         monkeypatch.setattr(VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.2)
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
-        stream._event_ch = Mock()
+        mock_event_ch(stream)
 
         async def scenario():
-            stream._input_ch.send_nowait(frame(1600))
+            stream._input_ch.send_nowait(speech_frame())
             await asyncio.sleep(0.05)
             ws.feed_json({"type": "final", "text": "bonjour", "confidence": 0.9})
             await asyncio.sleep(0.05)
-            stream._input_ch.close()
+            stream.end_input()
             # the server never closes: drain must time out
 
         task = asyncio.create_task(scenario())
@@ -624,6 +665,93 @@ class TestRunOutcome:
 
         assert stream._session_complete
         assert any("trailing transcript" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_interim_only_drain_timeout_completes_with_loud_warning(
+        self, monkeypatch, caplog
+    ):
+        """
+        Interims were delivered (the user saw text) but the server wedged
+        before the final: complete rather than error - the audio cannot be
+        replayed, so no retry improves the outcome and erroring vaporizes a
+        session whose content was substantially delivered. The warning must
+        say that finals-only consumers still experience loss.
+        """
+        monkeypatch.setattr(VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.2)
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "partial", "text": "bonj", "confidence": 0.5})
+            await asyncio.sleep(0.05)
+            stream.end_input()
+            # server wedges: no final, no close
+
+        task = asyncio.create_task(scenario())
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+
+        assert stream._session_complete
+        wedge_warnings = [
+            r.message for r in caplog.records if "interim" in r.message
+        ]
+        assert wedge_warnings, "the interim-only completion must be loud"
+        assert any("FINAL_TRANSCRIPT" in m for m in wedge_warnings), (
+            "the warning must state that finals-only consumers see loss"
+        )
+
+    @pytest.mark.asyncio
+    async def test_earlier_attempts_final_does_not_mask_later_turn_loss(
+        self, monkeypatch
+    ):
+        """
+        Attempt 1 delivered a final for turn 1, then died mid-input. Attempt
+        2 carried turn 2's audio into a wedged server and delivered NOTHING
+        for it. Keying the drain taxonomy on the session-scoped final flag
+        let attempt 2 complete as success - turn 2 silently vanished. It
+        must fail honestly instead.
+        """
+        monkeypatch.setattr(VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.2)
+        ws1, ws2 = FakeWS(), FakeWS()
+        dial = AsyncMock(side_effect=[ws1, ws2])
+        stream = await make_stream(dial=dial)
+        mock_event_ch(stream)
+
+        # Attempt 1: turn 1 flows, a final arrives, then the server drops
+        # the socket while input is still open - an interruption.
+        async def attempt1():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws1.feed_json({"type": "final", "text": "tour un", "confidence": 0.9})
+            await asyncio.sleep(0.05)
+            ws1.end()
+
+        task = asyncio.create_task(attempt1())
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+        assert stream._final_received, "attempt 1's final was delivered"
+
+        # Attempt 2 (the framework's retry): turn 2 flows into a wedged
+        # server that never answers and never closes.
+        async def attempt2():
+            await asyncio.sleep(0.02)
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream.end_input()
+
+        task = asyncio.create_task(attempt2())
+        with pytest.raises(TranscriptLostError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+        assert not stream._session_complete, (
+            "turn 2 was wholly lost; completing would mask it behind "
+            "attempt 1's final"
+        )
 
 
 class TestPerAttemptStateReset:
@@ -677,18 +805,17 @@ class TestExhaustedInputRetry:
 
     @pytest.mark.asyncio
     async def test_retry_with_consumed_input_and_no_finals_raises(self):
-        from livekit.agents import APIError
-
+        """The end_input() shape: attempt 1 dies writing Done, sentinel gone."""
         ws = FakeWS()
         ws.fail_on_text = True  # the attempt dies when it writes "Done"
         dial = AsyncMock(return_value=ws)
         stream = await make_stream(dial=dial)
-        stream._event_ch = Mock()
+        mock_event_ch(stream)
 
-        stream._input_ch.send_nowait(frame(1600))
-        stream._input_ch.close()
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()
 
-        # Attempt 1: consumes the frame, fails on the Done write.
+        # Attempt 1: consumes the frame and the sentinel, fails on Done.
         with pytest.raises(APIConnectionError):
             await asyncio.wait_for(stream._run(), timeout=5.0)
 
@@ -697,11 +824,58 @@ class TestExhaustedInputRetry:
         assert dial.await_count == 1
 
         # Attempt 2 (the framework's retry): must fail honestly, and must
-        # not dial - there is nothing left to send.
-        with pytest.raises(APIError, match="cannot be replayed") as excinfo:
+        # not dial - there is nothing left to send. TranscriptLostError, not
+        # APIError: the installed _main_task retries every APIError, so an
+        # APIError here meant max_retry misleading "recoverable" events and
+        # ~4s of dead air before the same death.
+        with pytest.raises(TranscriptLostError, match="cannot be replayed"):
             await asyncio.wait_for(stream._run(), timeout=5.0)
-        assert excinfo.value.retryable is False
         assert dial.await_count == 1, "a bare-Done redial fabricates success"
+        assert not stream._session_complete
+
+    @pytest.mark.asyncio
+    async def test_trailing_sentinel_does_not_bypass_exhausted_guard(self):
+        """
+        THE root-fact test: end_input() is flush() + close(), so after an
+        attempt dies on the LAST audio frame the channel still holds one
+        trailing sentinel. The old guard required qsize()==0, so the retry
+        dialed, consumed only the sentinel, sent a bare Done and completed
+        as SUCCESS with zero finals - total transcript loss presented as a
+        clean session. The retry must fail honestly without dialing.
+        """
+        ws = FakeWS()
+        ws.fail_on_bytes = True  # the attempt dies sending the LAST frame
+        dial = AsyncMock(return_value=ws)
+        stream = await make_stream(dial=dial)
+        mock_event_ch(stream)
+
+        # Deterministic chunking: every frame yields exactly one chunk, so
+        # the failure lands on the audio send, before the sentinel is pulled.
+        stream._audio_processor = Mock()
+        stream._audio_processor.process_audio_frame = Mock(
+            return_value=[np.ones(1600, dtype=np.int16)]
+        )
+        stream._audio_processor.flush = Mock(return_value=[])
+
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()  # REAL path: trailing sentinel + close
+
+        # Attempt 1 dies on the frame; the sentinel is still queued.
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        assert stream._audio_consumed
+        assert stream._input_ch.qsize() == 1, (
+            "precondition: the trailing sentinel must still be queued - "
+            "this is the exact state the old guard let through"
+        )
+
+        # Attempt 2: the sentinel must count as consumed input.
+        with pytest.raises(TranscriptLostError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        assert dial.await_count == 1, (
+            "the retry dialed for a sentinel-only channel: bare Done, "
+            "empty success, transcript lost"
+        )
         assert not stream._session_complete
 
     @pytest.mark.asyncio
@@ -709,19 +883,21 @@ class TestExhaustedInputRetry:
         """
         Finals already emitted: the deliverable data made it out. The retry
         completes without a pointless redial instead of erroring a session
-        whose transcript was delivered. State is set directly to the exact
-        post-failure picture (the flag-setting paths are covered by the
+        whose transcript was delivered. The channel state is built by the
+        REAL end_input() (trailing sentinel included - the state the guard
+        must classify as consumed); the delivery flags are set to the exact
+        post-failure picture (their setting paths are covered by the
         no-finals test above and the normal-session test).
         """
         from livekit.agents.stt import SpeechEventType
 
         dial = AsyncMock(side_effect=AssertionError("must not dial again"))
         stream = await make_stream(dial=dial)
-        stream._event_ch = Mock()
+        events = mock_event_ch(stream)
 
-        # As left by a failed attempt that had consumed everything and
-        # already emitted finals (START_OF_SPEECH included):
-        stream._input_ch.close()
+        # As left by a failed attempt that had consumed every frame after
+        # the caller ended input normally:
+        stream.end_input()
         stream._audio_consumed = True
         stream._final_received = True
         stream._speaking = True
@@ -730,36 +906,29 @@ class TestExhaustedInputRetry:
 
         assert stream._session_complete
         dial.assert_not_awaited()
-        emitted = [
-            c.args[0].type for c in stream._event_ch.send_nowait.call_args_list
-        ]
+        emitted = [c.args[0].type for c in events.send_nowait.call_args_list]
         assert emitted == [SpeechEventType.END_OF_SPEECH]
 
     @pytest.mark.asyncio
-    async def test_first_attempt_empty_session_still_allowed(self):
+    async def test_zero_audio_session_completes_without_dialing(self):
         """
-        A genuinely empty session (no audio ever pushed) is not the same as
-        a consumed one: the bare-Done exchange is legitimate there.
+        end_input() with no frames ever pushed: there is nothing to
+        transcribe, so there is nothing to dial for - no socket, no bare
+        Done, no synthesized silence shipped to an engine that would have
+        to invent a result for it. A clean empty completion, offline.
         """
-        ws = FakeWS()
-        dial = AsyncMock(return_value=ws)
+        dial = AsyncMock(side_effect=AssertionError("zero-audio must not dial"))
         stream = await make_stream(dial=dial)
-        stream._event_ch = Mock()
+        events = mock_event_ch(stream)
 
-        stream._input_ch.close()
+        stream.end_input()  # REAL path: sentinel + close, nothing else
 
-        async def scenario():
-            await asyncio.sleep(0.1)
-            ws.feed_json({"type": "final", "text": "", "confidence": 1.0})
-            ws.end()
-
-        task = asyncio.create_task(scenario())
         await asyncio.wait_for(stream._run(), timeout=5.0)
-        await task
 
         assert stream._session_complete
-        assert dial.await_count == 1
-        assert ws.sent_text == ["Done"]
+        dial.assert_not_awaited()
+        # No speech ever started, so no events are owed either
+        events.send_nowait.assert_not_called()
 
 
 class TestDefensiveResultProcessing:
@@ -833,31 +1002,52 @@ class TestSegmentEndSilence:
     """
     flush() from a VAD-gated caller (which pushes only speech frames) must
     still yield a final: the engine endpoints on ~300ms of wire silence that
-    nobody else provides. _on_segment_end synthesizes it.
+    nobody else provides. _on_segment_end synthesizes it - but ONLY at
+    genuine mid-session segment boundaries. end_input() is flush() + close(),
+    so every session's last item is a sentinel: injecting the silence there
+    shipped 400ms of zeros before every Done (Done itself forces the engine
+    flush), pure dead air at the end of every turn.
     """
 
+    WIRE_CHUNK_BYTES = VoxistSTTStream.WIRE_SAMPLE_RATE // 10 * 2  # 100ms Int16
+
+    @classmethod
+    def silence_payloads(cls, ws):
+        return [
+            c.args[0]
+            for c in ws.send_bytes.await_args_list
+            if len(c.args[0]) == cls.WIRE_CHUNK_BYTES
+            and c.args[0] == b"\x00" * cls.WIRE_CHUNK_BYTES
+        ]
+
     @pytest.mark.asyncio
-    async def test_flush_sends_silence_at_wire_rate(self):
+    async def test_mid_session_flush_sends_silence_at_wire_rate(self):
+        """A sentinel with the channel still OPEN is a segment boundary."""
         stream = await make_stream()
         ws = attach_mock_ws(stream)
 
+        # Real mid-session state: the sentinel is consumed while the input
+        # channel is still open (the session continues afterwards).
         stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
-        stream._input_ch.close()
+        task = asyncio.create_task(stream._send_audio_task())
+        await asyncio.sleep(0.2)  # sentinel consumed, channel still open
 
-        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
-
-        sent = [c.args[0] for c in ws.send_bytes.await_args_list]
-        assert sent, "a segment boundary must put silence on the wire"
-        total = b"".join(sent)
+        total = b"".join(c.args[0] for c in ws.send_bytes.await_args_list)
         expected_bytes = int(
             VoxistSTTStream.SEGMENT_SILENCE_SECONDS
             * VoxistSTTStream.WIRE_SAMPLE_RATE
             * 2  # Int16
         )
-        assert len(total) == expected_bytes
+        assert len(total) == expected_bytes, (
+            "a mid-session boundary must put the full endpointing silence "
+            "on the wire"
+        )
         assert total == b"\x00" * expected_bytes, "the filler must be silence"
         # and the silence must be >= the engine's ~300ms endpointing need
         assert VoxistSTTStream.SEGMENT_SILENCE_SECONDS >= 0.3
+
+        stream._input_ch.close()
+        await asyncio.wait_for(task, timeout=5.0)
 
     @pytest.mark.asyncio
     async def test_silence_bypasses_the_audio_processor(self):
@@ -870,12 +1060,299 @@ class TestSegmentEndSilence:
         stream._audio_processor.process_audio_frame = Mock(return_value=[])
 
         stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
-        stream._input_ch.close()
-
-        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+        task = asyncio.create_task(stream._send_audio_task())
+        await asyncio.sleep(0.2)  # mid-session: channel still open
 
         assert ws.send_bytes.await_count > 0
         stream._audio_processor.process_audio_frame.assert_not_called()
+
+        stream._input_ch.close()
+        await asyncio.wait_for(task, timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_end_of_session_sends_no_silence_before_done(self):
+        """
+        The trailing sentinel end_input() pushes is END OF SESSION, not a
+        segment boundary: Done forces the engine flush on its own, so the
+        400ms of zeros the old code shipped there was pure added latency on
+        every single turn (and a spurious 4-chunk dial for empty sessions).
+        """
+        stream = await make_stream()
+        ws = attach_mock_ws(stream)
+        mock_event_ch(stream)  # the cancelled _task closed the real one
+
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()  # REAL path: flush() + close()
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        assert stream._done_sent
+        assert ws.send_str.await_args.args[0] == "Done"
+        assert ws.send_bytes.await_count > 0, "the speech itself must ship"
+        assert self.silence_payloads(ws) == [], (
+            "end_input() must not inject endpointing silence before Done"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mid_session_flush_before_end_input_still_injects(self):
+        """
+        The [11] fix must not overreach: a genuine flush() boundary inside
+        the session keeps its silence even when end_input() follows later.
+        """
+        stream = await make_stream()
+        ws = attach_mock_ws(stream)
+        mock_event_ch(stream)
+
+        stream._input_ch.send_nowait(speech_frame())
+        stream.flush()  # REAL mid-session boundary
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()  # REAL session end
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        expected_chunks = int(VoxistSTTStream.SEGMENT_SILENCE_SECONDS * 10)
+        assert len(self.silence_payloads(ws)) == expected_chunks, (
+            "exactly one boundary's worth of silence: the flush() keeps "
+            "its injection, the end_input() sentinel adds none"
+        )
+        assert stream._done_sent
+
+
+class TestServerStallDetection:
+    """
+    A mute-but-connected server (wedged engine behind a live gateway that
+    still answers pings) must be detected MID-session, not discovered as
+    zero transcripts at end_input. The bound is send-aware: it arms only
+    while non-silent caller audio is flowing, so silent users and
+    silence-pushing callers can never trip it - the flaw that killed the
+    old unconditional 30s receive watchdog.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stall_bound_constants_are_sane(self):
+        assert 10.0 <= VoxistSTTStream.STALL_DETECTION_SECONDS <= 60.0, (
+            "short enough to save a live call, long enough that a loaded "
+            "engine's slowest partial cannot false-trigger"
+        )
+        assert 0 < VoxistSTTStream.NON_SILENCE_AMPLITUDE < 3000, (
+            "must sit between zero-fill/comfort noise and quiet speech"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mute_server_with_flowing_audio_raises(self, monkeypatch):
+        # raising=False: reverting the fix removes the constant, and this
+        # test must then fail on the missing BEHAVIOUR, not on monkeypatch
+        monkeypatch.setattr(
+            VoxistSTTStream, "STALL_DETECTION_SECONDS", 0.2, raising=False
+        )
+        ws = FakeWS()  # never feeds a single message
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        stopped = asyncio.Event()
+
+        async def pump():
+            # Real audio keeps flowing, as from a live microphone
+            for _ in range(200):
+                if stopped.is_set():
+                    return
+                stream._input_ch.send_nowait(speech_frame(320))  # 20ms
+                await asyncio.sleep(0.02)
+
+        pump_task = asyncio.create_task(pump())
+        try:
+            with pytest.raises(APIConnectionError, match="no response"):
+                await asyncio.wait_for(stream._run(), timeout=5.0)
+        finally:
+            stopped.set()
+            await pump_task
+        assert not stream._session_complete
+
+    @pytest.mark.asyncio
+    async def test_silent_frames_never_arm_the_stall_clock(self, monkeypatch):
+        """
+        A caller pushing pure silence is indistinguishable from a silent
+        user; the server owes it nothing, so it must not trip the bound.
+        """
+        monkeypatch.setattr(VoxistSTTStream, "STALL_DETECTION_SECONDS", 0.0)
+        stream = await make_stream()
+        attach_mock_ws(stream)
+
+        for _ in range(10):
+            stream._input_ch.send_nowait(frame(1600))  # zeros
+        stream._input_ch.close()
+
+        # With the bound at 0.0, ANY armed clock would raise on the second
+        # frame; silence must never arm it.
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+        assert stream._audio_flowing_since is None
+
+    @pytest.mark.asyncio
+    async def test_any_server_message_resets_the_stall_clock(self):
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+        stream._audio_flowing_since = 123.456  # armed long ago
+
+        ws.feed_json({"type": "partial", "text": "bonjour"})
+        ws.end()
+        await asyncio.wait_for(stream._recv_results_task(), timeout=5.0)
+
+        assert stream._audio_flowing_since is None, (
+            "a received message proves liveness and must disarm the clock"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_watchdog_task_exists(self):
+        """
+        The check is evaluated inline in the send loop; a third background
+        task would need the same cancellation care as send/recv and has no
+        payoff. Guard against one creeping back in.
+        """
+        import inspect
+
+        src = inspect.getsource(VoxistSTTStream._run)
+        assert src.count("create_task") == 2, (
+            "_run must own exactly two children: send and recv"
+        )
+
+
+class TestBoundedClose:
+    """
+    aiohttp's ws.close() waits up to 10s for the peer's close ACK. A wedged
+    server already cost the 5s drain bound; gifting it another 10s of dead
+    air in the finally defeats that. Teardown must be bounded.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_attempt_teardown_is_bounded(self, monkeypatch):
+        monkeypatch.setattr(VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.2)
+        monkeypatch.setattr(VoxistSTTStream, "CLOSE_TIMEOUT_SECONDS", 0.2)
+        ws = FakeWS()
+        ws.hang_on_close = True  # wedged peer never completes the handshake
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()
+
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        with pytest.raises(TranscriptLostError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        elapsed = loop.time() - start
+
+        assert elapsed < 2.0, (
+            f"teardown took {elapsed:.1f}s: the close was not bounded and "
+            "the wedged peer bought itself extra dead air"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_attempt_aborts_transport_before_close(self, monkeypatch):
+        """On a failed attempt, the transport is aborted, not flushed."""
+        monkeypatch.setattr(VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.2)
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        transport = Mock()
+        transport.is_closing = Mock(return_value=False)
+        transport.abort = Mock()
+        response = Mock()
+        response.connection = Mock()
+        response.connection.transport = transport
+        ws._response = response
+
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()
+
+        with pytest.raises(TranscriptLostError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        transport.abort.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_clean_completion_still_closes_politely(self):
+        """The clean path keeps the polite (but bounded) close."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "bonjour", "confidence": 0.9})
+            await asyncio.sleep(0.05)
+            stream.end_input()
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+        assert stream._session_complete
+
+
+class TestConfidenceHardening:
+    """
+    "confidence" is server-supplied; data.get(key, default) only covers a
+    MISSING key. null or junk must default to 1.0, not flow into SpeechData.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("msg_type", ["partial", "final"])
+    @pytest.mark.parametrize(
+        "confidence",
+        [None, "0.9", "high", [], {}, True, False],
+    )
+    async def test_non_numeric_confidence_defaults(self, msg_type, confidence):
+        stream = await make_stream()
+        events = mock_event_ch(stream)
+
+        await stream._process_result(
+            {"type": msg_type, "text": "bonjour", "confidence": confidence}
+        )
+
+        data = [
+            c.args[0].alternatives[0]
+            for c in events.send_nowait.call_args_list
+            if c.args[0].alternatives
+        ]
+        assert data, "the transcript event must still be emitted"
+        assert data[0].confidence == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("msg_type", ["partial", "final"])
+    async def test_missing_confidence_defaults(self, msg_type):
+        stream = await make_stream()
+        events = mock_event_ch(stream)
+
+        await stream._process_result({"type": msg_type, "text": "bonjour"})
+
+        data = [
+            c.args[0].alternatives[0]
+            for c in events.send_nowait.call_args_list
+            if c.args[0].alternatives
+        ]
+        assert data and data[0].confidence == 1.0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("msg_type", ["partial", "final"])
+    @pytest.mark.parametrize("confidence", [0.42, 1, 0])
+    async def test_numeric_confidence_passes_through(self, msg_type, confidence):
+        stream = await make_stream()
+        events = mock_event_ch(stream)
+
+        await stream._process_result(
+            {"type": msg_type, "text": "bonjour", "confidence": confidence}
+        )
+
+        data = [
+            c.args[0].alternatives[0]
+            for c in events.send_nowait.call_args_list
+            if c.args[0].alternatives
+        ]
+        assert data and data[0].confidence == float(confidence)
 
 
 class TestFinallyCancellationSemantics:
@@ -1043,9 +1520,12 @@ class TestLanguageCodeHandling:
         ws = FakeWS()
         dial = AsyncMock(return_value=ws)
         stream = await make_stream(language="fr-medical", dial=dial)
-        stream._event_ch = Mock()
+        mock_event_ch(stream)
 
-        stream._input_ch.close()
+        # A session with audio: a zero-audio end_input() would (correctly)
+        # never dial at all.
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()
         ws_task = asyncio.create_task(stream._run())
         await asyncio.sleep(0.05)
         ws.end()

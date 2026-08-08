@@ -379,8 +379,18 @@ class TestErrorHandling:
 
         # ...and a stream fails with the true cause rather than a generic
         # connection error. Deliberately not an APIError: livekit would retry
-        # those, and retrying cannot fix a revoked key.
+        # those, and retrying cannot fix a revoked key. The stream carries
+        # audio: a zero-audio end_input() correctly never dials at all, so
+        # it would never even reach authentication.
         stream = stt.stream()
+        stream.push_frame(
+            rtc.AudioFrame(
+                data=np.zeros(1600, dtype=np.int16).tobytes(),
+                sample_rate=16000,
+                num_channels=1,
+                samples_per_channel=1600,
+            )
+        )
         stream.end_input()
         with pytest.raises(AuthenticationError):
             async for _event in stream:
@@ -429,6 +439,106 @@ class TestErrorHandling:
                 pass
 
         await stt.aclose()
+
+
+@pytest.mark.integration
+class TestServerStallDetection:
+    """A wedged engine behind a live gateway must fail the attempt, fast."""
+
+    @pytest.mark.asyncio
+    async def test_wedged_engine_mid_session_is_detected(
+        self, monkeypatch, generate_test_audio
+    ):
+        """
+        End to end against the mock's wedge mode: the WS layer stays up and
+        keeps accepting audio, but the engine never answers. The send-aware
+        liveness bound must abandon the attempt instead of streaming into
+        the void until end_input.
+        """
+        from livekit.agents import APIConnectionError
+
+        from livekit.plugins.voxist.stream import VoxistSTTStream
+
+        monkeypatch.setattr(VoxistSTTStream, "STALL_DETECTION_SECONDS", 1.0)
+
+        server = MockVoxistServer(valid_api_key="test", error_mode="wedge")
+        await server.start()
+        try:
+            stt = VoxistSTT(
+                api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
+            )
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
+
+            speech = generate_test_audio(duration_ms=100)
+            stopped = asyncio.Event()
+
+            async def pump():
+                # Live microphone: real audio keeps flowing
+                while not stopped.is_set():
+                    try:
+                        stream.push_frame(
+                            rtc.AudioFrame(
+                                data=speech.tobytes(),
+                                sample_rate=16000,
+                                num_channels=1,
+                                samples_per_channel=len(speech),
+                            )
+                        )
+                    except RuntimeError:
+                        return  # stream already dead
+                    await asyncio.sleep(0.05)
+
+            pump_task = asyncio.create_task(pump())
+            start = time.time()
+            try:
+                with pytest.raises(APIConnectionError, match="no response"):
+                    async for _event in stream:
+                        pass
+            finally:
+                stopped.set()
+                await pump_task
+            elapsed = time.time() - start
+
+            assert elapsed < 10.0, (
+                "the stall must be detected around STALL_DETECTION_SECONDS, "
+                "not discovered at end of input"
+            )
+            assert server.audio_frames_received > 0, (
+                "precondition: audio really was flowing into the wedge"
+            )
+            await stt.aclose()
+        finally:
+            await server.stop()
+
+
+@pytest.mark.integration
+class TestZeroAudioSession:
+    """end_input() with no frames: clean empty completion, zero network."""
+
+    @pytest.mark.asyncio
+    async def test_zero_audio_session_never_dials(self):
+        server = MockVoxistServer(valid_api_key="test")
+        await server.start()
+        try:
+            stt = VoxistSTT(
+                api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
+            )
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
+            # No await between stream() and end_input(): _run has not begun,
+            # so the zero-audio short-circuit decides deterministically.
+            stream.end_input()
+
+            events = [event async for event in stream]
+
+            await stt.aclose()
+
+            assert events == [], "an empty session owes no events"
+            assert server.connections_count == 0, (
+                "a session with no audio must not dial: there is nothing "
+                "to transcribe"
+            )
+        finally:
+            await server.stop()
 
 
 @pytest.mark.integration

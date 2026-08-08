@@ -233,6 +233,45 @@ class TestMockServerErrorSimulation:
             await server.stop()
 
 
+class TestWedgeMode:
+    """
+    error_mode="wedge" models the mute-but-connected failure: the engine
+    behind the gateway is dead, but the gateway's WS layer stays up and
+    answers protocol pings. The socket accepts everything - audio, silence,
+    even Done - and never sends a byte back, never closes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_wedge_accepts_audio_but_never_responds(self):
+        server = MockVoxistServer(valid_api_key="test_key", error_mode="wedge")
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = (
+                    f"ws://{server.host}:{server.port}/ws"
+                    "?api_key=test_key&lang=fr"
+                )
+                async with session.ws_connect(url) as ws:
+                    for _ in range(3):
+                        await ws.send_bytes(speech_frame())
+                    for _ in range(5):  # enough silence to finalize normally
+                        await ws.send_bytes(silence_frame())
+                    await ws.send_str("Done")
+
+                    # No final on silence, no finalize-and-close on Done:
+                    # the socket just sits there, connected and mute.
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(ws.receive(), timeout=0.5)
+
+            assert server.audio_frames_received == 8
+            assert server.done_received_count == 1, (
+                "wedge must still observe Done for test bookkeeping"
+            )
+            assert server.finals_sent == 0
+        finally:
+            await server.stop()
+
+
 class TestFinalsWithoutDoneToggle:
     """
     finals_without_done=False models an engine that only finalizes on Done.

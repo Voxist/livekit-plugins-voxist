@@ -24,7 +24,6 @@ One WebSocket per stream, matching the gateway's protocol:
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import sys
 import time
@@ -37,7 +36,7 @@ import numpy as np
 # Required, not optional: a fallback shim here once silently disabled BCP-47
 # normalization on older livekit-agents. The dependency floor guarantees the
 # import, and failing loudly beats diverging quietly.
-from livekit.agents import APIConnectionError, APIError, LanguageCode, utils
+from livekit.agents import APIConnectionError, LanguageCode, utils
 from livekit.agents.stt import (
     RecognizeStream,
     SpeechData,
@@ -49,6 +48,7 @@ from livekit import rtc  # type: ignore[attr-defined]
 
 from .audio_processor import AudioProcessor
 from .exceptions import ConnectionError as VoxistConnectionError
+from .exceptions import TranscriptLostError
 from .log import logger
 
 if TYPE_CHECKING:
@@ -128,6 +128,36 @@ class VoxistSTTStream(RecognizeStream):
     # be useful anyway, so the oldest frames are dropped rather than queued.
     MAX_INPUT_BACKLOG_FRAMES = 1000
 
+    # Mid-session liveness bound. aiohttp's heartbeat only detects transport
+    # death; the gateway's WS layer keeps answering pings even when the
+    # engine behind it has wedged, so a mute-but-connected server used to
+    # mean silent zero-transcripts until end_input. If real (non-silent)
+    # caller audio has been flowing for this long with ZERO WebSocket
+    # messages received in that window, the server is declared stalled and
+    # the attempt fails as APIConnectionError so the framework redials.
+    # Checked inline in the send loop per frame - no watchdog task - and the
+    # receive loop resets the window on every message, so a silent USER
+    # (no frames pushed, or silence-only frames) can never trip it: the old
+    # 30s receive watchdog false-fired on exactly that.
+    STALL_DETECTION_SECONDS = 30.0
+
+    # Peak |Int16 amplitude| at or above which a caller frame counts as real
+    # audio for stall detection. Pure and near-pure silence (VAD comfort
+    # noise, zero-fill) stays below it; speech peaks are orders of magnitude
+    # above it. Callers pushing continuous low-level room noise during a
+    # long user silence are indistinguishable from speakers to anything but
+    # a real VAD, so the threshold is deliberately conservative: missing a
+    # whisper only delays detection, while a false positive would sever a
+    # healthy session.
+    NON_SILENCE_AMPLITUDE = 500
+
+    # Bound on ws.close() during teardown. aiohttp waits up to its ws_close
+    # default of 10s for the peer's close ACK - dead air a wedged server
+    # does not deserve, right after the 5s drain bound was tightened for the
+    # same reason. Failed attempts abort the transport outright; even the
+    # polite close on the clean path is bounded by this.
+    CLOSE_TIMEOUT_SECONDS = 1.0
+
     def __init__(
         self,
         *,
@@ -188,11 +218,27 @@ class VoxistSTTStream(RecognizeStream):
         # before Done" guards on the next attempt):
         #   _done_sent               "Done" was written on THIS socket
         #   _transport_lookup_failed log-once latch for THIS socket
+        #   _final_received_this_attempt / _interim_received_this_attempt
+        #                            what THIS attempt delivered. The
+        #                            post-Done drain taxonomy keys on these:
+        #                            a final from attempt 1 must not let
+        #                            attempt 2 - whose entire audio produced
+        #                            nothing before the server wedged -
+        #                            complete as success.
+        #   _audio_flowing_since     monotonic time of the first non-silent
+        #                            caller frame sent since the LAST
+        #                            WebSocket message was received on this
+        #                            socket; None while the server is
+        #                            responsive (stall detection, see
+        #                            STALL_DETECTION_SECONDS)
         # ------------------------------------------------------------------
         self._done_sent = False
         self._session_complete = False
         self._audio_consumed = False
         self._final_received = False
+        self._final_received_this_attempt = False
+        self._interim_received_this_attempt = False
+        self._audio_flowing_since: float | None = None
 
         # Latch so an unreachable transport is reported once, not per chunk
         self._transport_lookup_failed = False
@@ -222,13 +268,18 @@ class VoxistSTTStream(RecognizeStream):
 
         Raises:
             APIConnectionError: The session was interrupted (dial failure,
-                stalled send, server close before end of input). livekit's
-                _main_task catches this, emits a recoverable error event, and
-                calls _run() again up to conn_options.max_retry.
-            APIError (retryable=False): The session failed in a way no retry
-                can fix - its audio was already consumed and produced no
+                stalled send, mid-session server stall, server close before
+                end of input). livekit's _main_task catches this, emits a
+                recoverable error event, and calls _run() again up to
+                conn_options.max_retry.
+            TranscriptLostError: The session failed in a way no retry can
+                fix - its audio was already consumed and produced no
                 transcript. Raised instead of fabricating a clean, empty
-                completion.
+                completion. Deliberately NOT an APIError (see the class
+                docstring in exceptions.py): _main_task then emits exactly
+                one error event (recoverable=False) and terminates the
+                stream immediately instead of burning max_retry no-op
+                attempts while telling the caller "recoverable" each time.
             AuthenticationError: The key was rejected even with a fresh
                 token. Deliberately NOT an APIError: retrying cannot fix a
                 revoked key, so it propagates immediately as the true cause.
@@ -244,35 +295,56 @@ class VoxistSTTStream(RecognizeStream):
         # guard for this whole attempt.
         self._done_sent = False
         self._transport_lookup_failed = False
+        self._final_received_this_attempt = False
+        self._interim_received_this_attempt = False
+        self._audio_flowing_since = None
+
+        # end_input() is flush() + close(): the LAST channel item is always
+        # a _FlushSentinel, so "input fully consumed" must treat a closed
+        # channel whose only remaining items are sentinels as consumed. The
+        # earlier guard required qsize()==0, and the trailing sentinel
+        # bypassed it: after attempt 1 died on the last audio frame, attempt
+        # 2 found qsize()==1, dialed, consumed only the sentinel, sent a
+        # bare Done and completed as SUCCESS - total transcript loss.
+        input_exhausted = self._input_ch.closed and self._pending_input_only_sentinels()
+
+        if input_exhausted and not self._audio_consumed:
+            # No real audio ever entered this session (end_input() with zero
+            # frames) - there is nothing to transcribe, so there is nothing
+            # to dial for. Dialing anyway would ship a bare Done and force
+            # the engine to invent a result for zero audio. This only
+            # short-circuits when end_input() lands before the attempt
+            # starts (or on a retry); a zero-frame session whose end_input()
+            # races in after the dial completes normally over the wire.
+            logger.debug(
+                f"Stream {self._session_id} ended with no audio pushed; "
+                "completing without dialing"
+            )
+            self._finish_session()
+            return
 
         # A retry cannot replay streamed audio. If a previous attempt already
-        # consumed the input (it is closed and drained) then dialing a fresh
-        # socket would send a bare "Done" and "complete" with whatever the
-        # engine makes of zero audio - total transcript loss presented as
-        # success. Against _main_task's loop this plays out as:
+        # consumed the input then dialing a fresh socket would send a bare
+        # "Done" and "complete" with whatever the engine makes of zero audio
+        # - total transcript loss presented as success. Against _main_task's
+        # loop this plays out as:
         #   - no finals ever emitted: the session produced NOTHING, and no
-        #     retry can change that -> raise APIError(retryable=False). The
-        #     installed _main_task does not consult `retryable` and will
-        #     still loop, but this guard is idempotent - every retry lands
-        #     here again without dialing - so the stream terminates in
-        #     honest failure once max_retry is exhausted (and terminates
-        #     immediately on framework versions that do honour the flag).
+        #     retry can change that -> raise TranscriptLostError, which
+        #     _main_task does not retry: one honest error event, immediate
+        #     termination. (The guard stays idempotent regardless - any
+        #     framework that did call _run() again would land here without
+        #     dialing.)
         #   - finals WERE emitted (by an earlier attempt): the data that
         #     could be delivered has been delivered; only audio past the
         #     last final (if any existed) is unrecoverable. Completing
         #     without a pointless re-dial matches the _session_complete
         #     path, with the possible tail loss reported in the log rather
         #     than silently absorbed.
-        if (
-            self._audio_consumed
-            and self._input_ch.closed
-            and self._input_ch.qsize() == 0
-        ):
+        if input_exhausted:
             if not self._final_received:
-                raise APIError(
+                raise TranscriptLostError(
                     "session audio was consumed by a failed attempt and "
-                    "cannot be replayed; no transcript was produced",
-                    retryable=False,
+                    "cannot be replayed; no transcript was produced"
                 )
             logger.warning(
                 f"Stream {self._session_id} retry found the input already "
@@ -315,37 +387,69 @@ class VoxistSTTStream(RecognizeStream):
                             recv_task, timeout=self.SESSION_DRAIN_TIMEOUT_SECONDS
                         )
                     except asyncio.TimeoutError:
-                        if not self._final_received:
-                            # Nothing was EVER transcribed and now the server
-                            # has gone mute after Done: completing here would
-                            # fabricate a silent success out of a failed
-                            # session. If audio was consumed, a retry cannot
-                            # replay it (same taxonomy as the guard at the
-                            # top of _run); if none was, a fresh dial could
-                            # legitimately succeed, so let the framework
-                            # retry it.
-                            if self._audio_consumed:
-                                raise APIError(
-                                    "server produced no transcript and did "
-                                    "not close within "
-                                    f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s "
-                                    "of Done; the audio cannot be replayed",
-                                    retryable=False,
-                                ) from None
+                        # The taxonomy keys on what THIS attempt delivered
+                        # for the audio THIS attempt sent (the flags are
+                        # per-attempt): a final from attempt 1 must not let
+                        # attempt 2 - whose entire audio produced nothing
+                        # before the server wedged - complete as success.
+                        if self._final_received_this_attempt:
+                            # Finals made it out for this attempt's audio;
+                            # only a trailing one can be missing. Completing
+                            # with a warning beats failing a session whose
+                            # data was delivered.
+                            logger.warning(
+                                f"Stream {self._session_id} server neither "
+                                "closed nor answered within "
+                                f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s of "
+                                "Done - a trailing transcript may have been "
+                                "lost"
+                            )
+                        elif self._interim_received_this_attempt:
+                            # Interims were delivered but the final never
+                            # arrived before the server wedged. Complete
+                            # rather than error: the text already reached
+                            # the caller as INTERIM_TRANSCRIPT events, the
+                            # audio cannot be replayed so no retry can
+                            # improve the outcome, and erroring would
+                            # vaporize a session whose content was
+                            # substantially delivered. Trade-off, stated
+                            # plainly: agent code that consumes ONLY
+                            # FINAL_TRANSCRIPT events still experiences this
+                            # as transcript loss - hence the prominent
+                            # warning instead of a silent success.
+                            logger.warning(
+                                f"Stream {self._session_id} server wedged "
+                                "after Done with only interim transcripts "
+                                "delivered - completing because the text "
+                                "reached the caller as interims, but "
+                                "consumers that read only FINAL_TRANSCRIPT "
+                                "events will see this session's tail as "
+                                "lost"
+                            )
+                        elif self._audio_consumed:
+                            # Real audio was consumed (this or an earlier
+                            # attempt), nothing was delivered for it, and it
+                            # cannot be replayed: honest, non-retryable
+                            # failure (see TranscriptLostError - one error
+                            # event, immediate termination, no misleading
+                            # "recoverable" retries).
+                            raise TranscriptLostError(
+                                "server produced no transcript and did not "
+                                "close within "
+                                f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s of "
+                                "Done; the audio cannot be replayed"
+                            ) from None
+                        else:
+                            # Zero audio ever consumed: nothing was lost. A
+                            # fresh dial could legitimately succeed, so let
+                            # the framework retry (the retry lands in the
+                            # zero-audio short-circuit and completes empty).
                             raise APIConnectionError(
                                 "server produced no transcript and did not "
                                 "close within "
-                                f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s of Done"
+                                f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s of "
+                                "Done"
                             ) from None
-                        # Finals made it out; only a trailing one can be
-                        # missing. Completing with a warning beats failing a
-                        # session whose data was delivered.
-                        logger.warning(
-                            f"Stream {self._session_id} server neither closed "
-                            f"nor answered within "
-                            f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s of Done - "
-                            "a trailing transcript may have been lost"
-                        )
 
             if recv_task.done() and not recv_task.cancelled():
                 exc = recv_task.exception()
@@ -389,8 +493,28 @@ class VoxistSTTStream(RecognizeStream):
                                 f"failure in {task.get_name()}: {exc2!r}"
                             )
                 if not ws.closed:
-                    with contextlib.suppress(Exception):
-                        await ws.close()
+                    # ws.close() waits up to aiohttp's ws_close default of
+                    # 10s for the peer's close ACK - dead air a wedged or
+                    # failing peer must not be granted right after the drain
+                    # was bounded to 5s for the same reason. On a failed (or
+                    # cancelled) attempt the transport is aborted first, so
+                    # the close below returns immediately; the clean path
+                    # keeps the polite close but bounds it, aborting as the
+                    # fallback.
+                    if in_flight is not None:
+                        transport = self._get_transport()
+                        if transport is not None:
+                            transport.abort()
+                    try:
+                        await asyncio.wait_for(
+                            ws.close(), timeout=self.CLOSE_TIMEOUT_SECONDS
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        transport = self._get_transport()
+                        if transport is not None:
+                            transport.abort()
                 self._ws = None
 
     def _finish_session(self) -> None:
@@ -429,10 +553,23 @@ class VoxistSTTStream(RecognizeStream):
                 )
 
             if isinstance(data, self._FlushSentinel):
-                # End of SEGMENT, not of session. Ship whatever the processor
-                # is holding so the engine has the full segment to finalize.
+                # Ship whatever the processor is holding so the engine has
+                # the full segment to finalize.
                 for chunk in self._audio_processor.flush():
                     await self._send_audio_chunk(chunk)
+
+                # end_input() is flush() + close(), so the LAST item of every
+                # session is a sentinel. A sentinel pulled with the channel
+                # already closed and nothing behind it is therefore END OF
+                # SESSION, not a segment boundary: "Done" (written right
+                # after this loop) forces the engine flush on its own, so the
+                # endpointing silence would be pure waste - 400ms of extra
+                # latency per turn, up to 20s of it on a stalling uplink.
+                # A sentinel with the channel still open (or with more items
+                # behind it) is a genuine mid-session flush() and keeps the
+                # silence injection.
+                if self._input_ch.closed and self._input_ch.qsize() == 0:
+                    continue
                 await self._on_segment_end()
                 continue
 
@@ -448,6 +585,7 @@ class VoxistSTTStream(RecognizeStream):
                 frame_bytes = bytes(data.data)
                 for chunk in self._audio_processor.process_audio_frame(frame_bytes):
                     await self._send_audio_chunk(chunk)
+                self._check_server_liveness(frame_bytes)
             else:
                 logger.warning(
                     f"Stream {self._session_id} unexpected data type: {type(data)}"
@@ -497,6 +635,77 @@ class VoxistSTTStream(RecognizeStream):
         chunk = np.zeros(self.WIRE_SAMPLE_RATE // 10, dtype=np.int16)
         for _ in range(int(self.SEGMENT_SILENCE_SECONDS * 10)):
             await self._send_audio_chunk(chunk)
+
+    def _pending_input_only_sentinels(self) -> bool:
+        """
+        True if nothing but flush sentinels remains in the input channel.
+
+        Sentinels are segment markers, not data: a closed channel holding
+        only sentinels is semantically CONSUMED - draining it can produce no
+        audio, only boundaries with nothing between them. end_input() always
+        leaves exactly this state behind (flush() then close()), which is why
+        the exhausted-input guard cannot key on qsize()==0.
+
+        Reads Chan._queue, the deque backing qsize() - livekit exposes no
+        peek. If that private attribute ever moves, fall back to qsize()==0:
+        strictly conservative (never claims exhaustion falsely, may miss the
+        trailing-sentinel case the tests would then catch).
+        """
+        queue = getattr(self._input_ch, "_queue", None)
+        if queue is None:
+            return self._input_ch.qsize() == 0
+        return all(isinstance(item, self._FlushSentinel) for item in tuple(queue))
+
+    def _check_server_liveness(self, frame_bytes: bytes) -> None:
+        """
+        Detect a mute-but-connected server; called per caller frame sent.
+
+        aiohttp's heartbeat only catches transport death - the gateway's WS
+        layer answers pings even when the engine behind it is wedged. The
+        bound here is send-aware so long user silences cannot false-trigger
+        it (the old unconditional 30s receive watchdog did): the clock only
+        starts when a NON-SILENT caller frame is sent, and the receive loop
+        resets it on every message. Only if real audio has been flowing for
+        STALL_DETECTION_SECONDS with zero messages received in that window is
+        the server declared stalled.
+
+        Evaluated inline in the send loop - no watchdog task to create,
+        cancel, or leak. The worst-case detection delay is one frame period
+        past the bound, which is noise against 30s.
+
+        Non-silence is approximated by peak amplitude (NON_SILENCE_AMPLITUDE)
+        rather than a real VAD: synthesized zeros and near-zero comfort noise
+        do not start the clock, while any plausible speech does. A caller
+        pushing continuous above-threshold noise during a genuinely silent
+        half-minute is indistinguishable from a speaker here; the engine
+        normally answers real audio with partials well inside the bound, so
+        the threshold errs toward never severing a healthy session.
+
+        Raises:
+            APIConnectionError: No server message for STALL_DETECTION_SECONDS
+                of flowing audio; the framework redials.
+        """
+        samples = np.frombuffer(frame_bytes, dtype=np.int16)
+        if samples.size == 0:
+            return
+        # astype(int32) before abs(): abs(-32768) overflows in int16
+        if int(np.abs(samples.astype(np.int32)).max()) < self.NON_SILENCE_AMPLITUDE:
+            return
+
+        now = time.monotonic()
+        if self._audio_flowing_since is None:
+            self._audio_flowing_since = now
+            return
+        if now - self._audio_flowing_since >= self.STALL_DETECTION_SECONDS:
+            logger.warning(
+                f"Stream {self._session_id} sent real audio for "
+                f"{self.STALL_DETECTION_SECONDS}s without receiving a single "
+                "message - the server is connected but not responding; "
+                "abandoning the attempt"
+            )
+            raise APIConnectionError(
+                "no response from server while streaming audio"
+            )
 
     @property
     def dropped_frames(self) -> int:
@@ -677,6 +886,9 @@ class VoxistSTTStream(RecognizeStream):
         """
         assert self._ws is not None
         async for msg in self._ws:
+            # Any message proves the server is alive: reset the stall clock
+            # the send loop runs (see _check_server_liveness).
+            self._audio_flowing_since = None
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
@@ -695,6 +907,22 @@ class VoxistSTTStream(RecognizeStream):
         logger.debug(
             f"Stream {self._session_id} server closed the socket"
         )
+
+    @staticmethod
+    def _extract_confidence(data: dict) -> float:
+        """
+        Server-supplied confidence, hardened like "text" already is.
+
+        `data.get("confidence", 1.0)` only covers a missing key; the gateway
+        can send `"confidence": null` (or any non-numeric junk), which would
+        flow straight into SpeechData. Anything that is not a real number -
+        including bool, which is an int subclass - defaults to 1.0. No string
+        parsing, no clamping: boring by design.
+        """
+        value = data.get("confidence")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return 1.0
 
     async def _process_result(self, data: object):
         """
@@ -742,6 +970,11 @@ class VoxistSTTStream(RecognizeStream):
             if text and self._config["interim_results"]:
                 logger.debug(f"Stream {self._session_id} interim: {text[:50]}")
 
+                # Set only when the event actually reaches the caller: the
+                # drain taxonomy uses this flag to decide that "the text was
+                # delivered as interims", which is false with interim_results
+                # disabled.
+                self._interim_received_this_attempt = True
                 event = SpeechEvent(
                     type=SpeechEventType.INTERIM_TRANSCRIPT,
                     request_id=self._session_id,
@@ -749,7 +982,7 @@ class VoxistSTTStream(RecognizeStream):
                         SpeechData(
                             language=self._speech_language,
                             text=text,
-                            confidence=data.get("confidence", 1.0),
+                            confidence=self._extract_confidence(data),
                         )
                     ],
                 )
@@ -761,6 +994,7 @@ class VoxistSTTStream(RecognizeStream):
                 logger.info(f"Stream {self._session_id} final: {text[:100]}")
 
                 self._final_received = True
+                self._final_received_this_attempt = True
                 event = SpeechEvent(
                     type=SpeechEventType.FINAL_TRANSCRIPT,
                     request_id=self._session_id,
@@ -768,7 +1002,7 @@ class VoxistSTTStream(RecognizeStream):
                         SpeechData(
                             language=self._speech_language,
                             text=text,
-                            confidence=data.get("confidence", 1.0),
+                            confidence=self._extract_confidence(data),
                         )
                     ],
                 )

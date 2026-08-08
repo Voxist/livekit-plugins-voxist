@@ -69,7 +69,14 @@ class MockVoxistServer:
             transcription_confidence: Confidence score (0.0-1.0)
             send_interim: Whether to send interim results
             interim_delay_ms: Delay before sending interim result
-            error_mode: Error simulation mode (None, "auth_failure", "disconnect")
+            error_mode: Error simulation mode (None, "auth_failure",
+                        "disconnect", "wedge"). "wedge" models a wedged
+                        ENGINE behind a healthy gateway: the WebSocket layer
+                        stays connected (aiohttp answers pings at protocol
+                        level) and keeps accepting audio and Done, but never
+                        sends a single message and never closes - the exact
+                        mute-but-connected failure a transport heartbeat
+                        cannot see.
             on_audio_received: Callback when audio is received (for testing)
             api_key_header: Header carrying the API key on the token exchange
                             (must match ConnectionPool.api_key_header)
@@ -205,6 +212,22 @@ class MockVoxistServer:
                 interim_sent_for_segment = False
 
             async for msg in ws:
+                if self.error_mode == "wedge":
+                    # Wedged engine, healthy gateway: bookkeeping only.
+                    # Nothing is ever sent back, Done neither finalizes nor
+                    # closes, and the loop only ends when the CLIENT closes.
+                    if msg.type == aiohttp.WSMsgType.BINARY:
+                        self.audio_frames_received += 1
+                        self.total_audio_bytes += len(msg.data)
+                        if self.on_audio_received:
+                            self.on_audio_received(msg.data, len(msg.data) // 2)
+                    elif (
+                        msg.type == aiohttp.WSMsgType.TEXT
+                        and "Done" in msg.data
+                    ):
+                        self.done_received_count += 1
+                    continue
+
                 if msg.type == aiohttp.WSMsgType.TEXT:
                     try:
                         json.loads(msg.data)

@@ -173,7 +173,13 @@ class VoxistDialer:
             #   unparseable body
             # - RuntimeError: the session closing between the check above and
             #   the request (shutdown race)
-            # Anything escaping unmapped kills the stream with zero retries.
+            # Anything escaping unmapped kills the stream with zero retries,
+            # so a final catch-all maps whatever the enumeration missed (a
+            # UnicodeDecodeError from body decoding, say). Our own
+            # AuthenticationError/ConnectionError are re-raised first so they
+            # are never double-wrapped, and asyncio.CancelledError derives
+            # from BaseException (Python 3.8+), so no `except Exception`
+            # clause here can ever swallow a cancellation.
             try:
                 async with self._session.get(
                     http_url,
@@ -196,6 +202,8 @@ class VoxistDialer:
                             f"Token exchange failed with status {resp.status}"
                         )
                     data = await resp.json()
+            except (AuthenticationError, ConnectionError):
+                raise
             except (
                 aiohttp.ClientError,
                 asyncio.TimeoutError,
@@ -204,6 +212,10 @@ class VoxistDialer:
                 RuntimeError,
             ) as e:
                 raise ConnectionError(f"Token exchange failed: {e!r}") from e
+            except Exception as e:
+                raise ConnectionError(
+                    f"Token exchange failed unexpectedly: {e!r}"
+                ) from e
 
             if not isinstance(data, dict):
                 raise ConnectionError(
@@ -212,6 +224,16 @@ class VoxistDialer:
             token_url = data.get("url")
             if not token_url:
                 raise ConnectionError("Token exchange response missing 'url' field")
+            # Validate at the exchange, where the failure is attributable:
+            # a non-string (or non-WebSocket) url would otherwise crash
+            # dial() later with an unmapped TypeError and zero retries.
+            if not isinstance(token_url, str) or not token_url.startswith(
+                ("ws://", "wss://")
+            ):
+                raise ConnectionError(
+                    "Token exchange returned a malformed url: expected a "
+                    f"ws:// or wss:// string, got {token_url!r:.100}"
+                )
 
             self._token_url = token_url
             self._token_expires_at = self._token_expiry_from_url(token_url, now)
@@ -283,25 +305,28 @@ class VoxistDialer:
 
                 # A 401/403 here does NOT prove the API key is bad: this
                 # token may have been cached and invalidated server-side
-                # (expiry edge, gateway restart). Killing the stream with a
-                # fatal AuthenticationError on a stale CACHED token would
-                # punish a perfectly valid key. So: invalidate the cache
-                # (race-safely - see _invalidate_token), exchange the key for
-                # a fresh token ONCE, and redial. Only when the fresh token
-                # is also rejected is the credential itself the problem.
+                # (expiry edge, gateway restart, token-store propagation
+                # lag). Killing the stream with a fatal AuthenticationError
+                # on a rejected token would punish a perfectly valid key.
+                # So: invalidate the cache (race-safely - see
+                # _invalidate_token), exchange the key for a fresh token
+                # ONCE, and redial - bounded by this attempt counter, never
+                # by comparing tokens. JWTs have one-second iat/exp
+                # granularity, so a refetch in the same second (or a server
+                # reusing tokens within validity) legitimately hands back a
+                # byte-identical token that is still worth the one redial.
+                # A genuinely revoked key still fails fast: the token
+                # EXCHANGE itself 401s inside _get_token_url below and
+                # raises AuthenticationError directly.
                 if not refetched_token:
                     refetched_token = True
                     await self._invalidate_token(token_url)
-                    fresh_url = await self._get_token_url()
-                    if fresh_url != token_url:
-                        logger.info(
-                            "WebSocket handshake rejected the cached token; "
-                            "redialing once with a freshly exchanged token"
-                        )
-                        token_url = fresh_url
-                        continue
-                    # The exchange handed back the identical token; redialing
-                    # with the same credential cannot end differently.
+                    token_url = await self._get_token_url()
+                    logger.info(
+                        "WebSocket handshake rejected the token; redialing "
+                        "once with a freshly exchanged token"
+                    )
+                    continue
                 raise AuthenticationError(
                     "WebSocket authentication failed with a freshly "
                     "exchanged token"
@@ -316,6 +341,18 @@ class VoxistDialer:
                 # aiohttp raises RuntimeError('Session is closed') when a
                 # dial races aclose(); map it so livekit can retry cleanly.
                 raise ConnectionError(f"WebSocket dial failed: {e}") from e
+            except (AuthenticationError, ConnectionError):
+                # Defensive: never double-wrap our own mapped errors.
+                raise
+            except Exception as e:
+                # Catch-all for anything the enumeration above missed
+                # (e.g. a UnicodeDecodeError surfacing from the handshake):
+                # an unmapped exception kills the stream with zero retries.
+                # asyncio.CancelledError derives from BaseException
+                # (Python 3.8+), so cancellation is never swallowed here.
+                raise ConnectionError(
+                    f"WebSocket dial failed unexpectedly: {e!r}"
+                ) from e
 
             logger.debug(f"Dialed Voxist WebSocket (lang={language})")
             return ws

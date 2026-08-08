@@ -4,10 +4,12 @@ import asyncio
 import contextlib
 import logging
 import os
+import threading
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 import pytest
+from aiohttp import web
 from livekit.agents.stt import STTCapabilities
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions
 
@@ -595,15 +597,38 @@ class TestQUAL002InitializationState:
 
     @pytest.mark.asyncio
     async def test_wait_for_initialization_returns_true_if_already_completed(self):
-        """Test wait_for_initialization returns True immediately if already complete."""
+        """Completed init returns True without re-running the warm-up.
+
+        validate_websocket=False keeps this a pure state-machine test; the
+        WS probe contract is pinned in TestWebSocketReachabilityValidation.
+        """
         from livekit.plugins.voxist import InitializationState
 
-        stt = VoxistSTT(api_key="test")
+        stt = VoxistSTT(api_key="test", validate_websocket=False)
         stt._init_state = InitializationState.COMPLETED
 
         result = await stt.wait_for_initialization(timeout=5.0)
 
         assert result is True
+
+    @pytest.mark.asyncio
+    async def test_already_completed_still_validates_ws_exactly_once(self):
+        """[14] COMPLETED means 'token cached', not 'WS proven': the first
+        readiness check must still dial the probe, and only the first."""
+        from livekit.plugins.voxist import InitializationState
+
+        stt = VoxistSTT(api_key="test")
+        dialer = AsyncMock()
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.COMPLETED
+
+        assert await stt.wait_for_initialization(timeout=5.0) is True
+        dialer.dial.assert_awaited_once()
+
+        assert await stt.wait_for_initialization(timeout=5.0) is True
+        dialer.dial.assert_awaited_once()  # probe result is cached
+
+        await stt.aclose()
 
     @pytest.mark.asyncio
     async def test_wait_for_initialization_returns_false_if_already_failed(self):
@@ -1077,10 +1102,13 @@ class TestAcloseWithLiveStreams:
 
 class TestSessionLoopAffinity:
     """
-    aiohttp binds a ClientSession to the loop that first uses it. A stream
-    in a different loop must not die with RuntimeError('Event loop is
-    closed') - a plugin-owned session is rebuilt for the current loop; a
-    caller-supplied one is theirs, so it is a clear mapped error instead.
+    aiohttp binds a ClientSession to the loop that first uses it.
+
+    Contract ([6]): a session stranded on a CLOSED loop is rebuilt (plugin-
+    owned) or a clear mapped error (caller-supplied). A session bound to a
+    loop that is ALIVE but not the running one is neither destroyed nor
+    rebuilt: multi-loop sharing is unsupported, and the healthy loop's
+    session (and its token cache) must survive, so it is a mapped error.
     """
 
     def test_owned_session_is_rebuilt_for_a_new_loop(self):
@@ -1103,6 +1131,52 @@ class TestSessionLoopAffinity:
             await stt.aclose()
 
         asyncio.run(close())
+
+    def test_alive_foreign_loop_errors_without_destroying_the_session(self):
+        """
+        [6] Two LIVE loops sharing one VoxistSTT: the second loop must get
+        a clear mapped error, and the first loop's session, dialer and
+        token cache must survive untouched - no rebuild thrash, no leaked
+        connectors, no misleading 'defunct loop' warning.
+        """
+        stt = VoxistSTT(api_key="test_key")  # constructed with no loop
+
+        loop_a = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop_a.run_forever, daemon=True)
+        thread.start()
+        try:
+            asyncio.run_coroutine_threadsafe(
+                stt._ensure_dialer(), loop_a
+            ).result(timeout=5)
+            session_a, dialer_a = stt._session, stt._dialer
+            assert session_a is not None
+
+            async def ensure():
+                await stt._ensure_dialer()
+
+            # loop_a is still ALIVE: this must be an error, not a rebuild
+            with pytest.raises(
+                VoxistConnectionError, match="different running event loop"
+            ):
+                asyncio.run(ensure())
+
+            # the healthy loop's state survives...
+            assert stt._session is session_a
+            assert stt._dialer is dialer_a
+            assert not session_a.closed
+
+            # ...and keeps working from its own loop afterwards
+            still = asyncio.run_coroutine_threadsafe(
+                stt._ensure_dialer(), loop_a
+            ).result(timeout=5)
+            assert still is dialer_a
+        finally:
+            asyncio.run_coroutine_threadsafe(stt.aclose(), loop_a).result(
+                timeout=5
+            )
+            loop_a.call_soon_threadsafe(loop_a.stop)
+            thread.join(timeout=5)
+            loop_a.close()
 
     def test_user_session_on_dead_loop_raises_mapped_error(self):
         async def make_session():
@@ -1229,4 +1303,256 @@ class TestInitTaskExceptionRetrieval:
             await stt._init_task
 
         assert await stt.wait_for_initialization(timeout=1.0) is False
+        await stt.aclose()
+
+
+class TestAcloseAcrossLoops:
+    """
+    [7] aclose() must be best-effort-COMPLETE: an init task stranded on a
+    dead (or foreign) loop must not abort the teardown before streams and
+    the HTTP session are closed.
+    """
+
+    def test_aclose_from_another_loop_still_completes_cleanup(self, monkeypatch):
+        # Build the plugin under loop A so the background init task is
+        # created there, then close loop A with the task still pending
+        # (a slow warm-up: the token exchange never answered).
+        async def hang(self):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(VoxistSTT, "_initialize_pool", hang)
+
+        loop_a = asyncio.new_event_loop()
+
+        async def make():
+            return VoxistSTT(api_key="test_key")
+
+        stt = loop_a.run_until_complete(make())
+        assert stt._init_task is not None and not stt._init_task.done()
+        loop_a.close()
+
+        # Give the plugin things that MUST still be cleaned up.
+        fake_stream = AsyncMock()
+        stt._live_streams.add(fake_stream)
+        session = AsyncMock()
+        session.closed = False
+        stt._session = session
+        stt._owns_session = True
+
+        async def close():
+            await stt.aclose()
+
+        # Without the guard this dies on the init task (its future belongs
+        # to the closed loop A) and neither the stream nor the session is
+        # ever closed.
+        asyncio.run(close())
+
+        fake_stream.aclose.assert_awaited_once()
+        session.close.assert_awaited_once()
+        assert stt._closed is True
+
+    @pytest.mark.asyncio
+    async def test_aclose_completes_when_a_cleanup_step_fails(self):
+        """Best-effort-complete: a failing base-class close must not stop
+        the owned session from being closed (and must not re-raise -
+        aclose runs in finally blocks where an exception would mask the
+        caller's original error and leak everything after it)."""
+        stt = VoxistSTT(api_key="test_key")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        session = AsyncMock()
+        session.closed = False
+        stt._session = session
+        stt._owns_session = True
+
+        with patch(
+            "livekit.agents.stt.STT.aclose",
+            AsyncMock(side_effect=RuntimeError("base close boom")),
+        ):
+            await stt.aclose()  # must not raise
+
+        session.close.assert_awaited_once()
+
+
+class TestStreamAfterClose:
+    """
+    [13] stream() on a closed plugin is a programming error and must fail
+    at the call site, immediately - not 6 seconds later after livekit's
+    retry machinery burned its budget against a plugin that can never dial.
+    """
+
+    @pytest.mark.asyncio
+    async def test_stream_after_aclose_raises_immediately(self):
+        stt = VoxistSTT(api_key="test_key")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+        await stt.aclose()
+
+        with pytest.raises(RuntimeError, match="closed VoxistSTT"):
+            stt.stream()
+
+    @pytest.mark.asyncio
+    async def test_stream_before_aclose_still_works(self):
+        stt = VoxistSTT(api_key="test_key", base_url="ws://127.0.0.1:9/ws")
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        stream = stt.stream(
+            conn_options=APIConnectOptions(
+                max_retry=0, retry_interval=0.1, timeout=1.0
+            )
+        )
+        try:
+            assert stream in stt._live_streams
+        finally:
+            await stream.aclose()
+            if stream._task.done() and not stream._task.cancelled():
+                with contextlib.suppress(Exception):
+                    stream._task.exception()
+            await stt.aclose()
+
+
+class _TokenOnlyServer:
+    """
+    A deployment whose HTTPS token endpoint is healthy but whose WebSocket
+    path is broken (a proxy stripping the Upgrade header): /websocket hands
+    out a perfectly valid-looking token URL, /ws answers plain HTTP 200.
+    """
+
+    def __init__(self) -> None:
+        self.host = "127.0.0.1"
+        self.port = 0
+        self.ws_attempts = 0
+        self._app = web.Application()
+        self._app.router.add_get("/websocket", self._token)
+        self._app.router.add_get("/ws", self._not_a_websocket)
+        self._runner: web.AppRunner | None = None
+
+    async def _token(self, request):
+        return web.json_response(
+            {"url": f"ws://{self.host}:{self.port}/ws?token=tok"}
+        )
+
+    async def _not_a_websocket(self, request):
+        self.ws_attempts += 1
+        return web.Response(text="the proxy ate your Upgrade header")
+
+    async def start(self) -> None:
+        self._runner = web.AppRunner(self._app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, self.host, self.port)
+        await site.start()
+        assert site._server is not None
+        self.port = site._server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        if self._runner is not None:
+            await self._runner.cleanup()
+
+
+@pytest.mark.no_auto_mock_token
+class TestWebSocketReachabilityValidation:
+    """
+    [14] The warm-up's token pre-fetch is plain HTTPS, so it succeeds on
+    deployments where the WS path is blocked. The explicit readiness paths
+    (wait_for_initialization / __aenter__) must therefore prove the WS path
+    with one short-lived dial - once per plugin, never per stream.
+    """
+
+    @pytest.mark.asyncio
+    async def test_readiness_dials_the_ws_path_exactly_once(
+        self, mock_voxist_server
+    ):
+        stt = VoxistSTT(
+            api_key="test_key",
+            base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
+        )
+
+        assert await stt.wait_for_initialization(timeout=5.0) is True
+        assert stt.is_ready
+        assert mock_voxist_server.connections_count == 1, (
+            "readiness must include a real WS dial, not just the token fetch"
+        )
+
+        # The probe is cached: repeated readiness checks must not open
+        # another server-side engine session.
+        assert await stt.wait_for_initialization(timeout=5.0) is True
+        assert mock_voxist_server.connections_count == 1
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_ws_blocked_deployment_fails_readiness(self):
+        """The scenario the old initialize() caught and the token-only
+        warm-up missed: token endpoint healthy, WS path dead. Readiness
+        must be False, is_ready must agree, and __aenter__ must raise
+        InitializationError - not report a 'healthy' plugin whose every
+        real call will fail."""
+        from livekit.plugins.voxist.exceptions import InitializationError
+
+        server = _TokenOnlyServer()
+        await server.start()
+        try:
+            stt = VoxistSTT(
+                api_key="any_key",
+                base_url=f"ws://{server.host}:{server.port}/ws",
+            )
+
+            assert await stt.wait_for_initialization(timeout=5.0) is False
+            assert server.ws_attempts >= 1, "the WS path was actually probed"
+            assert stt.is_ready is False
+            assert isinstance(
+                stt.initialization_error, VoxistConnectionError
+            ), f"got {stt.initialization_error!r}"
+
+            with pytest.raises(InitializationError):
+                await stt.__aenter__()
+
+            await stt.aclose()
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_validate_websocket_false_keeps_readiness_token_only(
+        self, mock_voxist_server
+    ):
+        """The opt-out restores the pre-[14] token-only semantics."""
+        stt = VoxistSTT(
+            api_key="test_key",
+            base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
+            validate_websocket=False,
+        )
+
+        assert await stt.wait_for_initialization(timeout=5.0) is True
+        assert mock_voxist_server.connections_count == 0, (
+            "validate_websocket=False must not dial"
+        )
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_background_warmup_alone_never_dials(self, mock_voxist_server):
+        """The fire-and-forget warm-up stays token-only: each WS dial opens
+        a real ASR engine session server-side, a cost only the explicit
+        readiness paths may incur (and only once)."""
+        stt = VoxistSTT(
+            api_key="test_key",
+            base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
+        )
+        assert stt._init_task is not None
+        with contextlib.suppress(Exception):
+            await stt._init_task
+
+        assert mock_voxist_server.token_requests_count == 1
+        assert mock_voxist_server.connections_count == 0, (
+            "the background warm-up must not open engine sessions"
+        )
+
         await stt.aclose()

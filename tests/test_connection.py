@@ -134,6 +134,51 @@ class TestStaleCachedTokenRedial:
         assert len(session.get_calls) == 1
 
     @pytest.mark.asyncio
+    async def test_byte_identical_refetched_token_still_gets_one_redial(self):
+        """
+        [3] JWTs have one-second iat/exp granularity: a transient 401
+        (token-store propagation lag, gateway restart) followed by a refetch
+        in the same second yields a byte-identical token - and a server
+        reusing tokens within validity always returns the same URL. Neither
+        is proof of a bad key: the redial must happen (bounded by the
+        attempt counter, never by token comparison) and the stream survives.
+        """
+        ws = object()
+        session = FakeSession(
+            responses=[token_response("same")],
+            ws_results=[handshake_error(401), ws],
+        )
+        dialer = make_dialer(session)
+        prime_cache(dialer, "same")
+
+        result = await dialer.dial("fr", 16000)
+
+        assert result is ws, "the stream must survive a transient 401"
+        assert len(session.ws_calls) == 2, "one redial with the refetched token"
+        assert "token=same" in session.ws_calls[1][0]
+        assert len(session.get_calls) == 1, "exactly one refetch"
+
+    @pytest.mark.asyncio
+    async def test_revoked_key_fails_fast_at_the_refetch_exchange(self):
+        """
+        [3] A genuinely revoked key still fails fast without the
+        identical-token heuristic: the token EXCHANGE itself 401s during
+        the refetch and raises AuthenticationError directly - no redial.
+        """
+        session = FakeSession(
+            responses=[FakeResponse(status=401)],
+            ws_results=[handshake_error(401)],
+        )
+        dialer = make_dialer(session)
+        prime_cache(dialer, "cached")
+
+        with pytest.raises(AuthenticationError):
+            await dialer.dial("fr", 16000)
+
+        assert len(session.ws_calls) == 1, "no redial with a rejected key"
+        assert len(session.get_calls) == 1
+
+    @pytest.mark.asyncio
     async def test_non_auth_handshake_failure_does_not_refetch(self):
         session = FakeSession(ws_results=[handshake_error(500)])
         dialer = make_dialer(session)
@@ -204,6 +249,119 @@ class TestTokenExchangeErrorMapping:
     @pytest.mark.asyncio
     async def test_non_object_json_maps_to_connection_error(self):
         session = FakeSession(responses=[FakeResponse(payload=["not", "a", "dict"])])
+        dialer = make_dialer(session)
+
+        with pytest.raises(ConnectionError):
+            await dialer._get_token_url()
+
+    @pytest.mark.asyncio
+    async def test_unenumerated_body_failure_maps_to_connection_error(self):
+        """[5] UnicodeDecodeError is outside the enumerated tuple; the
+        catch-all must map it to our retryable ConnectionError instead of
+        letting it kill the stream with zero retries."""
+        session = FakeSession(
+            responses=[
+                FakeResponse(
+                    json_exc=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")
+                )
+            ]
+        )
+        dialer = make_dialer(session)
+
+        with pytest.raises(ConnectionError, match="unexpectedly"):
+            await dialer._get_token_url()
+
+    @pytest.mark.asyncio
+    async def test_dial_unenumerated_failure_maps_to_connection_error(self):
+        """[5] Same audit for dial(): an exotic exception from the
+        handshake must not escape unmapped."""
+        session = FakeSession(
+            ws_results=[UnicodeDecodeError("utf-8", b"\xff", 0, 1, "bad")]
+        )
+        dialer = make_dialer(session)
+        prime_cache(dialer, "cached")
+
+        with pytest.raises(ConnectionError, match="unexpectedly"):
+            await dialer.dial("fr", 16000)
+
+    @pytest.mark.asyncio
+    async def test_auth_error_is_never_double_wrapped(self):
+        """[5] Our own AuthenticationError must pass through the catch-all
+        untouched - wrapping it into ConnectionError would turn a fatal
+        credential failure into an endless retry loop."""
+        session = FakeSession(responses=[FakeResponse(status=401)])
+        dialer = make_dialer(session)
+
+        with pytest.raises(AuthenticationError):
+            await dialer._get_token_url()
+
+    @pytest.mark.asyncio
+    async def test_status_connection_error_is_never_double_wrapped(self):
+        """[5] Our own ConnectionError from the status check must surface
+        as-is, not re-wrapped by the catch-all."""
+        session = FakeSession(responses=[FakeResponse(status=503)])
+        dialer = make_dialer(session)
+
+        with pytest.raises(ConnectionError) as exc_info:
+            await dialer._get_token_url()
+        assert str(exc_info.value) == "Token exchange failed with status 503"
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_never_swallowed_by_the_exchange(self):
+        """[5] CancelledError derives from BaseException (3.10+), so no
+        `except Exception` clause may absorb it."""
+        session = FakeSession(
+            responses=[FakeResponse(enter_exc=asyncio.CancelledError())]
+        )
+        dialer = make_dialer(session)
+
+        with pytest.raises(asyncio.CancelledError):
+            await dialer._get_token_url()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_is_never_swallowed_by_the_dial(self):
+        session = FakeSession(ws_results=[asyncio.CancelledError()])
+        dialer = make_dialer(session)
+        prime_cache(dialer, "cached")
+
+        with pytest.raises(asyncio.CancelledError):
+            await dialer.dial("fr", 16000)
+
+
+@pytest.mark.no_auto_mock_token
+class TestMalformedTokenUrl:
+    """
+    [4] A malformed 'url' in the token response must be rejected AT THE
+    EXCHANGE as our ConnectionError - not crash dial() later with an
+    unmapped TypeError, which livekit treats as instant death (no retries,
+    no error event).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            123,
+            ["wss://host/ws"],
+            {"nested": "wss://host/ws"},
+            True,
+            "https://host/ws?token=t",
+            "not-a-url",
+        ],
+        ids=["int", "list", "dict", "bool", "http-scheme", "garbage"],
+    )
+    async def test_malformed_url_maps_to_connection_error(self, url):
+        session = FakeSession(responses=[FakeResponse(payload={"url": url})])
+        dialer = make_dialer(session)
+
+        with pytest.raises(ConnectionError, match="malformed url"):
+            await dialer._get_token_url()
+
+        assert dialer._token_url is None, "a malformed url must not be cached"
+
+    @pytest.mark.asyncio
+    async def test_empty_url_maps_to_connection_error(self):
+        session = FakeSession(responses=[FakeResponse(payload={"url": ""})])
         dialer = make_dialer(session)
 
         with pytest.raises(ConnectionError):

@@ -16,11 +16,15 @@ policy.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import ssl
+import threading
 import time
+import weakref
 from base64 import urlsafe_b64decode
 from binascii import Error as BinasciiError
+from collections import deque
 from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
@@ -36,6 +40,111 @@ TOKEN_REFRESH_BUFFER_SECONDS = 300.0
 # per plugin instance via VoxistSTT(connection_timeout=...), which threads
 # through to VoxistDialer(connection_timeout=...).
 DIAL_TIMEOUT_SECONDS = 10.0
+
+# Ceiling on dial ATTEMPTS against one gateway, restoring the bound the
+# deleted connection pool used to provide (30 reconnects/minute). Overridable
+# per dialer via VoxistDialer(max_dials_per_window=...).
+MAX_DIALS_PER_WINDOW = 30
+DIAL_RATE_LIMIT_WINDOW_SECONDS = 60.0
+
+
+class _DialRateLimiter:
+    """
+    Sliding-window cap on dial attempts against one gateway credential.
+
+    Why a limiter exists at all: without the pool, every stream dials
+    independently under livekit's per-stream retry, with no coordination. A
+    gateway outage with N concurrent streams therefore produces N x
+    max_retry dials (plus one HTTPS token exchange per 401-rejected cached
+    token) in a few seconds - against a gateway that may rate-limit or ban
+    the key, turning a transient outage into a much longer one.
+
+    Why PROCESS-WIDE (see _limiter_for) rather than per dialer instance: the
+    resource being protected is the gateway's own rate-limit/ban state for
+    one API key, and that budget does not grow just because a process
+    happens to host several VoxistSTT instances. A per-dialer limit would
+    silently multiply by the instance count, which is exactly the herd this
+    is meant to prevent. The cost, stated plainly: a process running many
+    plugins against the same gateway shares one budget, so a mass restart
+    can hit the limit - and then fails as a retryable ConnectionError that
+    livekit re-attempts later, which is the intended behaviour.
+
+    Thread-safe (a plain threading.Lock, never held across an await) because
+    one gateway's limiter can legitimately be shared by dialers living on
+    different event loops in different threads.
+    """
+
+    def __init__(self, *, max_dials: int, window: float) -> None:
+        self._max_dials = max_dials
+        self._window = window
+        self._attempts: deque[float] = deque()
+        self._lock = threading.Lock()
+        self._last_warned_at: float | None = None
+
+    @property
+    def max_dials(self) -> int:
+        return self._max_dials
+
+    @property
+    def window(self) -> float:
+        return self._window
+
+    def try_acquire(self, now: float) -> bool:
+        """Charge one dial attempt, or return False when the window is full."""
+        with self._lock:
+            cutoff = now - self._window
+            while self._attempts and self._attempts[0] <= cutoff:
+                self._attempts.popleft()
+
+            if len(self._attempts) >= self._max_dials:
+                # Throttled to one line per window: a herd would otherwise
+                # log once per rejected dial.
+                if (
+                    self._last_warned_at is None
+                    or now - self._last_warned_at >= self._window
+                ):
+                    self._last_warned_at = now
+                    logger.warning(
+                        f"Dial rate limit reached: {self._max_dials} dial "
+                        f"attempts in {self._window:.0f}s; further dials fail "
+                        "fast (retryable) until the window clears"
+                    )
+                return False
+
+            self._attempts.append(now)
+            return True
+
+
+# Process-wide registry, keyed by gateway URL + a fingerprint of the API key
+# (never the key itself). Values are weak: the limiter lives exactly as long
+# as some VoxistDialer holds it, so the registry cannot grow without bound
+# and a fully torn-down deployment leaves no state behind.
+_dial_limiters: weakref.WeakValueDictionary[str, _DialRateLimiter] = (
+    weakref.WeakValueDictionary()
+)
+_dial_limiters_lock = threading.Lock()
+
+
+def _limiter_for(
+    *, base_url: str, api_key: str, max_dials: int, window: float
+) -> _DialRateLimiter:
+    key = (
+        f"{base_url}|{hashlib.sha256(api_key.encode()).hexdigest()[:16]}"
+        f"|{max_dials}/{window}"
+    )
+    with _dial_limiters_lock:
+        limiter = _dial_limiters.get(key)
+        if limiter is None:
+            limiter = _DialRateLimiter(max_dials=max_dials, window=window)
+            _dial_limiters[key] = limiter
+        return limiter
+
+
+def reset_dial_rate_limits() -> None:
+    """Forget every shared dial limiter (test seam; not part of the plugin
+    lifecycle - dialers built afterwards get fresh windows)."""
+    with _dial_limiters_lock:
+        _dial_limiters.clear()
 
 
 class VoxistDialer:
@@ -58,6 +167,8 @@ class VoxistDialer:
         ssl_context: ssl.SSLContext | None = None,
         heartbeat_interval: float = 30.0,
         connection_timeout: float = DIAL_TIMEOUT_SECONDS,
+        max_dials_per_window: int = MAX_DIALS_PER_WINDOW,
+        dial_rate_limit_window: float = DIAL_RATE_LIMIT_WINDOW_SECONDS,
     ) -> None:
         self._session = session
         self._base_url = base_url
@@ -65,6 +176,16 @@ class VoxistDialer:
         self._api_key_header = api_key_header
         self._heartbeat_interval = heartbeat_interval
         self._connection_timeout = connection_timeout
+
+        # Shared with every other dialer aimed at the same gateway with the
+        # same credential (see _DialRateLimiter for the scope rationale).
+        # Strong reference: the limiter's lifetime is this dialer's.
+        self._rate_limiter = _limiter_for(
+            base_url=base_url,
+            api_key=api_key,
+            max_dials=max_dials_per_window,
+            window=dial_rate_limit_window,
+        )
 
         # Certificate verification is never disabled. An explicit context is
         # the only way to trust a private CA; without one, aiohttp's default
@@ -144,8 +265,12 @@ class VoxistDialer:
                 something a retry can fix.
             ConnectionError: The exchange failed for transport reasons.
         """
-        now = time.time()
         async with self._token_lock:
+            # The clock is read INSIDE the lock: waiting for a contended lock
+            # (another stream mid-exchange) can take seconds, and a timestamp
+            # captured before the wait would judge freshness - and record the
+            # cache expiry - against a time that is already stale.
+            now = time.time()
             if (
                 self._token_url
                 and now < self._token_expires_at - TOKEN_REFRESH_BUFFER_SECONDS
@@ -236,7 +361,14 @@ class VoxistDialer:
                 )
 
             self._token_url = token_url
-            self._token_expires_at = self._token_expiry_from_url(token_url, now)
+            # Re-read the clock: `now` predates the HTTPS round-trip, which
+            # can itself take seconds (up to connection_timeout). The expiry
+            # sanity-clamps in _token_expiry_from_url compare the server's exp
+            # claim against local time, so they must use the time the token
+            # actually arrived.
+            self._token_expires_at = self._token_expiry_from_url(
+                token_url, time.time()
+            )
             return token_url
 
     async def _invalidate_token(self, rejected_url: str) -> None:
@@ -253,6 +385,31 @@ class VoxistDialer:
                 self._token_url = None
                 self._token_expires_at = 0.0
 
+    def _charge_dial_attempt(self) -> None:
+        """
+        Charge one dial attempt against the shared window, or fail retryably.
+
+        Called once per gateway dial ATTEMPT - before the token exchange of
+        the first attempt, and again before the one post-401 redial - so the
+        extra HTTPS token exchange a rejected cached token triggers is
+        bounded by the same budget as the sockets themselves.
+
+        Raises:
+            ConnectionError: The window is full. Deliberately our retryable
+                mapping: the stream turns it into APIConnectionError, so
+                livekit re-attempts later on its own backoff instead of the
+                caller blocking here (no sleeps on this path).
+        """
+        if not self._rate_limiter.try_acquire(time.monotonic()):
+            raise ConnectionError(
+                "Dial rate limit reached for this gateway: "
+                f"{self._rate_limiter.max_dials} dial attempts per "
+                f"{self._rate_limiter.window:.0f}s (shared process-wide per "
+                "gateway credential). Refusing to dial so the gateway is not "
+                "hammered; this is retryable and will clear as the window "
+                "slides."
+            )
+
     async def dial(
         self, language: str, sample_rate: int
     ) -> aiohttp.ClientWebSocketResponse:
@@ -266,8 +423,11 @@ class VoxistDialer:
         Raises:
             AuthenticationError: The key (or token) was rejected even with a
                 freshly exchanged token.
-            ConnectionError: The dial failed for transport reasons.
+            ConnectionError: The dial failed for transport reasons, or the
+                shared dial rate limit is exhausted (see
+                _charge_dial_attempt).
         """
+        self._charge_dial_attempt()
         token_url = await self._get_token_url()
         refetched_token = False
 
@@ -320,6 +480,7 @@ class VoxistDialer:
                 # raises AuthenticationError directly.
                 if not refetched_token:
                     refetched_token = True
+                    self._charge_dial_attempt()
                     await self._invalidate_token(token_url)
                     token_url = await self._get_token_url()
                     logger.info(
@@ -341,15 +502,21 @@ class VoxistDialer:
                 # aiohttp raises RuntimeError('Session is closed') when a
                 # dial races aclose(); map it so livekit can retry cleanly.
                 raise ConnectionError(f"WebSocket dial failed: {e}") from e
-            except (AuthenticationError, ConnectionError):
-                # Defensive: never double-wrap our own mapped errors.
-                raise
             except Exception as e:
                 # Catch-all for anything the enumeration above missed
                 # (e.g. a UnicodeDecodeError surfacing from the handshake):
                 # an unmapped exception kills the stream with zero retries.
                 # asyncio.CancelledError derives from BaseException
                 # (Python 3.8+), so cancellation is never swallowed here.
+                #
+                # No `except (AuthenticationError, ConnectionError): raise`
+                # double-wrap guard: this try covers ONLY ws_connect, which
+                # raises neither. The token exchange and the rate-limit
+                # charge - the two things that DO raise our own types - are
+                # outside it (the refetch inside the 401 handler raises out
+                # of the handler, which sibling except clauses never see).
+                # Widening this try would require reinstating that guard
+                # ABOVE this clause.
                 raise ConnectionError(
                     f"WebSocket dial failed unexpectedly: {e!r}"
                 ) from e

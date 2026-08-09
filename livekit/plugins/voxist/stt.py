@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import os
 import ssl
+import time
 import weakref
 from enum import Enum
 
@@ -36,6 +37,11 @@ class InitializationState(Enum):
         PENDING -> RUNNING -> COMPLETED (success)
         PENDING -> RUNNING -> FAILED (error)
         PENDING -> NOT_STARTED (no event loop)
+        FAILED -> NOT_STARTED (transient cause, retry cooldown elapsed)
+
+    FAILED is NOT terminal for transient causes: see
+    VoxistSTT.wait_for_initialization and VoxistSTT._failure_is_permanent.
+    A rejected credential is the exception - it stays FAILED.
 
     Use VoxistSTT.initialization_state property to check current state.
     """
@@ -78,6 +84,10 @@ class VoxistSTT(STT):
             PENDING -> RUNNING -> COMPLETED (success path)
             PENDING -> RUNNING -> FAILED (error path)
             NOT_STARTED (no event loop, warm-up runs on demand)
+            FAILED -> NOT_STARTED (transient failure, cooldown elapsed:
+                the next wait_for_initialization() re-attempts, so one
+                transport blip does not brick the instance. A rejected
+                credential stays FAILED.)
 
     Example:
         # Minimal usage
@@ -253,8 +263,17 @@ class VoxistSTT(STT):
         self._dialer: VoxistDialer | None = None
         self._dialer_lock = asyncio.Lock()
         self._closed = False
+        # The loop the session is bound to, as recorded by us (see
+        # _session_loop): authoritative for plugin-owned sessions, pinned at
+        # first use for a caller-supplied one whose binding is unreadable.
+        self._session_bound_loop: asyncio.AbstractEventLoop | None = None
         self._validate_websocket = validate_websocket
         self._ws_validated = False
+        # Dedicated lock, NOT _dialer_lock: the probe calls _ensure_dialer,
+        # which takes _dialer_lock, and asyncio.Lock is not reentrant.
+        self._probe_lock = asyncio.Lock()
+        self._probe_failed_at: float | None = None
+        self._probe_error: Exception | None = None
 
         # Live streams, tracked weakly so a stream that ends normally
         # disappears on its own. aclose() closes these BEFORE the shared
@@ -267,6 +286,7 @@ class VoxistSTT(STT):
         self._init_task: asyncio.Task | None = None
         self._init_error: Exception | None = None
         self._init_state = InitializationState.PENDING
+        self._init_failed_at: float | None = None
 
         logger.info(
             f"VoxistSTT initialized: language={language}, "
@@ -294,6 +314,60 @@ class VoxistSTT(STT):
                 "on first use instead of pre-fetched"
             )
 
+    # How long a FAILED readiness result is trusted before a readiness call
+    # is allowed to re-attempt (see _may_retry_failed_readiness). Per
+    # instance: tests override it, and so may a deployment that wants a
+    # tighter or looser probe cadence.
+    READINESS_RETRY_COOLDOWN_SECONDS = 30.0
+
+    @staticmethod
+    def _now() -> float:
+        """Monotonic clock seam for the readiness cooldown (tests override it
+        per instance instead of tampering with the global clock, which asyncio
+        itself depends on)."""
+        return time.monotonic()
+
+    def _record_init_failure(self, exc: Exception) -> None:
+        """Move to FAILED, recording the cause and WHEN it happened.
+
+        The timestamp is what makes FAILED non-terminal for transient causes:
+        see _may_retry_failed_readiness.
+        """
+        self._init_error = exc
+        self._init_state = InitializationState.FAILED
+        self._init_failed_at = self._now()
+
+    @staticmethod
+    def _failure_is_permanent(exc: Exception | None) -> bool:
+        """
+        Whether a readiness failure can be re-attempted, or is settled.
+
+        The distinction that matters ([2]):
+
+        - CREDENTIAL REJECTED (AuthenticationError): the gateway looked at
+          the key and said no. Re-probing cannot change that answer, and
+          hammering a rejected key is exactly how a key gets banned. Sticky
+          for the instance's lifetime - fix the key and build a new plugin.
+        - TRANSIENT TRANSPORT FAILURE (everything else: our ConnectionError
+          from a refused/reset dial, a TimeoutError, a proxy hiccup, an
+          unexpected error): the deployment may well be reachable a moment
+          later. Blocking readiness forever on one blip bricked the plugin
+          even though stream() would have dialed and transcribed fine.
+        """
+        return isinstance(exc, AuthenticationError)
+
+    def _may_retry_failed_readiness(self) -> bool:
+        """True when a FAILED state is stale enough to re-attempt."""
+        if self._failure_is_permanent(self._init_error):
+            return False
+        if self._init_failed_at is None:
+            # FAILED was set without going through _record_init_failure
+            # (a test poking _init_state, say): no timestamp, no cooldown to
+            # measure - treat it as settled rather than re-probing blindly.
+            return False
+        elapsed = self._now() - self._init_failed_at
+        return elapsed >= self.READINESS_RETRY_COOLDOWN_SECONDS
+
     @staticmethod
     def _retrieve_init_exception(task: asyncio.Task) -> None:
         """Retrieve (and debug-log) the init task's exception so GC never
@@ -308,13 +382,66 @@ class VoxistSTT(STT):
                 "recorded in initialization_state/initialization_error)"
             )
 
-    @staticmethod
-    def _session_loop(
+    # Warn once per process, not once per dial: an aiohttp release that
+    # renames ClientSession._loop would otherwise flood every log line.
+    _loop_introspection_warned = False
+
+    @classmethod
+    def _introspect_session_loop(
+        cls,
         session: aiohttp.ClientSession,
     ) -> asyncio.AbstractEventLoop | None:
-        """The loop an aiohttp session is bound to, or None if undeterminable."""
+        """
+        The loop an aiohttp session is bound to by reading its private
+        attribute, or None if that cannot be determined.
+
+        Failing LOUDLY on purpose. This used to return None silently, which
+        disabled BOTH loop guards at once: no defunct-loop rebuild and no
+        alive-foreign-loop diagnosis. On an aiohttp release that renames the
+        attribute, a plugin built under one asyncio.run() and used under
+        another then died inside ws_connect with
+        RuntimeError('Event loop is closed'), mapped to a generic retryable
+        transport error - the user chasing a network problem that was really
+        a loop-affinity problem.
+
+        Callers must not depend on this for plugin-owned sessions: those
+        record their loop at creation (_session_bound_loop), which no aiohttp
+        rename can break. This introspection is only the fallback for a
+        caller-supplied session whose binding predates us.
+        """
         loop = getattr(session, "_loop", None)
-        return loop if isinstance(loop, asyncio.AbstractEventLoop) else None
+        if isinstance(loop, asyncio.AbstractEventLoop):
+            return loop
+        if not cls._loop_introspection_warned:
+            cls._loop_introspection_warned = True
+            logger.warning(
+                "Cannot determine which event loop this aiohttp.ClientSession "
+                f"is bound to (aiohttp {aiohttp.__version__} does not expose "
+                "ClientSession._loop as expected). Loop-affinity checks fall "
+                "back to first-use pinning for caller-supplied sessions: a "
+                "session already bound to another loop before this plugin "
+                "saw it can no longer be diagnosed, and its dials will fail "
+                "as transport errors instead. Plugin-owned sessions are "
+                "unaffected. Please report this aiohttp incompatibility."
+            )
+        return None
+
+    def _session_loop(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> asyncio.AbstractEventLoop | None:
+        """
+        The loop `session` is bound to, preferring our own record over
+        aiohttp introspection.
+
+        Returns None only when the binding is genuinely unknown - which,
+        after the first use of a caller-supplied session, cannot happen:
+        _ensure_dialer pins it (conservatively, to the loop that first used
+        it) precisely so the foreign-loop guard is never silently disabled.
+        """
+        if self._session_bound_loop is not None and session is self._session:
+            return self._session_bound_loop
+        return self._introspect_session_loop(session)
 
     async def _ensure_dialer(self) -> VoxistDialer:
         """
@@ -334,9 +461,23 @@ class VoxistSTT(STT):
           sharing one VoxistSTT): multi-loop sharing is unsupported, not
           silently accommodated. Destroying the session here would leak
           connectors, thrash the token cache and sabotage the healthy
-          loop's streams, so the session is left untouched and a mapped
-          (retryable-but-informative) error is raised: create one
-          VoxistSTT instance per event loop.
+          loop's streams, so the session is left untouched and RuntimeError
+          is raised: create one VoxistSTT instance per event loop.
+
+        Why RuntimeError and not our ConnectionError for that last case
+        ([8]): the stream maps ConnectionError to a retryable
+        APIConnectionError, so livekit burned its whole retry schedule -
+        three misleading recoverable=True events - on a programming error
+        that cannot change between attempts, then reported a wrapper instead
+        of the real cause. A non-APIError takes _main_task's terminal
+        branch: exactly one recoverable=False event and the precise message.
+        Same precedent as stream()-after-aclose().
+
+        Which loop a session is bound to is determined WITHOUT aiohttp
+        introspection whenever possible: a plugin-owned session records its
+        loop at creation, and a caller-supplied session is pinned to the loop
+        that first used it. See _introspect_session_loop for what happens
+        when neither is available.
         """
         async with self._dialer_lock:
             if self._closed:
@@ -350,9 +491,24 @@ class VoxistSTT(STT):
             running = asyncio.get_running_loop()
             if self._session is not None:
                 bound_loop = self._session_loop(self._session)
-                defunct = self._session.closed or (
-                    bound_loop is not None and bound_loop.is_closed()
-                )
+                if bound_loop is None:
+                    # Binding unknown - only reachable for a CALLER-SUPPLIED
+                    # session whose aiohttp binding is unreadable, because a
+                    # plugin-owned session records its loop at creation
+                    # (which is the conservative half of [11]: an owned
+                    # session is rebuilt for the running loop rather than
+                    # reused possibly-dead, with no introspection involved).
+                    # We cannot rebuild someone else's session, so pin it to
+                    # the loop that first used it: the foreign-loop guard
+                    # stays armed for every later loop instead of being
+                    # silently disabled. _introspect_session_loop has
+                    # already logged the incompatibility.
+                    assert not self._owns_session, (
+                        "a plugin-owned session always has a recorded loop"
+                    )
+                    self._session_bound_loop = running
+                    bound_loop = running
+                defunct = self._session.closed or bound_loop.is_closed()
                 if defunct:
                     if not self._owns_session:
                         raise VoxistConnectionError(
@@ -363,6 +519,7 @@ class VoxistSTT(STT):
                     old, old_loop = self._session, bound_loop
                     self._session = None
                     self._dialer = None
+                    self._session_bound_loop = None
                     if not old.closed:
                         if old_loop is running:
                             await old.close()
@@ -376,12 +533,12 @@ class VoxistSTT(STT):
                                 "bound to a defunct event loop; it cannot "
                                 "be closed from the current loop"
                             )
-                elif bound_loop is not None and bound_loop is not running:
+                elif bound_loop is not running:
                     # Alive-but-different loop: do NOT destroy the healthy
-                    # loop's session. The stream wraps this into a retryable
-                    # APIConnectionError, so the caller gets an informative
-                    # failure while the other loop keeps working.
-                    raise VoxistConnectionError(
+                    # loop's session. RuntimeError (not our ConnectionError)
+                    # so livekit fails fast with this exact message instead
+                    # of retrying a programming error - see the docstring.
+                    raise RuntimeError(
                         "VoxistSTT is bound to a different running event "
                         "loop; sharing one instance across live loops is "
                         "unsupported - create one VoxistSTT per event loop"
@@ -392,6 +549,9 @@ class VoxistSTT(STT):
                 if self._session is None:
                     self._session = aiohttp.ClientSession()
                     self._owns_session = True
+                    # Recorded, not introspected: no aiohttp rename can break
+                    # the loop guards for a session we created ourselves.
+                    self._session_bound_loop = running
                 self._dialer = VoxistDialer(
                     session=self._session,
                     base_url=self._base_url,
@@ -452,8 +612,9 @@ class VoxistSTT(STT):
             logger.debug("Token pre-fetch complete (state: COMPLETED)")
         except AuthenticationError as e:
             # Store and re-raise critical errors - never swallow auth failures
-            self._init_error = e
-            self._init_state = InitializationState.FAILED
+            # _record_init_failure stamps the failure time so the cooldown
+            # logic can tell a transient blip from a rejected credential.
+            self._record_init_failure(e)
             logger.error(
                 f"Authentication failed during the token pre-fetch: {e} "
                 "(state: FAILED)"
@@ -461,8 +622,7 @@ class VoxistSTT(STT):
             raise
         except Exception as e:
             # Store error for later access, mark as failed
-            self._init_error = e
-            self._init_state = InitializationState.FAILED
+            self._record_init_failure(e)
             logger.error(f"Failed to pre-fetch WebSocket token: {e} (state: FAILED)")
             # Don't re-raise - allow stream() to attempt on-demand initialization
 
@@ -480,23 +640,62 @@ class VoxistSTT(STT):
         Cost, weighed deliberately: the gateway opens a real ASR engine
         session server-side on connect (lang rides the URL). One extra
         short-lived engine session per PLUGIN STARTUP is acceptable; per
-        stream it would not be - hence the _ws_validated cache (at most one
-        probe per plugin) and hence this living on the explicit readiness
-        paths, not in the fire-and-forget background warm-up.
+        stream it would not be - hence this living on the explicit readiness
+        paths, not in the fire-and-forget background warm-up, and hence the
+        budget enforced here.
+
+        Probe budget ([9] + [2]): AT MOST ONE PROBE IN FLIGHT, AND AT MOST
+        ONE PER COOLDOWN WINDOW. The old guard was a bare check-then-await-
+        then-set, so `asyncio.gather(wait_for_initialization(),
+        wait_for_initialization())` - or a health endpoint racing
+        `async with` - made both callers dial, opening two real sockets and
+        two server-side engine sessions. _probe_lock plus a re-check inside
+        it makes the success path exactly-once; _probe_failed_at makes the
+        FAILURE path at-most-once-per-cooldown, so the bounded re-probe that
+        keeps a transient blip from bricking the plugin cannot itself become
+        a dial loop.
 
         Raises whatever the dial raises (mapped ConnectionError /
-        AuthenticationError, or asyncio.TimeoutError from the bound); the
-        caller records it as an initialization failure.
+        AuthenticationError, or asyncio.TimeoutError from the bound), or a
+        ConnectionError replaying the last failure while the cooldown holds;
+        the caller records it as an initialization failure.
         """
         if self._ws_validated or not self._validate_websocket:
             return
-        dialer = await self._ensure_dialer()
-        language = self._config["language"]
-        assert isinstance(language, str)  # validated in __init__
-        ws = await asyncio.wait_for(
-            dialer.dial(language, 16000), timeout=timeout
-        )
-        self._ws_validated = True
+
+        async with self._probe_lock:
+            # Re-check under the lock: a racing caller may have completed the
+            # probe (or failed it) while we waited here.
+            if self._ws_validated:
+                return
+            if self._probe_failed_at is not None:
+                elapsed = self._now() - self._probe_failed_at
+                if elapsed < self.READINESS_RETRY_COOLDOWN_SECONDS:
+                    raise VoxistConnectionError(
+                        "WebSocket reachability probe failed "
+                        f"{elapsed:.1f}s ago; not re-probing for another "
+                        f"{self.READINESS_RETRY_COOLDOWN_SECONDS - elapsed:.1f}s "
+                        f"(last failure: {self._probe_error!r})"
+                    ) from self._probe_error
+
+            dialer = await self._ensure_dialer()
+            language = self._config["language"]
+            assert isinstance(language, str)  # validated in __init__
+            try:
+                ws = await asyncio.wait_for(
+                    dialer.dial(language, 16000), timeout=timeout
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Stamped so concurrent and subsequent callers share one
+                # cooldown window instead of each dialing again.
+                self._probe_failed_at = self._now()
+                self._probe_error = e
+                raise
+            self._ws_validated = True
+            self._probe_failed_at = None
+            self._probe_error = None
         try:
             await ws.close()
         except Exception as e:
@@ -708,6 +907,12 @@ class VoxistSTT(STT):
         though the token itself was fetched: a deployment whose WS path is
         blocked is not ready, whatever its HTTPS endpoint says.
 
+        FAILED reads as False even once the retry cooldown has elapsed: this
+        property is synchronous, so it cannot re-probe, and claiming
+        readiness it has not verified is exactly the lie [2] removed. A
+        transient failure becomes ready again on the next
+        `await wait_for_initialization()`, which does re-probe.
+
         Returns:
             True if ready, False otherwise
         """
@@ -728,6 +933,19 @@ class VoxistSTT(STT):
         _validate_websocket_path) so True means "a stream can actually
         connect", not merely "the HTTPS token endpoint answered".
 
+        FAILED is not terminal for transient causes ([2]). A single blip in
+        the one-shot WS probe used to brick the plugin forever: this method
+        returned False on its first line for the rest of the instance's life,
+        is_ready stayed False and check_initialization() kept raising, even
+        though stream() would have dialed and transcribed fine the moment the
+        blip cleared. So a FAILED state whose cause was a transient transport
+        failure is re-attempted once READINESS_RETRY_COOLDOWN_SECONDS have
+        passed since it was recorded, and success clears it. A rejected
+        credential (AuthenticationError) stays sticky - see
+        _failure_is_permanent for that distinction. The cooldown, and the
+        probe's own in-flight lock, bound the retry: at most one probe in
+        flight, and at most one per cooldown window.
+
         Args:
             timeout: Maximum time to wait in seconds (default: 30.0).
                 Bounds the token warm-up and the WS probe separately.
@@ -743,7 +961,25 @@ class VoxistSTT(STT):
                 logger.error(f"Init failed: {stt.initialization_error}")
         """
         if self._init_state == InitializationState.FAILED:
-            return False
+            if not self._may_retry_failed_readiness():
+                return False
+            # Cooldown elapsed on a transient failure: re-run readiness from
+            # scratch. NOT_STARTED routes into the on-demand warm-up below;
+            # the token exchange is cached, so this is cheap when the earlier
+            # failure was the probe rather than the token.
+            logger.info(
+                "Re-attempting readiness after a transient failure "
+                f"({self._init_error!r}); the "
+                f"{self.READINESS_RETRY_COOLDOWN_SECONDS:.0f}s cooldown has "
+                "elapsed"
+            )
+            self._init_state = InitializationState.NOT_STARTED
+            self._init_failed_at = None
+            # Cleared with the state: a recovered plugin reporting COMPLETED
+            # while initialization_error still holds the old blip would be
+            # the same kind of lie is_ready used to tell. A repeat failure
+            # records a fresh error through _record_init_failure.
+            self._init_error = None
 
         if self._init_state == InitializationState.NOT_STARTED:
             # No background task, initialize on demand
@@ -753,14 +989,14 @@ class VoxistSTT(STT):
                 # non-auth errors (streams may still succeed on demand), so
                 # the state - not the absence of an exception - is the result.
             except asyncio.TimeoutError:
-                self._init_error = asyncio.TimeoutError(
-                    f"Initialization timed out after {timeout}s"
+                self._record_init_failure(
+                    asyncio.TimeoutError(
+                        f"Initialization timed out after {timeout}s"
+                    )
                 )
-                self._init_state = InitializationState.FAILED
                 return False
             except Exception as e:
-                self._init_error = e
-                self._init_state = InitializationState.FAILED
+                self._record_init_failure(e)
                 return False
         elif (
             self._init_state != InitializationState.COMPLETED
@@ -773,13 +1009,15 @@ class VoxistSTT(STT):
                     timeout=timeout
                 )
             except asyncio.TimeoutError:
-                self._init_error = asyncio.TimeoutError(
-                    f"Initialization timed out after {timeout}s"
+                self._record_init_failure(
+                    asyncio.TimeoutError(
+                        f"Initialization timed out after {timeout}s"
+                    )
                 )
-                self._init_state = InitializationState.FAILED
                 return False
             except Exception:
-                # Error already stored in _init_error by _initialize_pool
+                # Error already stored (with its timestamp) by
+                # _initialize_pool's _record_init_failure
                 pass
 
         if self._init_state != InitializationState.COMPLETED:
@@ -791,8 +1029,7 @@ class VoxistSTT(STT):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._init_error = e
-            self._init_state = InitializationState.FAILED
+            self._record_init_failure(e)
             logger.error(
                 f"WebSocket reachability validation failed: {e!r} "
                 "(state: FAILED - the token endpoint works but the "
@@ -807,6 +1044,11 @@ class VoxistSTT(STT):
 
         Use this before operations that require successful initialization.
 
+        Synchronous, so it never re-probes: it reports the last VERIFIED
+        outcome. A transient failure is recoverable - the message says so -
+        and clears on the next `await wait_for_initialization()` once the
+        cooldown has elapsed. A rejected credential never clears.
+
         Raises:
             InitializationError: If initialization failed
 
@@ -815,8 +1057,20 @@ class VoxistSTT(STT):
             stream = stt.stream()
         """
         if self._init_state == InitializationState.FAILED:
+            if self._failure_is_permanent(self._init_error):
+                hint = (
+                    "The credential was rejected; this will not clear - fix "
+                    "the API key and build a new plugin instance."
+                )
+            else:
+                hint = (
+                    "This failure looks transient; "
+                    "await wait_for_initialization() re-probes once "
+                    f"{self.READINESS_RETRY_COOLDOWN_SECONDS:.0f}s have "
+                    "passed since it was recorded."
+                )
             raise InitializationError(
-                f"Plugin initialization failed: {self._init_error}"
+                f"Plugin initialization failed: {self._init_error}. {hint}"
             ) from self._init_error
 
     async def __aenter__(self) -> VoxistSTT:

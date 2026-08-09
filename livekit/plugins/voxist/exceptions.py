@@ -56,18 +56,18 @@ class ConnectionError(VoxistError):
 
 class ConnectionPoolExhaustedError(ConnectionError):
     """
-    Raised when all connections in the pool have failed.
+    DEPRECATED - never raised. Superseded by ConnectionError.
 
-    This indicates a systemic issue:
-    - Voxist API unavailable
-    - Network outage
-    - Invalid configuration affecting all connections
+    This dates from the connection pool, which no longer exists: the gateway
+    ends every session by closing the socket after "Done", so sockets cannot
+    be reused and each stream dials its own. With no pool there is nothing to
+    exhaust, and every dial or token-exchange failure is now a plain
+    ConnectionError.
 
-    Resolution:
-    - Check Voxist API status
-    - Verify network connectivity
-    - Review error logs for specific failure causes
-    - Consider increasing connection_timeout
+    Kept only so `except ConnectionPoolExhaustedError` in existing user code
+    still imports and still compiles. It subclasses ConnectionError, so code
+    that catches it already catches nothing narrower than what is raised -
+    catch ConnectionError instead.
     """
     pass
 
@@ -113,39 +113,33 @@ class ConfigurationError(VoxistError):
 
 class BackpressureError(VoxistError):
     """
-    Raised when WebSocket buffer is consistently full.
+    DEPRECATED - never raised. Backpressure is no longer an error condition.
 
-    This indicates:
-    - Sending audio faster than network can handle
-    - Server processing slower than audio rate
-    - Network congestion
+    Sustained inability to keep up with the input is handled inside the
+    stream: the input backlog is bounded and trimmed (oldest audio dropped,
+    flush sentinels preserved, drops rate-limit-logged) rather than raised.
+    A send that fails outright surfaces as ConnectionError, and a session
+    whose audio was consumed with nothing transcribable to show for it
+    surfaces as TranscriptLostError.
 
-    Resolution:
-    - Reduce chunk_duration_ms
-    - Increase connection_pool_size
-    - Check network bandwidth
+    Kept only so `except BackpressureError` in existing user code still
+    imports and still compiles.
     """
     pass
 
 
 class OwnershipViolationError(VoxistError):
     """
-    Raised when a stream attempts to modify connection state without ownership.
+    DEPRECATED - never raised. Superseded by single-owner sockets.
 
-    Security: VUL-003 mitigation
-    This error indicates a race condition where multiple streams are
-    attempting to access the same connection concurrently.
+    This dates from the connection pool, where several streams could contend
+    for one pooled connection and ownership had to be policed at runtime
+    (VUL-003). There is no pool: each stream dials, owns and closes exactly
+    one socket for its own lifetime, so there is no shared connection state
+    left to violate.
 
-    This is a programming error and should not occur in normal operation.
-    If this error is raised, it indicates:
-    - A bug in stream lifecycle management
-    - Improper connection pool usage
-    - Concurrent access to a connection
-
-    Resolution:
-    - Report this error - it indicates a bug in the plugin
-    - Ensure each stream exclusively owns its connection
-    - Check for improper connection sharing
+    Kept only so `except OwnershipViolationError` in existing user code still
+    imports and still compiles.
     """
     pass
 
@@ -185,9 +179,10 @@ class InitializationError(VoxistError):
     attempting to use it would result in undefined behavior.
 
     Common causes:
-    - Authentication failure during pool initialization
-    - Network issues preventing initial connection
-    - Invalid configuration detected at runtime
+    - Authentication failure during the startup token pre-fetch
+    - Network issues preventing the token exchange
+    - The WebSocket reachability probe failing on a deployment whose HTTPS
+      token endpoint works but whose WebSocket path is blocked
 
     Resolution:
     - Check initialization_error property for root cause

@@ -4,9 +4,11 @@ Production-ready LiveKit Speech-to-Text plugin for [Voxist](https://voxist.com) 
 
 ## Features
 
-- **Ultra-low latency:** < 300ms end-to-end with connection pooling
+- **Real-time streaming:** one WebSocket per stream, dialed on demand, with the
+  token exchange pre-fetched at startup so the first dial is not slowed by it
 - **Multi-language support:** French, English, German, Italian, Spanish, Dutch, Portuguese, Swedish
-- **Production-ready:** Auto-reconnection, error recovery, comprehensive testing
+- **Production-ready:** retries owned by LiveKit's own `conn_options.max_retry`,
+  mapped error taxonomy, comprehensive testing
 - **Simple API:** 3-line integration with LiveKit agents
 
 ## Installation
@@ -59,7 +61,6 @@ stt = voxist.VoxistSTT(
     language="fr",
     sample_rate=16000,
     interim_results=True,
-    connection_pool_size=3,      # 2-3 recommended for ultra-low latency
     chunk_duration_ms=100,       # Audio chunk size
     stride_overlap_ms=20,        # Chunk overlap for accuracy
 )
@@ -81,8 +82,11 @@ stt = voxist.VoxistSTT(
 ## Performance
 
 - **Latency:** < 300ms end-to-end (95th percentile)
-- **Connection pool:** Zero cold-start with pre-warmed connections
-- **Recovery:** < 2s automatic reconnection
+- **Startup:** the WebSocket token is pre-fetched at construction, so the first
+  stream's dial does not pay for the HTTPS token exchange
+- **Recovery:** retries are LiveKit's, governed by `conn_options.max_retry` and
+  `retry_interval` on `stream()`; a session whose audio was consumed with no
+  transcript raises `TranscriptLostError` rather than faking success
 - **Memory:** < 50MB per agent instance
 - **CPU:** < 10% for audio processing
 

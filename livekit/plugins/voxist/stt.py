@@ -51,14 +51,20 @@ class VoxistSTT(STT):
     Voxist ASR Speech-to-Text plugin for LiveKit.
 
     Features:
-    - Connection pooling for ultra-low latency (< 300ms end-to-end)
+    - One WebSocket per stream, dialed on demand: the gateway ends every
+      session by closing the socket after "Done", so sockets are never reused
+      and there is no connection pool
     - Support for 8+ languages including French medical
     - Automatic text2num and medical units processing (fr-medical)
     - Interim and final transcription results
-    - Automatic reconnection and error recovery
+    - Retries owned by livekit's own machinery (conn_options.max_retry on
+      stream()); transport liveness by aiohttp's WebSocket heartbeat
 
     Task Lifecycle (QUAL-002):
-        The plugin performs background initialization to pre-warm connections.
+        Construction starts a background warm-up that pre-fetches the
+        WebSocket token (the one slow step of the first dial). The explicit
+        readiness paths additionally prove WebSocket reachability with one
+        short-lived dial, unless validate_websocket=False.
         Use these properties and methods to manage the initialization lifecycle:
 
         - initialization_state: Current state (NOT_STARTED, PENDING, RUNNING,
@@ -71,7 +77,7 @@ class VoxistSTT(STT):
         State transitions:
             PENDING -> RUNNING -> COMPLETED (success path)
             PENDING -> RUNNING -> FAILED (error path)
-            NOT_STARTED (no event loop, init on demand)
+            NOT_STARTED (no event loop, warm-up runs on demand)
 
     Example:
         # Minimal usage
@@ -81,7 +87,6 @@ class VoxistSTT(STT):
         stt = VoxistSTT(
             api_key="voxist_...",
             language="fr-medical",
-            connection_pool_size=3,
         )
 
         # Use in LiveKit agent
@@ -195,10 +200,10 @@ class VoxistSTT(STT):
                 f"Recommended: 16000 Hz for optimal quality."
             )
 
-        if connection_pool_size < 1 or connection_pool_size > 5:
-            raise ConfigurationError(
-                f"connection_pool_size must be 1-5, got {connection_pool_size}"
-            )
+        # connection_pool_size is deliberately NOT range-checked: it is
+        # accepted-and-ignored (see the deprecation warning below), so a hard
+        # ConfigurationError for an out-of-range value would reject a setting
+        # that does nothing either way.
 
         if chunk_duration_ms < 50 or chunk_duration_ms > 500:
             raise ConfigurationError(
@@ -281,10 +286,13 @@ class VoxistSTT(STT):
             self._init_task.add_done_callback(self._retrieve_init_exception)
             logger.debug("Background initialization task created")
         except RuntimeError:
-            # No running event loop (e.g., in tests)
-            # Pool will be initialized on first stream() call
+            # No running event loop (e.g., in tests): nothing is pre-fetched
+            # now; the token is exchanged on the first dial instead.
             self._init_state = InitializationState.NOT_STARTED
-            logger.debug("No running event loop, pool will initialize on demand")
+            logger.debug(
+                "No running event loop; the WebSocket token will be fetched "
+                "on first use instead of pre-fetched"
+            )
 
     @staticmethod
     def _retrieve_init_exception(task: asyncio.Task) -> None:
@@ -412,6 +420,10 @@ class VoxistSTT(STT):
         """
         Warm up: pre-fetch the WebSocket token (called asynchronously).
 
+        The "_pool" in the name is a leftover: there is no pool, and this
+        method never opens a connection. Renaming it is a separate change -
+        the existing test suite patches and calls it by this name.
+
         The token exchange is the one slow step of the first dial (an HTTPS
         round-trip). Pre-fetching it keeps the InitializationState API
         meaningful: COMPLETED means the first stream dials without it, and
@@ -442,7 +454,10 @@ class VoxistSTT(STT):
             # Store and re-raise critical errors - never swallow auth failures
             self._init_error = e
             self._init_state = InitializationState.FAILED
-            logger.error(f"Authentication failed during pool initialization: {e} (state: FAILED)")
+            logger.error(
+                f"Authentication failed during the token pre-fetch: {e} "
+                "(state: FAILED)"
+            )
             raise
         except Exception as e:
             # Store error for later access, mark as failed

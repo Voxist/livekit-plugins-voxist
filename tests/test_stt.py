@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
 import pytest
-from aiohttp import web
 from livekit.agents.stt import STTCapabilities
 from livekit.agents.types import NOT_GIVEN, APIConnectOptions
 
@@ -90,18 +89,23 @@ class TestVoxistSTTInitialization:
         """connection_pool_size is accepted for backwards compatibility.
 
         There is no pool anymore - one socket per stream - but constructors in
-        user code still pass it, so it must be accepted (and validated).
+        user code still pass it, so it must be accepted.
         """
         stt = VoxistSTT(api_key="test", connection_pool_size=3)
         assert stt._config is not None
 
-    def test_initialization_with_invalid_pool_size_raises(self):
-        """Test VoxistSTT raises error for invalid pool size."""
-        with pytest.raises(ConfigurationError, match="connection_pool_size must be"):
-            VoxistSTT(api_key="test", connection_pool_size=0)
+    @pytest.mark.parametrize("size", [0, -1, 10, 1000])
+    def test_out_of_range_pool_size_is_not_an_error(self, size):
+        """[I] An IGNORED parameter must never hard-fail construction.
 
-        with pytest.raises(ConfigurationError, match="connection_pool_size must be"):
-            VoxistSTT(api_key="test", connection_pool_size=10)
+        The value is discarded - there is no pool to size - so rejecting it
+        would be a ConfigurationError for a setting that does nothing. The
+        deprecation warning is the only response (asserted separately by
+        TestDeadAndLiveParameters.test_non_default_dead_params_warn).
+        """
+        stt = VoxistSTT(api_key="test", connection_pool_size=size)
+        assert stt._config["language"] == "fr"
+        assert not hasattr(stt, "_pool"), "no pool should exist to size"
 
     def test_initialization_with_custom_chunk_duration(self):
         """Test VoxistSTT with custom chunk duration."""
@@ -370,12 +374,14 @@ class TestVoxistSTTErrorHandling:
         assert "not supported" in error_msg
         assert "fr" in error_msg  # Should list supported languages
 
-    def test_invalid_pool_size_error_message(self):
-        """Test pool size validation error message."""
-        with pytest.raises(ConfigurationError) as exc_info:
-            VoxistSTT(api_key="test", connection_pool_size=10)
+    def test_pool_size_raises_no_configuration_error(self):
+        """[I] There is no pool-size validation left to produce a message.
 
-        assert "connection_pool_size must be 1-5" in str(exc_info.value)
+        The parameter is accepted-and-ignored, so no value of it may raise -
+        only chunk_duration_ms (a LIVE parameter) still does, below.
+        """
+        for size in (0, 10):
+            VoxistSTT(api_key="test", connection_pool_size=size)
 
     def test_invalid_chunk_duration_error_message(self):
         """Test chunk duration validation error message."""
@@ -1419,44 +1425,6 @@ class TestStreamAfterClose:
             await stt.aclose()
 
 
-class _TokenOnlyServer:
-    """
-    A deployment whose HTTPS token endpoint is healthy but whose WebSocket
-    path is broken (a proxy stripping the Upgrade header): /websocket hands
-    out a perfectly valid-looking token URL, /ws answers plain HTTP 200.
-    """
-
-    def __init__(self) -> None:
-        self.host = "127.0.0.1"
-        self.port = 0
-        self.ws_attempts = 0
-        self._app = web.Application()
-        self._app.router.add_get("/websocket", self._token)
-        self._app.router.add_get("/ws", self._not_a_websocket)
-        self._runner: web.AppRunner | None = None
-
-    async def _token(self, request):
-        return web.json_response(
-            {"url": f"ws://{self.host}:{self.port}/ws?token=tok"}
-        )
-
-    async def _not_a_websocket(self, request):
-        self.ws_attempts += 1
-        return web.Response(text="the proxy ate your Upgrade header")
-
-    async def start(self) -> None:
-        self._runner = web.AppRunner(self._app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, self.host, self.port)
-        await site.start()
-        assert site._server is not None
-        self.port = site._server.sockets[0].getsockname()[1]
-
-    async def stop(self) -> None:
-        if self._runner is not None:
-            await self._runner.cleanup()
-
-
 @pytest.mark.no_auto_mock_token
 class TestWebSocketReachabilityValidation:
     """
@@ -1497,7 +1465,11 @@ class TestWebSocketReachabilityValidation:
         real call will fail."""
         from livekit.plugins.voxist.exceptions import InitializationError
 
-        server = _TokenOnlyServer()
+        from .fixtures.mock_server import MockVoxistServer
+
+        # error_mode="ws_blocked": /websocket hands out a valid-looking token
+        # URL, /ws answers a plain HTTP 200 instead of upgrading.
+        server = MockVoxistServer(valid_api_key="any_key", error_mode="ws_blocked")
         await server.start()
         try:
             stt = VoxistSTT(
@@ -1506,7 +1478,9 @@ class TestWebSocketReachabilityValidation:
             )
 
             assert await stt.wait_for_initialization(timeout=5.0) is False
-            assert server.ws_attempts >= 1, "the WS path was actually probed"
+            assert server.ws_upgrade_refusals >= 1, (
+                "the WS path was actually probed"
+            )
             assert stt.is_ready is False
             assert isinstance(
                 stt.initialization_error, VoxistConnectionError

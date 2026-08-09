@@ -11,7 +11,7 @@ import aiohttp
 import numpy as np
 import pytest
 
-from .fixtures.mock_server import MockVoxistServer
+from .fixtures.mock_server import ConfigurableMockServer, MockVoxistServer
 
 
 def speech_frame(ms=100, rate=16000):
@@ -48,6 +48,60 @@ class TestMockServerBasics:
         assert server.site is not None
         assert server.port != 0, "start() must publish the real bound port"
         await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_binds_exactly_one_socket(self):
+        """
+        [A] self.port must honestly describe the server.
+
+        The default host is the 127.0.0.1 literal, not "localhost", precisely
+        so ONE socket is bound. "localhost" resolves to both 127.0.0.1 and
+        ::1; TCPSite then opens a listener per family, and with port=0 the OS
+        assigns each a DIFFERENT ephemeral port. Publishing sockets[0]'s port
+        would leave a client that resolved to the other family dialing a port
+        nothing advertised - an intermittent failure that reads as a flake.
+        """
+        server = MockVoxistServer()
+        await server.start()
+        try:
+            assert server.site is not None
+            assert server.site._server is not None
+            sockets = server.site._server.sockets
+            assert len(sockets) == 1, (
+                f"expected a single listening socket, got "
+                f"{[s.getsockname() for s in sockets]}"
+            )
+            assert sockets[0].getsockname()[1] == server.port
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_multi_family_host_with_ephemeral_port_is_refused(self):
+        """
+        A host that fans out across families cannot publish one ephemeral
+        port, so start() must refuse rather than advertise a half-working URL.
+
+        Where "localhost" happens to resolve to a single family the hazard
+        does not exist, and start() must succeed with one honest socket - so
+        both outcomes are asserted rather than one being skipped.
+        """
+        server = MockVoxistServer(host="localhost")
+        try:
+            await server.start()
+        except RuntimeError as e:
+            assert "listening sockets" in str(e)
+            assert server.runner is None, "a refused start must not leak a runner"
+            assert server.site is None
+            return
+
+        try:
+            assert server.site is not None and server.site._server is not None
+            assert len(server.site._server.sockets) == 1, (
+                "start() accepted a multi-socket bind"
+            )
+            assert server.site._server.sockets[0].getsockname()[1] == server.port
+        finally:
+            await server.stop()
 
     @pytest.mark.asyncio
     async def test_two_default_servers_run_concurrently(self):
@@ -218,6 +272,53 @@ class TestMockServerBasics:
         assert all(results)
 
 
+    @pytest.mark.asyncio
+    async def test_stats_cover_every_counter(self, mock_voxist_server):
+        """
+        [13] get_stats()/reset_stats() must describe the WHOLE observation
+        surface, not the four counters that existed first. A counter missing
+        from reset_stats() leaks state across a test that reuses the server.
+        """
+        tracked = {
+            "connections_count",
+            "token_requests_count",
+            "audio_frames_received",
+            "total_audio_bytes",
+            "ws_upgrade_refusals",
+            "connected_languages",
+            "done_received_count",
+            "finals_sent",
+            "segments_finalized",
+        }
+        assert set(mock_voxist_server.get_stats()) == tracked
+
+        async with aiohttp.ClientSession() as session:
+            url = f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws?api_key=test_key&lang=fr"
+            async with session.ws_connect(url) as ws:
+                for _ in range(3):
+                    await ws.send_bytes(speech_frame())
+                for _ in range(5):
+                    await ws.send_bytes(silence_frame())
+                await collect_json(ws, timeout=1.0)
+                await ws.send_str("Done")
+                await collect_json(ws, timeout=1.0)
+
+        dirty = mock_voxist_server.get_stats()
+        assert dirty["finals_sent"] >= 1
+        assert dirty["segments_finalized"]
+        assert dirty["connected_languages"] == ["fr"]
+        assert dirty["done_received_count"] == 1
+
+        # A snapshot must not mutate under the caller.
+        snapshot = mock_voxist_server.get_stats()
+        mock_voxist_server.reset_stats()
+        assert snapshot["connected_languages"] == ["fr"]
+        assert snapshot["segments_finalized"]
+
+        for name, value in mock_voxist_server.get_stats().items():
+            assert not value, f"reset_stats() left {name}={value!r}"
+
+
 class TestMockServerErrorSimulation:
     @pytest.mark.asyncio
     async def test_server_auth_failure_mode(self):
@@ -229,6 +330,158 @@ class TestMockServerErrorSimulation:
                 async with session.ws_connect(url) as ws:
                     msg = await ws.receive()
                     assert msg.type == aiohttp.WSMsgType.CLOSE
+        finally:
+            await server.stop()
+
+
+class TestWsBlockedMode:
+    """
+    [J] error_mode="ws_blocked" models a deployment whose HTTPS token endpoint
+    is healthy but whose WebSocket path is broken (a proxy stripping the
+    Upgrade header) - the case the token-only warm-up cannot see.
+    """
+
+    @pytest.mark.asyncio
+    async def test_token_endpoint_healthy_but_ws_never_upgrades(self):
+        server = MockVoxistServer(valid_api_key="test_key", error_mode="ws_blocked")
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"http://{server.host}:{server.port}/websocket",
+                    headers={server.api_key_header: "test_key"},
+                ) as resp:
+                    assert resp.status == 200, "the token endpoint stays healthy"
+                    assert f":{server.port}/ws" in (await resp.json())["url"]
+
+                with pytest.raises(aiohttp.WSServerHandshakeError):
+                    await session.ws_connect(
+                        f"ws://{server.host}:{server.port}/ws?api_key=test_key"
+                    )
+
+                # The blocked route is a plain HTTP endpoint, not an upgrade.
+                async with session.get(
+                    f"http://{server.host}:{server.port}/ws?api_key=test_key"
+                ) as resp:
+                    assert resp.status == 200
+                    assert "Upgrade header" in await resp.text()
+
+            assert server.ws_upgrade_refusals == 2
+            assert server.connections_count == 0, (
+                "a refused upgrade is not a WebSocket session"
+            )
+        finally:
+            await server.stop()
+
+
+class TestConfigurableMockServerParity:
+    """
+    [13] ConfigurableMockServer used to carry a SECOND websocket_handler that
+    drifted from the contract the base class enforces: it sent a
+    {"status": "connected"} greeting the gateway never sends, had no
+    silence-delimited segmentation, and ignored error_mode. It now inherits the
+    base handler, so it must exhibit the base contract exactly.
+    """
+
+    def test_it_adds_no_handler_of_its_own(self):
+        assert (
+            ConfigurableMockServer.websocket_handler
+            is MockVoxistServer.websocket_handler
+        ), "the duplicated handler is back - it will drift again"
+
+    @pytest.mark.asyncio
+    async def test_no_greeting_and_finals_without_done(self):
+        server = ConfigurableMockServer(valid_api_key="test_key")
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"ws://{server.host}:{server.port}/ws?api_key=test_key&lang=fr"
+                async with session.ws_connect(url) as ws:
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(ws.receive(), timeout=0.3)
+
+                    for _ in range(3):
+                        await ws.send_bytes(speech_frame())
+                    for _ in range(5):
+                        await ws.send_bytes(silence_frame())
+                    messages = await collect_json(ws)
+
+            assert any(m["type"] == "final" for m in messages), (
+                f"no final without Done, got {[m['type'] for m in messages]}"
+            )
+            assert server.done_received_count == 0
+            assert server.finals_sent == 1
+            assert server.connected_languages == ["fr"]
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_wedge_mode_reaches_the_subclass(self):
+        """error_mode was silently ignored by the old override."""
+        server = ConfigurableMockServer(valid_api_key="test_key", error_mode="wedge")
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"ws://{server.host}:{server.port}/ws?api_key=test_key&lang=fr"
+                async with session.ws_connect(url) as ws:
+                    for _ in range(3):
+                        await ws.send_bytes(speech_frame())
+                    for _ in range(5):
+                        await ws.send_bytes(silence_frame())
+                    with pytest.raises(asyncio.TimeoutError):
+                        await asyncio.wait_for(ws.receive(), timeout=0.5)
+            assert server.finals_sent == 0
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_scripted_responses_replace_engine_output(self):
+        """`responses` gives the test full control of the message sequence."""
+        server = ConfigurableMockServer(
+            valid_api_key="test_key",
+            responses=[
+                {"message": {"type": "partial", "text": "un"}, "delay": 0},
+                {"message": {"type": "final", "text": "un deux"}, "delay": 0},
+            ],
+        )
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"ws://{server.host}:{server.port}/ws?api_key=test_key&lang=fr"
+                async with session.ws_connect(url) as ws:
+                    for _ in range(4):  # one more frame than scripted replies
+                        await ws.send_bytes(speech_frame())
+                    messages = await collect_json(ws, timeout=0.5)
+
+            assert [m["text"] for m in messages] == ["un", "un deux"], (
+                "the script must be the only thing sent"
+            )
+            assert server.finals_sent == 0, (
+                "engine-side finalization must stay suspended in scripted mode"
+            )
+            assert server.audio_frames_received == 4
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_after_drops_the_socket_midsession(self):
+        server = ConfigurableMockServer(valid_api_key="test_key", disconnect_after=2)
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"ws://{server.host}:{server.port}/ws?api_key=test_key&lang=fr"
+                async with session.ws_connect(url) as ws:
+                    for _ in range(2):
+                        await ws.send_bytes(speech_frame())
+                    while True:
+                        msg = await asyncio.wait_for(ws.receive(), timeout=2.0)
+                        if msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSING,
+                        ):
+                            break
+            assert server.audio_frames_received == 2
         finally:
             await server.stop()
 

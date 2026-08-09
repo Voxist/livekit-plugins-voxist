@@ -488,16 +488,24 @@ class TestServerStallDetection:
                         return  # stream already dead
                     await asyncio.sleep(0.05)
 
+            async def drain():
+                async for _event in stream:
+                    pass
+
             pump_task = asyncio.create_task(pump())
-            start = time.time()
+            # monotonic, not time(): an NTP step mid-test must not decide
+            # whether CI passes.
+            start = time.monotonic()
             try:
+                # Bounded: a detector that never fires leaves this stream
+                # open forever (the wedge never answers and never closes),
+                # and a regression must FAIL, not hang CI.
                 with pytest.raises(APIConnectionError, match="no response"):
-                    async for _event in stream:
-                        pass
+                    await asyncio.wait_for(drain(), timeout=10.0)
             finally:
                 stopped.set()
                 await pump_task
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - start
 
             assert elapsed < 10.0, (
                 "the stall must be detected around STALL_DETECTION_SECONDS, "
@@ -507,6 +515,190 @@ class TestServerStallDetection:
                 "precondition: audio really was flowing into the wedge"
             )
             await stt.aclose()
+        finally:
+            await server.stop()
+
+
+    @pytest.mark.asyncio
+    async def test_quiet_speaker_wedge_is_detected(
+        self, monkeypatch, generate_test_audio
+    ):
+        """
+        Same wedge, but the speaker is quiet or under-gained: this audio's
+        peak sits far below the amplitude gate the detector used to arm on,
+        so the clock never started and the wedge was only discovered as zero
+        transcripts at end_input - terminally, instead of retrying mid-call.
+        Counting delivered bytes does not care how loud the speaker is.
+        """
+        from livekit.agents import APIConnectionError
+
+        from livekit.plugins.voxist.stream import VoxistSTTStream
+
+        monkeypatch.setattr(VoxistSTTStream, "STALL_DETECTION_SECONDS", 1.0)
+
+        server = MockVoxistServer(valid_api_key="test", error_mode="wedge")
+        await server.start()
+        try:
+            stt = VoxistSTT(
+                api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
+            )
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
+
+            # Real speech, 60 LSB peak: inaudible to a 500-amplitude gate.
+            quiet = (generate_test_audio(duration_ms=100) // 546).astype(np.int16)
+            assert 0 < int(np.abs(quiet.astype(np.int32)).max()) < 500, (
+                "precondition: this speaker must be below the old gate"
+            )
+            stopped = asyncio.Event()
+
+            async def pump():
+                while not stopped.is_set():
+                    try:
+                        stream.push_frame(
+                            rtc.AudioFrame(
+                                data=quiet.tobytes(),
+                                sample_rate=16000,
+                                num_channels=1,
+                                samples_per_channel=len(quiet),
+                            )
+                        )
+                    except RuntimeError:
+                        return  # stream already dead
+                    await asyncio.sleep(0.05)
+
+            async def drain():
+                async for _event in stream:
+                    pass
+
+            pump_task = asyncio.create_task(pump())
+            start = time.monotonic()
+            try:
+                # Bounded on purpose: the failure mode being tested is a
+                # detector that never fires, and that must not hang CI.
+                with pytest.raises(APIConnectionError, match="no response"):
+                    await asyncio.wait_for(drain(), timeout=10.0)
+            finally:
+                stopped.set()
+                await pump_task
+            elapsed = time.monotonic() - start
+
+            assert elapsed < 10.0, (
+                "a quiet speaker's wedged server must be detected around "
+                "STALL_DETECTION_SECONDS too, not at end of input"
+            )
+            assert server.audio_frames_received > 0
+            await stt.aclose()
+        finally:
+            await server.stop()
+
+
+@pytest.mark.integration
+class TestSessionEndingWithoutTranscript:
+    """
+    A gateway whose engine crashed closes the socket promptly after "Done"
+    without ever sending a transcript. From the plugin's side that is
+    indistinguishable from a heartbeat death: the receive iterator simply
+    ends. It must never be reported as a clean, successful session.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prompt_close_with_no_transcript_is_not_success(
+        self, generate_test_audio
+    ):
+        from livekit.plugins.voxist.exceptions import TranscriptLostError
+
+        # transcription_text="" models the crashed engine: the gateway
+        # forwards Done, nothing comes back, and it closes the client socket.
+        server = MockVoxistServer(
+            valid_api_key="test", transcription_text="", send_interim=False
+        )
+        await server.start()
+        try:
+            stt = VoxistSTT(
+                api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
+            )
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
+
+            speech = generate_test_audio(duration_ms=500)
+            stream.push_frame(
+                rtc.AudioFrame(
+                    data=speech.tobytes(),
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=len(speech),
+                )
+            )
+            stream.end_input()
+
+            events = []
+            with pytest.raises(TranscriptLostError):
+                async for event in stream:
+                    events.append(event)
+
+            assert server.done_received_count == 1, (
+                "precondition: the session really did reach end of input"
+            )
+            assert not [
+                e for e in events
+                if e.type == SpeechEventType.FINAL_TRANSCRIPT
+            ], "precondition: nothing was delivered"
+            await stt.aclose()
+        finally:
+            await server.stop()
+
+
+@pytest.mark.integration
+class TestTurnBoundarySilence:
+    """
+    flush() immediately followed by end_input() is the commonest VAD pattern
+    there is, and it was untested: two adjacent sentinels with no frames
+    between them. "Done" forces the engine flush by itself, so any
+    endpointing silence shipped here is pure dead air at the end of a turn.
+    """
+
+    @pytest.mark.asyncio
+    async def test_flush_then_end_input_ships_no_endpointing_silence(
+        self, generate_test_audio
+    ):
+        received: list[bytes] = []
+
+        server = MockVoxistServer(
+            valid_api_key="test",
+            on_audio_received=lambda data, _samples: received.append(bytes(data)),
+        )
+        await server.start()
+        try:
+            stt = VoxistSTT(
+                api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
+            )
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
+
+            speech = generate_test_audio(duration_ms=500)
+            stream.push_frame(
+                rtc.AudioFrame(
+                    data=speech.tobytes(),
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=len(speech),
+                )
+            )
+            stream.flush()      # end of segment...
+            stream.end_input()  # ...and end of session, back to back
+
+            async def drain():
+                async for _ in stream:
+                    pass
+            await asyncio.wait_for(drain(), timeout=15.0)
+            await stt.aclose()
+
+            silent_chunks = [c for c in received if not any(c)]
+            assert silent_chunks == [], (
+                f"{len(silent_chunks)} chunks of endpointing silence were "
+                "shipped before Done: 400ms of dead air on the commonest "
+                "turn ending there is"
+            )
+            assert server.done_received_count == 1, "exactly one Done"
+            assert server.connections_count == 1, "one socket for the session"
         finally:
             await server.stop()
 

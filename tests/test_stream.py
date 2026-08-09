@@ -10,6 +10,7 @@ import aiohttp
 import numpy as np
 import pytest
 from livekit.agents import APIConnectionError
+from livekit.agents.stt import SpeechEventType
 from livekit.agents.types import APIConnectOptions
 
 from livekit import rtc
@@ -155,16 +156,26 @@ def frame(samples=160):
     )
 
 
-def speech_frame(samples=1600):
-    """A frame that counts as real audio for stall detection (sine, loud)."""
+def speech_frame(samples=1600, amplitude=20000):
+    """A frame carrying real signal (sine wave, loud by default)."""
     t = np.arange(samples, dtype=np.float64)
-    data = (np.sin(2 * np.pi * 440 * t / 16000.0) * 20000).astype(np.int16)
+    data = (np.sin(2 * np.pi * 440 * t / 16000.0) * amplitude).astype(np.int16)
     return rtc.AudioFrame(
         data=data.tobytes(),
         sample_rate=16000,
         num_channels=1,
         samples_per_channel=samples,
     )
+
+
+def quiet_speech_frame(samples=1600):
+    """
+    A quiet / under-gained speaker: real speech whose peak sits far below
+    the amplitude gate the stall detector used to arm on (500). Sessions
+    like this were invisible to that gate, so a wedged server went
+    undetected for them until end_input killed the session terminally.
+    """
+    return speech_frame(samples, amplitude=60)
 
 
 class TestSendPath:
@@ -931,6 +942,456 @@ class TestExhaustedInputRetry:
         events.send_nowait.assert_not_called()
 
 
+class TestCompletionGate:
+    """
+    ONE gate decides whether a session succeeded.
+
+    Three review rounds found the same bug - a clean success reported after
+    the entire transcript was lost - at three DIFFERENT entry points into
+    the completion path (an exhausted-input retry, a trailing FlushSentinel,
+    a prompt server close). Each round guarded that one entry point. These
+    tests pin the structural property instead: the verdict lives inside the
+    exit, so a new caller cannot forget to check.
+    """
+
+    @pytest.mark.asyncio
+    async def test_prompt_close_after_done_without_transcript_is_not_success(
+        self,
+    ):
+        """
+        THE round-7 finding. The gateway closes the socket promptly after
+        "Done" without ever sending a transcript - its engine crashed, and an
+        aiohttp heartbeat death looks identical from here: `async for msg in
+        ws` simply ends, with no exception. The drain's wait_for then returns
+        WITHOUT TimeoutError, so the whole outcome taxonomy was skipped and a
+        session with real audio and zero transcripts was reported as a clean
+        success.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            await asyncio.sleep(0.05)
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream.end_input()
+            await asyncio.sleep(0.05)
+            ws.end()  # closes right after Done, having sent nothing
+
+        task = asyncio.create_task(scenario())
+        with pytest.raises(TranscriptLostError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+
+        assert ws.sent_text == ["Done"], "precondition: Done really was sent"
+        assert not stream._session_complete, (
+            "a session that consumed real audio and delivered nothing is not "
+            "a success, however politely the server closed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_prompt_close_still_closes_the_speech_state(self):
+        """
+        Same prompt close, but START_OF_SPEECH already reached the caller:
+        the engine sent a partial (interims disabled, so nothing was
+        delivered) and then died. The terminal raise must not skip
+        END_OF_SPEECH - the raise sites used to bypass the completion path
+        entirely, leaving _speaking True and a turn open forever downstream.
+        """
+        config = dict(DEFAULT_CONFIG, interim_results=False)
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws), config=config)
+        events = mock_event_ch(stream)
+
+        async def scenario():
+            await asyncio.sleep(0.05)
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            # Speech detected (START_OF_SPEECH) but, with interims disabled,
+            # nothing is DELIVERED to the caller.
+            ws.feed_json({"type": "partial", "text": "bonj"})
+            await asyncio.sleep(0.05)
+            stream.end_input()
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        with pytest.raises(TranscriptLostError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+
+        emitted = [c.args[0].type for c in events.send_nowait.call_args_list]
+        assert emitted == [
+            SpeechEventType.START_OF_SPEECH,
+            SpeechEventType.END_OF_SPEECH,
+        ], f"START_OF_SPEECH must be matched even when the session fails: {emitted}"
+        assert not stream._speaking
+
+    @pytest.mark.asyncio
+    async def test_interrupted_attempt_closes_the_speech_state(self):
+        """
+        The backstop in _run's own finally: an attempt that raises before it
+        ever reaches the gate (here a mid-input server close) must still not
+        leave a START_OF_SPEECH unmatched. If the retry budget is exhausted,
+        that raise is the end of the stream.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        events = mock_event_ch(stream)
+
+        async def scenario():
+            await asyncio.sleep(0.05)
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            await asyncio.sleep(0.05)
+            ws.end()  # server drops the socket, input still open
+
+        task = asyncio.create_task(scenario())
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+
+        emitted = [c.args[0].type for c in events.send_nowait.call_args_list]
+        assert emitted[-1] == SpeechEventType.END_OF_SPEECH
+        assert not stream._speaking
+
+    @pytest.mark.asyncio
+    async def test_success_is_decided_in_exactly_one_place(self):
+        """
+        The structural property, asserted on the source: if a second place
+        could mark a session complete, round 8 would find it. Likewise the
+        terminal TranscriptLostError has exactly one raise site, inside the
+        gate - it used to be raised from branches that never emitted
+        END_OF_SPEECH.
+        """
+        import inspect
+
+        module_src = inspect.getsource(
+            __import__(
+                "livekit.plugins.voxist.stream", fromlist=["stream"]
+            )
+        )
+        gate_src = inspect.getsource(VoxistSTTStream._finish_session)
+
+        assert module_src.count("_session_complete = True") == 1, (
+            "only the completion gate may mark a session successful"
+        )
+        assert gate_src.count("_session_complete = True") == 1
+
+        assert module_src.count("raise TranscriptLostError(") == 1, (
+            "the terminal verdict must have a single raise site"
+        )
+        assert gate_src.count("raise TranscriptLostError(") == 1
+
+    @pytest.mark.asyncio
+    async def test_no_exit_from_an_attempt_bypasses_the_gate(self):
+        """
+        The invariant that makes the whole class of bug impossible rather
+        than merely guarded, checked on the parse tree: inside
+        _run_attempt, every `return` is immediately preceded by a
+        _finish_session call, and the exchange's normal fall-through ends
+        with one too. A branch that "completes" without passing through the
+        gate cannot be added without failing here - which is exactly how
+        rounds 5, 6 and 7 each found a fresh unguarded entry point.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        fn = ast.parse(
+            textwrap.dedent(inspect.getsource(VoxistSTTStream._run_attempt))
+        ).body[0]
+
+        def is_gate_call(stmt):
+            return (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr == "_finish_session"
+            )
+
+        def statement_lists(node):
+            for field in ("body", "orelse", "finalbody"):
+                seq = getattr(node, field, None)
+                if isinstance(seq, list) and seq and isinstance(seq[0], ast.stmt):
+                    yield seq
+
+        returns = 0
+        for node in ast.walk(fn):
+            for block in statement_lists(node):
+                for i, stmt in enumerate(block):
+                    if not isinstance(stmt, ast.Return):
+                        continue
+                    returns += 1
+                    assert i > 0 and is_gate_call(block[i - 1]), (
+                        f"the return on line {stmt.lineno} of _run_attempt "
+                        "leaves the session without a verdict from the "
+                        "completion gate"
+                    )
+
+        assert returns >= 3, (
+            "sanity: the early exits (no audio, exhausted input, drain "
+            "timeout) must still be there"
+        )
+
+        exchange = fn.body[-1]
+        assert isinstance(exchange, ast.Try), "the exchange must be the tail"
+        assert is_gate_call(exchange.body[-1]), (
+            "falling out of the exchange must render a verdict, not imply "
+            "success - a server that closes promptly after Done having sent "
+            "nothing lands exactly here"
+        )
+
+    @pytest.mark.asyncio
+    async def test_gate_emits_end_of_speech_on_every_verdict(self):
+        """
+        Whatever the gate decides, a pending START_OF_SPEECH is closed
+        first. Driven directly over the taxonomy so a new verdict cannot be
+        added without an END_OF_SPEECH.
+        """
+        from livekit.plugins.voxist.stream import _SessionOutcome
+
+        def outcome(*, final=False, interim=False, lost=False, concluded=False):
+            return _SessionOutcome(
+                delivered_final=final,
+                delivered_interim=interim,
+                unrecoverable_audio=lost,
+                concluded=concluded,
+                detail=(
+                    f"final={final} interim={interim} lost={lost} "
+                    f"concluded={concluded}"
+                ),
+            )
+
+        verdicts = [
+            # (outcome, expected exception type or None)
+            (outcome(final=True, lost=True, concluded=True), None),
+            (outcome(final=True, lost=True), None),
+            (outcome(interim=True, lost=True), None),
+            (outcome(lost=True, concluded=True), TranscriptLostError),
+            (outcome(), APIConnectionError),
+            (outcome(concluded=True), None),
+        ]
+
+        for outcome, expected in verdicts:
+            stream = await make_stream()
+            events = mock_event_ch(stream)
+            stream._speaking = True
+
+            if expected is None:
+                stream._finish_session(outcome)
+                assert stream._session_complete
+            else:
+                with pytest.raises(expected):
+                    stream._finish_session(outcome)
+                assert not stream._session_complete
+
+            emitted = [c.args[0].type for c in events.send_nowait.call_args_list]
+            assert emitted == [SpeechEventType.END_OF_SPEECH], (
+                f"verdict {outcome.detail!r} left the speech state open"
+            )
+
+    @pytest.mark.asyncio
+    async def test_prompt_close_with_no_audio_completes_empty(self):
+        """
+        The mirror image: nothing was consumed, so nothing was lost. A
+        prompt close after a bare Done is a clean empty session, not an
+        error - the gate must not overcorrect into failing those.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        run_task = asyncio.create_task(stream._run())
+        await asyncio.sleep(0.05)  # dialed, send loop waiting on input
+        stream.end_input()
+        await asyncio.sleep(0.05)
+        ws.end()
+
+        await asyncio.wait_for(run_task, timeout=5.0)
+        assert stream._session_complete
+
+
+class TestConsumedAudioPredicate:
+    """
+    "Consumed real audio" must mean audio that could plausibly have produced
+    a transcript. Counting every frame - including pure silence - made a
+    retry that shipped nothing but the caller's trailing captured silence
+    look like a session whose transcript had vanished, and killed it with a
+    terminal error although every final had already been delivered.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pure_silence_is_not_consumed_audio(self):
+        stream = await make_stream()
+        attach_mock_ws(stream)
+        mock_event_ch(stream)
+
+        for _ in range(10):
+            stream._input_ch.send_nowait(frame(1600))  # zeros
+        stream.end_input()
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        assert stream._audio_consumed is False
+        assert stream._real_audio_this_attempt is False
+
+    @pytest.mark.asyncio
+    async def test_signal_bearing_audio_is_consumed_audio(self):
+        stream = await make_stream()
+        attach_mock_ws(stream)
+        mock_event_ch(stream)
+
+        stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        assert stream._audio_consumed
+        assert stream._real_audio_this_attempt
+
+    @pytest.mark.asyncio
+    async def test_quiet_speech_counts_as_real_audio(self):
+        """
+        The asymmetry, pinned: mistaking quiet speech for silence would let
+        a lost transcript be reported as a clean empty success, so anything
+        that is not pure zeros counts.
+        """
+        stream = await make_stream()
+        attach_mock_ws(stream)
+        mock_event_ch(stream)
+
+        stream._input_ch.send_nowait(quiet_speech_frame())
+        stream.end_input()
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+        assert stream._audio_consumed
+
+    @pytest.mark.asyncio
+    async def test_dropped_real_frame_still_counts_as_consumed(self, monkeypatch):
+        """
+        A frame discarded to bound the backlog has still irrevocably left
+        the channel: no retry can replay it, so it is consumed.
+        """
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 0)
+        stream = await make_stream()
+        attach_mock_ws(stream)
+        mock_event_ch(stream)
+
+        for _ in range(5):
+            stream._input_ch.send_nowait(speech_frame())
+        stream.end_input()
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        assert stream.dropped_frames > 0
+        assert stream._audio_consumed
+
+    @pytest.mark.asyncio
+    async def test_silence_only_retry_after_finals_completes(self, monkeypatch):
+        """
+        Attempt 1 delivered every final, then the connection blipped. The
+        retry ships nothing but the caller's trailing captured silence plus
+        Done; the server has nothing to finalize, so it neither answers nor
+        closes within the drain.
+
+        Keying the loss verdict on the SESSION's consumption made this a
+        terminal TranscriptLostError - the stream died although its whole
+        transcript had been delivered. An attempt that shipped only silence
+        owes nothing and can lose nothing: it is judged on the session.
+        """
+        monkeypatch.setattr(VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.2)
+        ws1, ws2 = FakeWS(), FakeWS()
+        dial = AsyncMock(side_effect=[ws1, ws2])
+        stream = await make_stream(dial=dial)
+        mock_event_ch(stream)
+
+        async def attempt1():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws1.feed_json({"type": "final", "text": "bonjour", "confidence": 0.9})
+            await asyncio.sleep(0.05)
+            ws1.end()  # blip: server drops the socket, input still open
+
+        task = asyncio.create_task(attempt1())
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+        assert stream._final_received, "attempt 1 delivered the transcript"
+
+        async def attempt2():
+            await asyncio.sleep(0.02)
+            for _ in range(3):
+                stream._input_ch.send_nowait(frame(1600))  # captured silence
+            await asyncio.sleep(0.05)
+            stream.end_input()
+            # the server has nothing to finalize: no answer, no close
+
+        task = asyncio.create_task(attempt2())
+        await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+
+        assert stream._session_complete, (
+            "the session's transcript was fully delivered; a retry that "
+            "shipped only silence cannot turn it into transcript loss"
+        )
+
+
+class TestSentinelPredicateFailsSafe:
+    """
+    The predicate reads livekit's private Chan._queue. If that attribute
+    ever moves, the fallback decides what a rename costs - and the previous
+    fallback (qsize()==0) was the pre-fix buggy check itself, so a livekit
+    rename would silently resurrect total-transcript-loss-as-success.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unreadable_queue_reports_the_incompatibility_once(self, caplog):
+        stream = await make_stream()
+        mock_event_ch(stream)
+        stream.end_input()
+        # The rename: the deque backing qsize() is no longer where we look.
+        del stream._input_ch._queue
+
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            for _ in range(20):
+                assert stream._pending_input_only_sentinels() is True
+
+        warnings = [
+            r for r in caplog.records if "Chan._queue has moved" in r.message
+        ]
+        assert len(warnings) == 1, (
+            "name the livekit-version incompatibility exactly once per stream"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unreadable_queue_prefers_an_honest_error_to_a_fake_success(
+        self,
+    ):
+        """
+        With the channel uninspectable, a retry whose audio is gone must
+        reach the honest TranscriptLostError - never dial, ship a bare Done
+        and report success. The safe direction is stated in the helper and
+        pinned here.
+        """
+        dial = AsyncMock(side_effect=AssertionError("must not dial"))
+        stream = await make_stream(dial=dial)
+        mock_event_ch(stream)
+
+        # State a failed attempt leaves behind: audio consumed, no finals,
+        # input closed - and now uninspectable.
+        stream.end_input()
+        stream._audio_consumed = True
+        del stream._input_ch._queue
+
+        with pytest.raises(TranscriptLostError):
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        dial.assert_not_awaited()
+        assert not stream._session_complete
+
+
 class TestDefensiveResultProcessing:
     """
     The gateway can emit frames outside the transcript shape (e.g. a pub/sub
@@ -1094,6 +1555,61 @@ class TestSegmentEndSilence:
         )
 
     @pytest.mark.asyncio
+    async def test_flush_immediately_followed_by_end_input_sends_no_silence(self):
+        """
+        THE commonest VAD pattern of all, and it was untested: turn
+        detection calls flush() at end of speech and the caller ends the
+        session in the same breath, so the channel holds TWO ADJACENT
+        sentinels with no frames between them.
+
+        The end-of-session check keyed on qsize()==0, so pulling the FIRST
+        sentinel saw qsize()==1 and treated it as a mid-session boundary:
+        400ms of endpointing silence in front of a "Done" that forces the
+        engine flush by itself. Pure dead air on every single turn ending
+        this way. One predicate for both callers is what makes it
+        impossible: whatever remains is sentinels, so this is end of
+        session.
+        """
+        stream = await make_stream()
+        ws = attach_mock_ws(stream)
+        mock_event_ch(stream)
+
+        stream._input_ch.send_nowait(speech_frame())
+        stream.flush()       # REAL path: end of segment...
+        stream.end_input()   # ...and end of session, back to back
+
+        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        assert self.silence_payloads(ws) == [], (
+            "two adjacent sentinels are one session ending, not a segment "
+            "boundary: injecting silence before Done is pure dead air"
+        )
+        assert ws.send_bytes.await_count > 0, "the speech itself must ship"
+        assert ws.send_str.await_count == 1, "exactly one Done"
+        assert ws.send_str.await_args.args[0] == "Done"
+
+    @pytest.mark.asyncio
+    async def test_end_of_session_detection_uses_the_shared_predicate(self):
+        """
+        The send loop and the exhausted-input guard must ask the SAME
+        question. They diverged for a round - the guard used the predicate,
+        the send loop still tested qsize() - and that divergence is the
+        two-sentinel dead-air bug above.
+        """
+        import inspect
+
+        src = inspect.getsource(VoxistSTTStream._send_audio_task)
+        assert "_pending_input_only_sentinels" in src
+        # Comments describe the old check on purpose; only code counts.
+        code = "\n".join(
+            line for line in src.splitlines() if not line.strip().startswith("#")
+        )
+        assert "qsize() == 0" not in code, (
+            "a second expression for 'no audio remains' is how the two "
+            "callers drifted apart"
+        )
+
+    @pytest.mark.asyncio
     async def test_mid_session_flush_before_end_input_still_injects(self):
         """
         The [11] fix must not overreach: a genuine flush() boundary inside
@@ -1122,10 +1638,14 @@ class TestServerStallDetection:
     """
     A mute-but-connected server (wedged engine behind a live gateway that
     still answers pings) must be detected MID-session, not discovered as
-    zero transcripts at end_input. The bound is send-aware: it arms only
-    while non-silent caller audio is flowing, so silent users and
-    silence-pushing callers can never trip it - the flaw that killed the
-    old unconditional 30s receive watchdog.
+    zero transcripts at end_input.
+
+    The detector counts CALLER-AUDIO BYTES delivered since the last message
+    from the server, not wall time since a loud frame. Three defects died
+    with the wall clock: the latch was never cleared by later silence (a
+    cough then 35s of quiet killed a healthy session), quiet speakers never
+    armed it at all (their wedged servers went undetected), and it copied
+    every frame to int32 on the per-frame hot path.
     """
 
     @pytest.mark.asyncio
@@ -1134,9 +1654,29 @@ class TestServerStallDetection:
             "short enough to save a live call, long enough that a loaded "
             "engine's slowest partial cannot false-trigger"
         )
-        assert 0 < VoxistSTTStream.NON_SILENCE_AMPLITUDE < 3000, (
-            "must sit between zero-fill/comfort noise and quiet speech"
+        assert not hasattr(VoxistSTTStream, "NON_SILENCE_AMPLITUDE"), (
+            "an amplitude gate cannot hear a quiet speaker, so it silently "
+            "exempts them from stall detection; the bound is measured in "
+            "delivered audio bytes instead"
         )
+
+    @pytest.mark.asyncio
+    async def test_bound_is_the_byte_equivalent_of_the_second_bound(self):
+        """One source of truth: the byte budget derives from the seconds."""
+        stream = await make_stream()
+        attach_mock_ws(stream)
+
+        expected = int(
+            VoxistSTTStream.STALL_DETECTION_SECONDS
+            * VoxistSTTStream.WIRE_SAMPLE_RATE
+            * 2  # Int16
+        )
+        stream._bytes_sent_since_message = expected
+        stream._check_server_liveness()  # exactly at the bound: not a stall
+
+        stream._bytes_sent_since_message = expected + 1
+        with pytest.raises(APIConnectionError, match="no response"):
+            stream._check_server_liveness()
 
     @pytest.mark.asyncio
     async def test_mute_server_with_flowing_audio_raises(self, monkeypatch):
@@ -1169,39 +1709,141 @@ class TestServerStallDetection:
         assert not stream._session_complete
 
     @pytest.mark.asyncio
-    async def test_silent_frames_never_arm_the_stall_clock(self, monkeypatch):
+    async def test_quiet_speaker_wedge_is_detected(self, monkeypatch):
         """
-        A caller pushing pure silence is indistinguishable from a silent
-        user; the server owes it nothing, so it must not trip the bound.
+        THE quiet-speaker test. This audio's peak (60) sits far below the
+        amplitude gate the detector used to arm on (500), so the old clock
+        never started and the wedge was only discovered at end_input - by
+        which point the audio was unreplayable and the session died
+        terminally instead of retrying mid-call. Byte accounting does not
+        care how loud the speaker is.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "STALL_DETECTION_SECONDS", 0.2, raising=False
+        )
+        ws = FakeWS()  # wedged engine: never answers, never closes
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        stopped = asyncio.Event()
+
+        async def pump():
+            for _ in range(200):
+                if stopped.is_set():
+                    return
+                stream._input_ch.send_nowait(quiet_speech_frame(320))
+                await asyncio.sleep(0.02)
+
+        pump_task = asyncio.create_task(pump())
+        try:
+            with pytest.raises(APIConnectionError, match="no response"):
+                await asyncio.wait_for(stream._run(), timeout=5.0)
+        finally:
+            stopped.set()
+            await pump_task
+        assert not stream._session_complete
+
+    @pytest.mark.asyncio
+    async def test_silent_user_never_trips_the_detector(self, monkeypatch):
+        """
+        A user who says nothing sends nothing: no bytes reach the server, so
+        the bound cannot be reached however long the silence lasts. The old
+        unconditional 30s receive watchdog false-fired on exactly this.
+        """
+        monkeypatch.setattr(VoxistSTTStream, "STALL_DETECTION_SECONDS", 0.0)
+        ws = FakeWS()  # never answers
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        run_task = asyncio.create_task(stream._run())
+        await asyncio.sleep(0.3)  # a "long" user silence at this scale
+
+        assert not run_task.done(), (
+            "a silent user must not be able to trip the liveness bound"
+        )
+        assert stream._bytes_sent_since_message == 0
+
+        run_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run_task
+
+    @pytest.mark.asyncio
+    async def test_injected_endpointing_silence_is_not_counted(self, monkeypatch):
+        """
+        The endpointing silence is OUR audio, synthesized to make the engine
+        finalize a segment. Counting it would let the plugin declare the
+        server stalled because of bytes the caller never sent - and with a
+        stalling uplink, 20s of injected zeros would do it.
         """
         monkeypatch.setattr(VoxistSTTStream, "STALL_DETECTION_SECONDS", 0.0)
         stream = await make_stream()
-        attach_mock_ws(stream)
+        ws = attach_mock_ws(stream)
+        # No caller bytes at all: every chunk sent below is injected silence.
+        stream._audio_processor = Mock()
+        stream._audio_processor.flush = Mock(return_value=[])
+        stream._audio_processor.process_audio_frame = Mock(return_value=[])
 
-        for _ in range(10):
-            stream._input_ch.send_nowait(frame(1600))  # zeros
+        stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
+        stream._input_ch.send_nowait(frame(1600))
+        task = asyncio.create_task(stream._send_audio_task())
+        await asyncio.sleep(0.2)  # mid-session boundary: silence is injected
+
+        assert ws.send_bytes.await_count > 0, "the silence must reach the wire"
+        assert stream._bytes_sent_since_message == 0, (
+            "injected endpointing silence must not move the liveness bound"
+        )
+        assert not task.done(), "and it must certainly not trip it"
+
         stream._input_ch.close()
-
-        # With the bound at 0.0, ANY armed clock would raise on the second
-        # frame; silence must never arm it.
-        await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
-        assert stream._audio_flowing_since is None
+        await asyncio.wait_for(task, timeout=5.0)
 
     @pytest.mark.asyncio
-    async def test_any_server_message_resets_the_stall_clock(self):
+    async def test_caller_audio_is_counted(self):
+        """The other half of the contract: the caller's audio does count."""
+        stream = await make_stream()
+        attach_mock_ws(stream)
+
+        chunk = np.zeros(1600, dtype=np.int16)  # 3200B
+        await stream._send_audio_chunk(chunk)
+        assert stream._bytes_sent_since_message == 3200
+        await stream._send_audio_chunk(chunk)
+        assert stream._bytes_sent_since_message == 6400
+
+    @pytest.mark.asyncio
+    async def test_any_server_message_resets_the_byte_budget(self):
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
         stream._ws = ws
-        stream._audio_flowing_since = 123.456  # armed long ago
+        stream._bytes_sent_since_message = 900_000  # nearly at the bound
 
         ws.feed_json({"type": "partial", "text": "bonjour"})
         ws.end()
         await asyncio.wait_for(stream._recv_results_task(), timeout=5.0)
 
-        assert stream._audio_flowing_since is None, (
-            "a received message proves liveness and must disarm the clock"
+        assert stream._bytes_sent_since_message == 0, (
+            "a received message proves liveness and must reset the budget"
         )
+        assert stream._last_message_at is not None
+
+    @pytest.mark.asyncio
+    async def test_no_per_frame_int32_copy_on_the_hot_path(self):
+        """
+        The old detector built an int32 copy of every frame to compute a
+        peak. Nothing on the per-frame path may promote dtypes again.
+        """
+        import inspect
+
+        hot_path = "".join(
+            inspect.getsource(fn)
+            for fn in (
+                VoxistSTTStream._send_audio_task,
+                VoxistSTTStream._carries_signal,
+                VoxistSTTStream._check_server_liveness,
+                VoxistSTTStream._send_audio_chunk,
+            )
+        )
+        assert "astype" not in hot_path
 
     @pytest.mark.asyncio
     async def test_no_watchdog_task_exists(self):
@@ -1212,9 +1854,11 @@ class TestServerStallDetection:
         """
         import inspect
 
-        src = inspect.getsource(VoxistSTTStream._run)
+        src = inspect.getsource(VoxistSTTStream._run) + inspect.getsource(
+            VoxistSTTStream._run_attempt
+        )
         assert src.count("create_task") == 2, (
-            "_run must own exactly two children: send and recv"
+            "an attempt must own exactly two children: send and recv"
         )
 
 
@@ -1523,10 +2167,14 @@ class TestLanguageCodeHandling:
         mock_event_ch(stream)
 
         # A session with audio: a zero-audio end_input() would (correctly)
-        # never dial at all.
+        # never dial at all. A final must arrive too - a server that closes
+        # after Done having sent NOTHING for real audio is transcript loss,
+        # not a completed session, and the gate now says so.
         stream._input_ch.send_nowait(speech_frame())
         stream.end_input()
         ws_task = asyncio.create_task(stream._run())
+        await asyncio.sleep(0.05)
+        ws.feed_json({"type": "final", "text": "bonjour"})
         await asyncio.sleep(0.05)
         ws.end()
         await asyncio.wait_for(ws_task, timeout=5.0)

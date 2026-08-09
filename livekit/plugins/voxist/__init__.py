@@ -15,6 +15,14 @@ Example:
         stt = voxist.VoxistSTT(language="fr-medical")
         agent = agents.VoicePipelineAgent(stt=stt, llm=..., tts=...)
         await agent.start(ctx.room)
+
+Deprecated exception names:
+    ConnectionPoolExhaustedError is a pool-era name that nothing raises any
+    more; it is still exported so existing `except` clauses keep importing.
+    Catch ConnectionError instead. Two further pool-era names,
+    BackpressureError and OwnershipViolationError, remain importable from
+    livekit.plugins.voxist.exceptions but are not raised either. Each class's
+    docstring names what replaced it.
 """
 
 from .exceptions import (
@@ -40,6 +48,7 @@ __all__ = [
     "InsufficientBalanceError",
     "ConnectionError",
     "TranscriptLostError",
+    # Deprecated, never raised; exported so existing user code still imports.
     "ConnectionPoolExhaustedError",
     "LanguageNotSupportedError",
     "ConfigurationError",

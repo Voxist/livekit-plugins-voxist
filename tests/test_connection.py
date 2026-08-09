@@ -10,8 +10,25 @@ from unittest.mock import Mock
 import aiohttp
 import pytest
 
-from livekit.plugins.voxist.connection import VoxistDialer
+from livekit.plugins.voxist import connection
+from livekit.plugins.voxist.connection import (
+    DIAL_RATE_LIMIT_WINDOW_SECONDS,
+    MAX_DIALS_PER_WINDOW,
+    VoxistDialer,
+    _DialRateLimiter,
+    reset_dial_rate_limits,
+)
 from livekit.plugins.voxist.exceptions import AuthenticationError, ConnectionError
+
+
+@pytest.fixture(autouse=True)
+def _isolated_dial_rate_limits():
+    """The dial limiter is shared process-wide per gateway credential, so
+    every test in this module starts from an empty registry (dialers built
+    afterwards get fresh windows) and leaves none behind."""
+    reset_dial_rate_limits()
+    yield
+    reset_dial_rate_limits()
 
 
 def handshake_error(status: int) -> aiohttp.WSServerHandshakeError:
@@ -575,3 +592,189 @@ class TestTokenExchangeAgainstServer:
             await ws.close()
 
         assert mock_voxist_server.connected_languages == ["fr-medical"]
+
+
+class FakeClock:
+    """Deterministic stand-in for the `time` module inside connection.py.
+
+    Injected with monkeypatch.setattr(connection, "time", clock) so the
+    global clock - which asyncio itself depends on - is never touched.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def time(self) -> float:
+        return self.now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.mark.no_auto_mock_token
+class TestTokenClockReadAfterLock:
+    """
+    [B] The clock must be read INSIDE _token_lock. Reading it before the
+    await meant that, after lock contention, both the freshness check and the
+    recorded cache expiry used a timestamp that was already seconds old - so
+    a token could be judged fresh against a time that had passed, or have its
+    expiry recorded against a moment before the round-trip it describes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_freshness_check_uses_the_post_lock_clock(self, monkeypatch):
+        clock = FakeClock(0.0)
+        monkeypatch.setattr(connection, "time", clock)
+
+        session = FakeSession(responses=[token_response("fresh")])
+        dialer = make_dialer(session)
+        # A cached token that is fresh at t=0 but inside the 300s refresh
+        # buffer from t=10 onwards.
+        dialer._token_url = "wss://host/ws?token=cached"
+        dialer._token_expires_at = 310.0
+
+        # Hold the lock so the caller must wait, exactly as a concurrent
+        # exchange would make it wait.
+        await dialer._token_lock.acquire()
+        task = asyncio.create_task(dialer._get_token_url())
+        for _ in range(5):
+            await asyncio.sleep(0)  # let the task reach the lock
+
+        clock.now = 20.0  # the wait for the lock cost 20 seconds
+        dialer._token_lock.release()
+        url = await task
+
+        assert "token=fresh" in url, (
+            "the stale cached token was judged fresh against a pre-lock clock"
+        )
+        assert len(session.get_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_expiry_is_recorded_from_the_arrival_clock(self, monkeypatch):
+        clock = FakeClock(0.0)
+        monkeypatch.setattr(connection, "time", clock)
+
+        class SlowResponse(FakeResponse):
+            async def json(self):
+                clock.now += 20.0  # the HTTPS round-trip took 20s
+                return self._payload
+
+        session = FakeSession(
+            responses=[SlowResponse(payload={"url": "wss://host/ws?token=nojwt"})]
+        )
+        dialer = make_dialer(session)
+
+        await dialer._get_token_url()
+
+        # exp unreadable -> assume the 1h lifetime, counted from ARRIVAL
+        assert dialer._token_expires_at == pytest.approx(3620.0), (
+            "the expiry was recorded against the clock read before the "
+            "round-trip"
+        )
+
+
+class TestDialRateLimitWindow:
+    """[12] The sliding window itself, exercised with a synthetic clock."""
+
+    def test_window_slides(self):
+        limiter = _DialRateLimiter(max_dials=2, window=60.0)
+
+        assert limiter.try_acquire(100.0)
+        assert limiter.try_acquire(100.0)
+        assert not limiter.try_acquire(120.0)
+        # the first two attempts age out once t - 60 passes them
+        assert limiter.try_acquire(161.0)
+        assert limiter.try_acquire(161.0)
+        assert not limiter.try_acquire(161.0)
+
+    def test_defaults_match_the_retired_pool_budget(self):
+        assert MAX_DIALS_PER_WINDOW == 30
+        assert DIAL_RATE_LIMIT_WINDOW_SECONDS == 60.0
+
+
+@pytest.mark.no_auto_mock_token
+class TestDialRateLimit:
+    """
+    [12] With the pool gone, every stream dials independently under livekit's
+    per-stream retry with no coordination: a gateway outage with N streams
+    produced a thundering herd of dials (plus one HTTPS token exchange per
+    401-rejected cached token) against a gateway that may rate-limit or ban
+    the key. Dial ATTEMPTS are therefore capped per gateway credential, and
+    an exhausted window fails as a retryable ConnectionError - never a sleep.
+    """
+
+    @pytest.mark.asyncio
+    async def test_exhausted_window_fails_retryably_without_dialing(self):
+        ws = object()
+        session = FakeSession(
+            responses=[token_response("t")], ws_results=[ws, ws, ws]
+        )
+        dialer = make_dialer(session, max_dials_per_window=3)
+
+        for _ in range(3):
+            assert await dialer.dial("fr", 16000) is ws
+
+        with pytest.raises(ConnectionError) as excinfo:
+            await dialer.dial("fr", 16000)
+
+        message = str(excinfo.value)
+        assert "Dial rate limit" in message
+        assert "3 dial attempts per 60s" in message, message
+        assert len(session.ws_calls) == 3, "the 4th dial must not reach the wire"
+
+    @pytest.mark.asyncio
+    async def test_budget_is_shared_across_dialer_instances(self):
+        """Process-wide, not per dialer: the gateway's rate-limit/ban budget
+        for one key does not grow because a process hosts several plugins."""
+        ws = object()
+        first = FakeSession(responses=[token_response("t")], ws_results=[ws])
+        second = FakeSession(responses=[token_response("t")], ws_results=[ws])
+        d1 = make_dialer(first, max_dials_per_window=1)
+        d2 = make_dialer(second, max_dials_per_window=1)
+
+        assert d1._rate_limiter is d2._rate_limiter
+
+        assert await d1.dial("fr", 16000) is ws
+        with pytest.raises(ConnectionError, match="Dial rate limit"):
+            await d2.dial("fr", 16000)
+        assert second.ws_calls == []
+
+    @pytest.mark.asyncio
+    async def test_a_different_credential_has_its_own_budget(self):
+        ws = object()
+        mine = FakeSession(responses=[token_response("t")], ws_results=[ws])
+        theirs = FakeSession(responses=[token_response("t")], ws_results=[ws])
+        d1 = make_dialer(mine, max_dials_per_window=1)
+        d2 = VoxistDialer(
+            session=theirs,
+            base_url="wss://host/ws",
+            api_key="a-different-key",
+            max_dials_per_window=1,
+        )
+
+        assert d1._rate_limiter is not d2._rate_limiter
+        assert await d1.dial("fr", 16000) is ws
+        assert await d2.dial("fr", 16000) is ws
+
+    @pytest.mark.asyncio
+    async def test_the_post_401_redial_is_charged_too(self):
+        """The extra token exchange a rejected cached token triggers is part
+        of the herd, so the redial attempt draws from the same budget - and
+        the resulting error is surfaced verbatim, not double-wrapped by
+        dial()'s catch-all ([E])."""
+        session = FakeSession(
+            responses=[token_response("fresh")],
+            ws_results=[handshake_error(401)],
+        )
+        dialer = make_dialer(session, max_dials_per_window=1)
+        prime_cache(dialer, "stale")
+
+        with pytest.raises(ConnectionError) as excinfo:
+            await dialer.dial("fr", 16000)
+
+        assert "Dial rate limit" in str(excinfo.value)
+        assert "unexpectedly" not in str(excinfo.value), (
+            "our own mapped error must not be re-wrapped by the catch-all"
+        )
+        assert len(session.ws_calls) == 1, "no second socket"
+        assert session.get_calls == [], "and no extra token exchange either"

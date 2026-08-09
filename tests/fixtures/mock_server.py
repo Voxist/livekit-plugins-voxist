@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import random
 from collections.abc import Callable
 
 import aiohttp
@@ -10,25 +11,34 @@ from aiohttp import web
 
 class MockVoxistServer:
     """
-    Mock WebSocket server simulating Voxist API protocol.
+    Mock Voxist gateway: the SEC-001 token endpoint plus the WebSocket route.
 
-    Simulates the complete Voxist protocol:
-    1. HTTP token exchange: API key -> short-lived WebSocket token (SEC-001)
-    2. WebSocket connection authenticated with that token
-    3. Connection confirmation message
-    4. Binary Int16 audio reception
-    5. Partial and final transcription results
-    6. Done signal handling
+    What the plugin actually does against it, verified in connection.py:
 
-    Both the token endpoint and the WebSocket route are served on the same
-    host/port, because ConnectionPool._get_http_base_url() derives the token
-    URL from base_url by swapping the scheme and dropping the "/ws" suffix.
+    1. ``VoxistDialer._http_base_url()`` turns ``base_url`` into an HTTP base
+       by swapping the scheme (``wss://`` -> ``https://``, ``ws://`` ->
+       ``http://``) and dropping a trailing ``/ws``.
+    2. ``VoxistDialer._get_token_url()`` GETs ``{http_base}/websocket`` with
+       the API key in the ``api_key_header`` header and ``engine=voxist-rt``
+       as a query param, then reads the ``url`` field out of the JSON body.
+    3. ``VoxistDialer.dial()`` appends ``lang`` and ``sample_rate`` to that
+       URL and opens the WebSocket.
+    4. The socket carries binary Int16 audio up and transcription JSON down.
+       There is NO greeting frame (see websocket_handler).
+    5. ``"Done"`` is the end-of-SESSION signal: the engine flushes a last
+       final and the gateway then closes the client socket.
+
+    Both routes are therefore served on the SAME host/port, so a test can
+    point ``VoxistSTT(base_url=f"ws://{server.host}:{server.port}/ws")`` at
+    this server and exercise the real token exchange.
 
     By default the server binds port 0: the OS picks a free ephemeral port,
     so any number of servers (parallel pytest workers, concurrent suites,
     leaked processes from a previous run) coexist without EADDRINUSE. After
     start(), ``self.port`` holds the real bound port - always build URLs
-    from ``server.port`` AFTER ``await server.start()``.
+    from ``server.port`` AFTER ``await server.start()``. The default host is
+    the ``127.0.0.1`` LITERAL, not ``"localhost"``, so exactly one socket is
+    bound and ``self.port`` can honestly describe it (see start()).
 
     Example:
         server = MockVoxistServer()
@@ -43,7 +53,7 @@ class MockVoxistServer:
     def __init__(
         self,
         port: int = 0,
-        host: str = "localhost",
+        host: str = "127.0.0.1",
         *,
         valid_api_key: str = "test_key",
         processing_delay_ms: int = 50,
@@ -55,6 +65,9 @@ class MockVoxistServer:
         on_audio_received: Callable | None = None,
         api_key_header: str = "X-LVL-KEY",
         ws_token: str = "mock_jwt_token",
+        responses: list[dict] | None = None,
+        disconnect_after: int | None = None,
+        variable_latency: bool = False,
     ):
         """
         Initialize mock Voxist server.
@@ -62,26 +75,43 @@ class MockVoxistServer:
         Args:
             port: Server port; 0 (the default) binds an OS-assigned ephemeral
                   port, published on self.port once start() returns
-            host: Server host
+            host: Server host; must resolve to a SINGLE address family (the
+                  default is the 127.0.0.1 literal - see start())
             valid_api_key: Expected API key for authentication
             processing_delay_ms: Delay before sending final result (simulates processing)
             transcription_text: Text to return in transcription
             transcription_confidence: Confidence score (0.0-1.0)
             send_interim: Whether to send interim results
             interim_delay_ms: Delay before sending interim result
-            error_mode: Error simulation mode (None, "auth_failure",
-                        "disconnect", "wedge"). "wedge" models a wedged
-                        ENGINE behind a healthy gateway: the WebSocket layer
-                        stays connected (aiohttp answers pings at protocol
-                        level) and keeps accepting audio and Done, but never
-                        sends a single message and never closes - the exact
-                        mute-but-connected failure a transport heartbeat
-                        cannot see.
+            error_mode: Error simulation mode (None, "auth_failure", "wedge",
+                        "ws_blocked").
+                        "wedge" models a wedged ENGINE behind a healthy
+                        gateway: the WebSocket layer stays connected (aiohttp
+                        answers pings at protocol level) and keeps accepting
+                        audio and Done, but never sends a single message and
+                        never closes - the exact mute-but-connected failure a
+                        transport heartbeat cannot see.
+                        "ws_blocked" models a deployment whose HTTPS token
+                        endpoint is healthy but whose WebSocket path is broken
+                        (a proxy stripping the Upgrade header): /websocket
+                        hands out a valid-looking token URL while /ws answers
+                        a plain HTTP 200 instead of upgrading. Refusals are
+                        counted in self.ws_upgrade_refusals.
             on_audio_received: Callback when audio is received (for testing)
             api_key_header: Header carrying the API key on the token exchange
-                            (must match ConnectionPool.api_key_header)
+                            (must match VoxistDialer's api_key_header, whose
+                            default is also X-LVL-KEY)
             ws_token: Token handed out by the token endpoint and accepted by
                       the WebSocket route
+            responses: Scripted reply sequence - one dict per received audio
+                       frame, {"message": {...}, "delay": seconds}. While set,
+                       the script is the ONLY thing sent: the engine's own
+                       interim/segment-final generation is suspended so a test
+                       controls the exact message sequence.
+            disconnect_after: Close the socket with code 1001 once this many
+                              audio frames have arrived (reconnection testing)
+            variable_latency: Randomise the scripted delay to 20-100ms instead
+                              of honouring each response's "delay"
         """
         self.port = port
         self.host = host
@@ -109,6 +139,13 @@ class MockVoxistServer:
         self.error_mode = error_mode
         self.on_audio_received = on_audio_received
 
+        # Configurable behaviours (formerly a second, divergent handler in
+        # ConfigurableMockServer - see that class).
+        self.responses = responses or []
+        self.disconnect_after = disconnect_after
+        self.variable_latency = variable_latency
+        self._response_index = 0
+
         self.app = web.Application()
         self.app.router.add_get("/websocket", self.token_handler)
         self.app.router.add_get("/ws", self.websocket_handler)
@@ -119,22 +156,31 @@ class MockVoxistServer:
         self.token_requests_count = 0
         self.audio_frames_received = 0
         self.total_audio_bytes = 0
+        self.ws_upgrade_refusals = 0
 
     async def token_handler(self, request: web.Request) -> web.Response:
         """
         Handle the SEC-001 token exchange: API key -> WebSocket URL with token.
 
-        Contract, from ConnectionPool._get_ws_token():
+        Contract, as implemented by VoxistDialer._get_token_url():
         - GET {http_base}/websocket with the API key in the api_key_header
-          header and engine=voxist-rt as a query param
-        - 401/403 means the key is invalid and must not be retried
-        - any other non-200 is a transport failure
-        - a 200 body must carry a "url" field; the pool appends lang and
-          sample_rate to it and connects there
+          header and engine=voxist-rt as a query param, where {http_base} is
+          _http_base_url()'s scheme-swapped, "/ws"-stripped base_url
+        - 401/403 raises AuthenticationError: the key is invalid, and no retry
+          can fix it
+        - any other non-200 raises ConnectionError (a transport failure, which
+          livekit's conn_options.max_retry may retry)
+        - a 200 body must be a JSON OBJECT carrying a "url" string that starts
+          with ws:// or wss://; anything else raises ConnectionError. dial()
+          then appends lang and sample_rate to that url and connects there
 
-        The pool reads nothing else from the body: it caches the URL for a
-        hard-coded hour rather than honouring a server-supplied expiry, so
-        expires_in below is returned for fidelity but has no effect.
+        The dialer reads nothing else from the body. In particular it does NOT
+        read expires_in: the refresh deadline comes from the token's own JWT
+        exp claim (_token_expiry_from_url), sanity-clamped, falling back to the
+        gateway's known 1h lifetime when the claim is unreadable. self.ws_token
+        defaults to the non-JWT literal "mock_jwt_token", so that fallback is
+        the path tests normally take; expires_in below is returned only for
+        shape fidelity and has no effect.
         """
         self.token_requests_count += 1
 
@@ -148,16 +194,27 @@ class MockVoxistServer:
             "expires_in": 3600,
         })
 
-    async def websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
+    async def websocket_handler(self, request: web.Request) -> web.StreamResponse:
         """
-        Handle WebSocket connection.
+        Handle the WebSocket route, as the gateway does.
 
-        Implements Voxist protocol:
-        1. Authenticate via query parameter
-        2. Send connection confirmation
-        3. Process audio frames
-        4. Send transcription results
+        1. Authenticate the token (or a raw api_key) from the query string
+        2. Send NOTHING on connect - the gateway has no greeting frame
+        3. Receive binary Int16 audio; emit one partial per segment and one
+           final per silence-delimited segment
+        4. Treat "Done" as end-of-SESSION: flush a final, then close
+
+        error_mode shortcuts this: "ws_blocked" never upgrades at all,
+        "auth_failure" closes with 1008, "wedge" accepts everything and
+        answers nothing.
         """
+        if self.error_mode == "ws_blocked":
+            # Broken WebSocket path behind a healthy token endpoint: answer
+            # the plain HTTP request instead of upgrading, exactly as a proxy
+            # that stripped the Upgrade header would.
+            self.ws_upgrade_refusals += 1
+            return web.Response(text="the proxy ate your Upgrade header")
+
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
@@ -193,6 +250,7 @@ class MockVoxistServer:
             sample_rate = int(request.query.get("sample_rate", "16000"))
             bytes_per_ms = sample_rate * 2 // 1000
             interim_sent_for_segment = False
+            frame_count = 0
 
             async def finalize_segment() -> None:
                 nonlocal speech_bytes, silence_run_ms, interim_sent_for_segment
@@ -249,9 +307,36 @@ class MockVoxistServer:
                 elif msg.type == aiohttp.WSMsgType.BINARY:
                     self.audio_frames_received += 1
                     self.total_audio_bytes += len(msg.data)
+                    frame_count += 1
 
                     if self.on_audio_received:
                         self.on_audio_received(msg.data, len(msg.data) // 2)
+
+                    # Optional: model a gateway that drops the socket
+                    # mid-session (reconnection testing).
+                    if (
+                        self.disconnect_after is not None
+                        and frame_count >= self.disconnect_after
+                    ):
+                        await ws.close(code=1001, message=b"Test disconnect")
+                        return ws
+
+                    if self.responses:
+                        # Scripted mode: the test owns the message sequence, so
+                        # the engine's own interim/final generation is
+                        # suspended (speech_bytes stays 0, so a later "Done"
+                        # finalizes nothing and just closes).
+                        if self._response_index < len(self.responses):
+                            response = self.responses[self._response_index]
+                            self._response_index += 1
+                            if self.variable_latency:
+                                delay = random.uniform(0.02, 0.1)  # 20-100ms
+                            else:
+                                delay = response.get("delay", 0.05)
+                            if delay:
+                                await asyncio.sleep(delay)
+                            await ws.send_json(response["message"])
+                        continue
 
                     is_silence = not any(msg.data)
                     if is_silence:
@@ -289,7 +374,19 @@ class MockVoxistServer:
         return ws
 
     async def start(self):
-        """Start the mock WebSocket server."""
+        """
+        Start the mock server on exactly ONE listening socket.
+
+        The single-socket requirement is not pedantry. A hostname like
+        "localhost" resolves to both 127.0.0.1 and ::1, so aiohttp's TCPSite
+        opens one listener per family - and with port=0 the OS assigns each a
+        DIFFERENT ephemeral port. self.port can only publish one of them, so a
+        client that resolved the host to the other family would dial a port
+        nothing ever advertised: an intermittent connection failure that reads
+        as a random flake. Binding a single-family literal (the 127.0.0.1
+        default) makes self.port an honest description of the server.
+        """
+        requested_port = self.port
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
 
@@ -300,7 +397,22 @@ class MockVoxistServer:
         # so URL construction (tests AND token_handler) uses it. The listening
         # socket lives on the underlying asyncio Server held by the TCPSite.
         assert self.site._server is not None
-        self.port = self.site._server.sockets[0].getsockname()[1]
+        sockets = self.site._server.sockets
+        if requested_port == 0 and len(sockets) != 1:
+            # Multi-family bind with an OS-assigned port: the ports differ per
+            # family and only one can be published. Fail loudly at start()
+            # rather than hand out a URL that works for some resolutions only.
+            await self.site.stop()
+            await self.runner.cleanup()
+            self.site = None
+            self.runner = None
+            raise RuntimeError(
+                f"host={self.host!r} bound {len(sockets)} listening sockets; "
+                "with port=0 each address family gets a DIFFERENT ephemeral "
+                "port and only one can be advertised. Use a single-family "
+                "literal host such as '127.0.0.1' (the default)."
+            )
+        self.port = sockets[0].getsockname()[1]
 
         print(
             f"Mock Voxist server started at ws://{self.host}:{self.port}/ws "
@@ -319,124 +431,48 @@ class MockVoxistServer:
 
     def get_stats(self) -> dict:
         """
-        Get server statistics.
+        Snapshot of everything the server observed.
 
-        Returns:
-            Dictionary with connection and audio stats
+        Lists are copied so a snapshot never mutates underneath a test that
+        holds it while the server keeps running.
         """
         return {
             "connections_count": self.connections_count,
             "token_requests_count": self.token_requests_count,
             "audio_frames_received": self.audio_frames_received,
             "total_audio_bytes": self.total_audio_bytes,
+            "ws_upgrade_refusals": self.ws_upgrade_refusals,
+            "connected_languages": list(self.connected_languages),
+            "done_received_count": self.done_received_count,
+            "finals_sent": self.finals_sent,
+            "segments_finalized": list(self.segments_finalized),
         }
 
     def reset_stats(self):
-        """Reset server statistics."""
+        """Reset every counter get_stats() reports."""
         self.connections_count = 0
         self.token_requests_count = 0
         self.audio_frames_received = 0
         self.total_audio_bytes = 0
+        self.ws_upgrade_refusals = 0
+        self.connected_languages = []
+        self.done_received_count = 0
+        self.finals_sent = 0
+        self.segments_finalized = []
 
 
 class ConfigurableMockServer(MockVoxistServer):
     """
-    Extended mock server with configurable behaviors for advanced testing.
+    Backwards-compatible name for behaviours that now live on the base class.
 
-    Supports:
-    - Multi-utterance handling
-    - Custom response sequences
-    - Connection drops
-    - Latency variations
+    This used to override websocket_handler with a SECOND, independent
+    implementation, and it drifted from the contract the base class enforces:
+    it still sent a {"status": "connected"} greeting the real gateway never
+    sends, had no silence-delimited segmentation, and ignored error_mode
+    entirely. Its extra behaviours are plain MockVoxistServer options now
+    (``responses``, ``disconnect_after``, ``variable_latency``), so it adds
+    nothing and inherits the gateway-faithful handler, the ws_blocked/wedge
+    error modes, and the full stats surface.
+
+    Prefer MockVoxistServer(...) directly in new tests.
     """
-
-    def __init__(
-        self,
-        port: int = 0,
-        *,
-        responses: list[dict] | None = None,
-        disconnect_after: int | None = None,
-        variable_latency: bool = False,
-        **kwargs
-    ):
-        """
-        Initialize configurable mock server.
-
-        Args:
-            port: Server port; 0 (the default) binds an OS-assigned ephemeral
-                  port, published on self.port once start() returns
-            responses: List of response dicts to send in sequence
-            disconnect_after: Disconnect after N audio frames (for reconnection testing)
-            variable_latency: Vary processing delay randomly (20-100ms)
-            **kwargs: Additional arguments for MockVoxistServer
-        """
-        super().__init__(port=port, **kwargs)
-
-        self.responses = responses or []
-        self.disconnect_after = disconnect_after
-        self.variable_latency = variable_latency
-        self._response_index = 0
-
-    async def websocket_handler(self, request: web.Request) -> web.WebSocketResponse:
-        """Extended handler with configurable behaviors."""
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-
-        self.connections_count += 1
-
-        try:
-            # Authenticate (token issued by /websocket, or a raw key)
-            credential = request.query.get("api_key") or request.query.get("token")
-            if credential not in (self.valid_api_key, self.ws_token):
-                await ws.close(code=1008, message=b"Invalid API key")
-                return ws
-
-            # Send connection confirmation
-            await ws.send_json({"status": "connected"})
-
-            frame_count = 0
-
-            # Process messages
-            async for msg in ws:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    # Handle JSON or "Done"
-                    try:
-                        json.loads(msg.data)
-                        # Config received
-                    except json.JSONDecodeError:
-                        if "Done" in msg.data:
-                            break
-
-                elif msg.type == aiohttp.WSMsgType.BINARY:
-                    self.audio_frames_received += 1
-                    self.total_audio_bytes += len(msg.data)
-                    frame_count += 1
-
-                    # Check disconnect condition
-                    if self.disconnect_after and frame_count >= self.disconnect_after:
-                        await ws.close(code=1001, message=b"Test disconnect")
-                        return ws
-
-                    # Send configured responses
-                    if self.responses and self._response_index < len(self.responses):
-                        response = self.responses[self._response_index]
-
-                        # Apply variable latency if enabled
-                        if self.variable_latency:
-                            import random
-                            delay = random.uniform(0.02, 0.1)  # 20-100ms
-                        else:
-                            delay = response.get("delay", 0.05)
-
-                        await asyncio.sleep(delay)
-                        await ws.send_json(response["message"])
-                        self._response_index += 1
-
-        except Exception as e:
-            print(f"ConfigurableMockServer error: {e}")
-
-        finally:
-            if not ws.closed:
-                await ws.close()
-
-        return ws

@@ -50,33 +50,6 @@ def event_loop():
 
 
 @pytest.fixture
-def mock_token_exchange_for_server():
-    """
-    Factory fixture to mock token exchange for a specific mock server.
-
-    Use this in integration tests that need to test with a mock server:
-
-        @pytest.mark.no_auto_mock_token
-        async def test_something(self, mock_voxist_server, mock_token_exchange_for_server):
-            with mock_token_exchange_for_server(mock_voxist_server):
-                # Test code here
-    """
-    from contextlib import contextmanager
-
-    @contextmanager
-    def _mock_for_server(server):
-        from livekit.plugins.voxist.connection import VoxistDialer
-
-        async def _mock_get_token_url(self) -> str:
-            return f"ws://{server.host}:{server.port}/ws?token=mock_jwt_token"
-
-        with patch.object(VoxistDialer, '_get_token_url', _mock_get_token_url):
-            yield
-
-    return _mock_for_server
-
-
-@pytest.fixture
 def sample_rate():
     """Default sample rate for tests."""
     return 16000
@@ -95,14 +68,14 @@ async def mock_voxist_server():
 
     The server exposes both the SEC-001 token endpoint and the WebSocket
     route, so integration tests exercise the real token exchange rather than
-    a patched _get_ws_token.
+    a patched VoxistDialer._get_token_url.
 
-    Binds an OS-assigned ephemeral port (no fixed-port collisions between
-    parallel runs); read the real port from server.port - the fixture only
-    yields after start(), so it is always resolved.
+    Binds one socket on an OS-assigned ephemeral port (no fixed-port
+    collisions between parallel runs); read the real port from server.port -
+    the fixture only yields after start(), so it is always resolved.
 
     Yields:
-        MockVoxistServer instance running on an ephemeral localhost port
+        MockVoxistServer instance running on an ephemeral 127.0.0.1 port
     """
     server = MockVoxistServer(
         valid_api_key="test_key",

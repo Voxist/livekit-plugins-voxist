@@ -17,6 +17,7 @@ from livekit.plugins.voxist import VoxistSTT
 from livekit.plugins.voxist.exceptions import (
     ConfigurationError,
     LanguageNotSupportedError,
+    VoxistError,
 )
 from livekit.plugins.voxist.exceptions import (
     ConnectionError as VoxistConnectionError,
@@ -1108,7 +1109,14 @@ class TestSessionLoopAffinity:
     owned) or a clear mapped error (caller-supplied). A session bound to a
     loop that is ALIVE but not the running one is neither destroyed nor
     rebuilt: multi-loop sharing is unsupported, and the healthy loop's
-    session (and its token cache) must survive, so it is a mapped error.
+    session (and its token cache) must survive.
+
+    Contract update ([8]): the alive-foreign-loop case raises RuntimeError,
+    NOT our ConnectionError. Round 6 used ConnectionError, which the stream
+    maps to a retryable APIConnectionError - so livekit burned its whole
+    retry schedule (three misleading recoverable=True events) on a
+    programming error that cannot change between attempts, then reported a
+    wrapper instead of the real cause.
     """
 
     def test_owned_session_is_rebuilt_for_a_new_loop(self):
@@ -1135,9 +1143,12 @@ class TestSessionLoopAffinity:
     def test_alive_foreign_loop_errors_without_destroying_the_session(self):
         """
         [6] Two LIVE loops sharing one VoxistSTT: the second loop must get
-        a clear mapped error, and the first loop's session, dialer and
-        token cache must survive untouched - no rebuild thrash, no leaked
-        connectors, no misleading 'defunct loop' warning.
+        a clear error, and the first loop's session, dialer and token cache
+        must survive untouched - no rebuild thrash, no leaked connectors, no
+        misleading 'defunct loop' warning.
+
+        [8] The error must be a non-APIError-mappable RuntimeError so
+        livekit fails fast on the programming error instead of retrying it.
         """
         stt = VoxistSTT(api_key="test_key")  # constructed with no loop
 
@@ -1156,9 +1167,16 @@ class TestSessionLoopAffinity:
 
             # loop_a is still ALIVE: this must be an error, not a rebuild
             with pytest.raises(
-                VoxistConnectionError, match="different running event loop"
-            ):
+                RuntimeError, match="different running event loop"
+            ) as excinfo:
                 asyncio.run(ensure())
+
+            # [8] It must NOT be our ConnectionError: stream.py maps that to
+            # a retryable APIConnectionError, and no retry can fix a
+            # programming error. RuntimeError takes _main_task's terminal
+            # branch (one recoverable=False event, real cause surfaced).
+            assert not isinstance(excinfo.value, VoxistConnectionError)
+            assert not isinstance(excinfo.value, VoxistError)
 
             # the healthy loop's state survives...
             assert stt._session is session_a
@@ -1556,3 +1574,322 @@ class TestWebSocketReachabilityValidation:
         )
 
         await stt.aclose()
+
+
+async def _quiesce_background_init(stt: VoxistSTT) -> None:
+    """Cancel the fire-and-forget warm-up so a test owns the state machine.
+
+    Without this a background task completing mid-test can overwrite the
+    state the test just asserted on.
+    """
+    if stt._init_task is not None:
+        stt._init_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await stt._init_task
+
+
+def _install_fake_clock(stt: VoxistSTT, start: float = 1000.0) -> dict:
+    """Replace the readiness cooldown's clock seam on ONE instance (never the
+    global clock, which asyncio depends on)."""
+    clock = {"now": start}
+    stt._now = lambda: clock["now"]  # type: ignore[method-assign]
+    return clock
+
+
+class TestReadinessRecoveryAfterTransientFailure:
+    """
+    [2] FAILED must not be terminal for transient causes. A background
+    warm-up could succeed (COMPLETED) and then one blip in the one-shot WS
+    probe bricked the plugin for the rest of its life: wait_for_initialization
+    returned False on its first line forever, is_ready stayed False and
+    check_initialization() kept raising - even though stream() would have
+    dialed and transcribed fine the moment the blip cleared.
+
+    A rejected credential is the deliberate exception: it stays sticky.
+    """
+
+    @pytest.mark.asyncio
+    async def test_transient_probe_failure_recovers_after_the_cooldown(self):
+        from livekit.plugins.voxist import InitializationState
+
+        stt = VoxistSTT(api_key="test")
+        await _quiesce_background_init(stt)
+        clock = _install_fake_clock(stt)
+
+        ws = AsyncMock()
+        dialer = AsyncMock()
+        dialer.dial = AsyncMock(
+            side_effect=[VoxistConnectionError("transient blip"), ws]
+        )
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.COMPLETED
+
+        # One blip in the probe fails readiness...
+        assert await stt.wait_for_initialization(timeout=5.0) is False
+        assert stt.initialization_state is InitializationState.FAILED
+        assert stt.is_ready is False
+
+        # ...and inside the cooldown it is not re-probed (no dial herd).
+        clock["now"] += stt.READINESS_RETRY_COOLDOWN_SECONDS - 1.0
+        assert await stt.wait_for_initialization(timeout=5.0) is False
+        assert dialer.dial.await_count == 1
+
+        # Past the cooldown the probe is re-attempted, succeeds, and the
+        # plugin becomes ready again.
+        clock["now"] += 2.0
+        assert await stt.wait_for_initialization(timeout=5.0) is True
+        assert dialer.dial.await_count == 2
+        assert stt.initialization_state is InitializationState.COMPLETED
+        assert stt.is_ready is True
+        stt.check_initialization()  # no longer raises
+        assert stt.initialization_error is None, (
+            "a recovered plugin must not keep reporting the cleared blip"
+        )
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_rejected_credential_stays_sticky_past_the_cooldown(self):
+        """A key the gateway refused cannot be fixed by re-probing, and
+        hammering it is how a key gets banned."""
+        from livekit.plugins.voxist import (
+            InitializationError,
+            InitializationState,
+        )
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+
+        stt = VoxistSTT(api_key="test")
+        await _quiesce_background_init(stt)
+        clock = _install_fake_clock(stt)
+
+        dialer = AsyncMock()
+        dialer.dial = AsyncMock(side_effect=AuthenticationError("revoked key"))
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.COMPLETED
+
+        assert await stt.wait_for_initialization(timeout=5.0) is False
+
+        clock["now"] += 10 * stt.READINESS_RETRY_COOLDOWN_SECONDS
+        assert await stt.wait_for_initialization(timeout=5.0) is False
+        assert dialer.dial.await_count == 1, "a rejected key must not be re-probed"
+        assert stt.initialization_state is InitializationState.FAILED
+
+        with pytest.raises(InitializationError, match="will not clear"):
+            stt.check_initialization()
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_message_advertises_the_retry(self):
+        from livekit.plugins.voxist import (
+            InitializationError,
+            InitializationState,
+        )
+
+        stt = VoxistSTT(api_key="test")
+        await _quiesce_background_init(stt)
+        _install_fake_clock(stt)
+
+        dialer = AsyncMock()
+        dialer.dial = AsyncMock(side_effect=VoxistConnectionError("blip"))
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.COMPLETED
+
+        assert await stt.wait_for_initialization(timeout=5.0) is False
+        with pytest.raises(InitializationError, match="transient"):
+            stt.check_initialization()
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_a_transient_token_failure_also_recovers(self):
+        """The recovery path is not probe-specific: a warm-up that failed on
+        the token exchange re-runs it too."""
+        from livekit.plugins.voxist import InitializationState
+
+        stt = VoxistSTT(api_key="test", validate_websocket=False)
+        await _quiesce_background_init(stt)
+        clock = _install_fake_clock(stt)
+
+        dialer = AsyncMock()
+        dialer._get_token_url = AsyncMock(
+            side_effect=[VoxistConnectionError("gateway down"), "ws://ok/?t=1"]
+        )
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.NOT_STARTED
+
+        assert await stt.wait_for_initialization(timeout=5.0) is False
+        assert stt.initialization_state is InitializationState.FAILED
+
+        clock["now"] += stt.READINESS_RETRY_COOLDOWN_SECONDS + 1.0
+        assert await stt.wait_for_initialization(timeout=5.0) is True
+        assert stt.initialization_state is InitializationState.COMPLETED
+
+        await stt.aclose()
+
+
+class TestConcurrentReadinessProbe:
+    """
+    [9] The probe guard was a check-then-await-then-set, so two concurrent
+    readiness calls (asyncio.gather, or a health endpoint racing
+    `async with`) both dialed: two real WebSockets and two server-side ASR
+    engine sessions, breaking the documented probe budget.
+
+    Invariant: at most one probe IN FLIGHT, and at most one PER COOLDOWN
+    WINDOW.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_readiness_calls_dial_once(self):
+        from livekit.plugins.voxist import InitializationState
+
+        stt = VoxistSTT(api_key="test")
+        await _quiesce_background_init(stt)
+
+        ws = AsyncMock()
+
+        async def slow_dial(*args, **kwargs):
+            await asyncio.sleep(0.05)  # wide enough for the racer to enter
+            return ws
+
+        dialer = AsyncMock()
+        dialer.dial = AsyncMock(side_effect=slow_dial)
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.COMPLETED
+
+        results = await asyncio.gather(
+            stt.wait_for_initialization(timeout=5.0),
+            stt.wait_for_initialization(timeout=5.0),
+        )
+
+        assert results == [True, True]
+        assert dialer.dial.await_count == 1, (
+            "concurrent readiness must open exactly one probe socket"
+        )
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_two_concurrent_failing_probes_dial_once(self):
+        """The failure path is bounded by the same budget: the loser of the
+        race must not dial again the instant the winner fails."""
+        from livekit.plugins.voxist import InitializationState
+
+        stt = VoxistSTT(api_key="test")
+        await _quiesce_background_init(stt)
+        _install_fake_clock(stt)
+
+        async def slow_boom(*args, **kwargs):
+            await asyncio.sleep(0.05)
+            raise VoxistConnectionError("blip")
+
+        dialer = AsyncMock()
+        dialer.dial = AsyncMock(side_effect=slow_boom)
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.COMPLETED
+
+        results = await asyncio.gather(
+            stt.wait_for_initialization(timeout=5.0),
+            stt.wait_for_initialization(timeout=5.0),
+        )
+
+        assert results == [False, False]
+        assert dialer.dial.await_count == 1, (
+            "at most one probe per cooldown window, failures included"
+        )
+
+        await stt.aclose()
+
+
+class TestSessionLoopIntrospectionFailsLoud:
+    """
+    [11] _session_loop used to read aiohttp's private ClientSession._loop and
+    return None silently when absent, which disabled BOTH loop guards at
+    once: no defunct-loop rebuild and no alive-foreign-loop diagnosis. On an
+    aiohttp release that renames the attribute, a plugin built under one
+    asyncio.run() and used under another then died inside ws_connect with
+    RuntimeError('Event loop is closed'), mapped to a generic retryable
+    transport error - a misleading network diagnosis for a loop-affinity bug.
+    """
+
+    def test_owned_session_rebuild_survives_broken_introspection(self):
+        """A plugin-owned session records its loop at creation, so the
+        rebuild does not depend on aiohttp introspection at all."""
+        stt = VoxistSTT(api_key="test_key")  # no loop: init on demand
+
+        async def ensure():
+            await stt._ensure_dialer()
+            return stt._session
+
+        first = asyncio.run(ensure())
+        assert first is not None
+        # Simulate the aiohttp rename: the binding is no longer an event
+        # loop. Mock (not a bare object) so aiohttp's own __del__ - which
+        # pokes _loop.call_exception_handler - stays quiet.
+        first._loop = Mock()
+
+        second = asyncio.run(ensure())
+        assert second is not first, (
+            "an unreadable binding must not silently disable the rebuild"
+        )
+
+        asyncio.run(stt.aclose())
+
+    def test_unreadable_binding_warns_and_keeps_the_foreign_loop_guard(
+        self, caplog, monkeypatch
+    ):
+        """A caller-supplied session cannot be rebuilt, so it is pinned to
+        the loop that first used it - the guard stays armed - and the aiohttp
+        incompatibility is named in the log instead of swallowed."""
+        monkeypatch.setattr(VoxistSTT, "_loop_introspection_warned", False)
+
+        loop_a = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop_a.run_forever, daemon=True)
+        thread.start()
+        try:
+            session = asyncio.run_coroutine_threadsafe(
+                _make_session(), loop_a
+            ).result(timeout=5)
+            session._loop = Mock()  # the aiohttp rename
+            stt = VoxistSTT(api_key="test_key", http_session=session)
+
+            with caplog.at_level(
+                logging.WARNING, logger="livekit.plugins.voxist"
+            ):
+                asyncio.run_coroutine_threadsafe(
+                    stt._ensure_dialer(), loop_a
+                ).result(timeout=5)
+
+            messages = [r.message for r in caplog.records]
+            assert any(
+                "Cannot determine which event loop" in m and "aiohttp" in m
+                for m in messages
+            ), messages
+
+            # Warned once per process, not once per dial.
+            caplog.clear()
+            asyncio.run_coroutine_threadsafe(
+                stt._ensure_dialer(), loop_a
+            ).result(timeout=5)
+            assert not any(
+                "Cannot determine which event loop" in r.message
+                for r in caplog.records
+            )
+
+            # And the foreign-loop guard is still armed for a second loop.
+            with pytest.raises(RuntimeError, match="different running event loop"):
+                asyncio.run(stt._ensure_dialer())
+        finally:
+            asyncio.run_coroutine_threadsafe(stt.aclose(), loop_a).result(
+                timeout=5
+            )
+            asyncio.run_coroutine_threadsafe(session.close(), loop_a).result(
+                timeout=5
+            )
+            loop_a.call_soon_threadsafe(loop_a.stop)
+            thread.join(timeout=5)
+            loop_a.close()
+
+
+async def _make_session() -> aiohttp.ClientSession:
+    return aiohttp.ClientSession()

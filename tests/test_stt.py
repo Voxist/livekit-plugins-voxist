@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import threading
@@ -335,6 +336,9 @@ class TestVoxistSTTIntegration:
 
             # Should have created task for pool initialization
             mock_create_task.assert_called_once()
+            # The mocked loop does not take ownership of the coroutine the
+            # way a real create_task() call does, so close it explicitly.
+            mock_create_task.call_args.args[0].close()
 
     def test_pool_configuration_propagated(self):
         """Test pool receives correct configuration from STT."""
@@ -569,7 +573,7 @@ class TestQUAL002InitializationState:
         stt = VoxistSTT(api_key="test")
 
         assert hasattr(stt, 'wait_for_initialization')
-        assert asyncio.iscoroutinefunction(stt.wait_for_initialization)
+        assert inspect.iscoroutinefunction(stt.wait_for_initialization)
 
     def test_stt_has_check_initialization_method(self):
         """Test that VoxistSTT has check_initialization method."""

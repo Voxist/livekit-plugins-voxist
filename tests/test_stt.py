@@ -708,13 +708,70 @@ class TestQUAL002InitializationState:
 
     @pytest.mark.asyncio
     async def test_is_ready_true_after_completion(self):
-        """Test is_ready is True after successful initialization."""
+        """Token-only initialization is enough when WS validation is disabled."""
         from livekit.plugins.voxist import InitializationState
 
-        stt = VoxistSTT(api_key="test")
+        stt = VoxistSTT(api_key="test", validate_websocket=False)
         stt._init_state = InitializationState.COMPLETED
 
         assert stt.is_ready is True
+
+    @pytest.mark.asyncio
+    async def test_is_ready_requires_ws_proof_when_validation_enabled(self):
+        """A cached token must not masquerade as a reachable WebSocket."""
+        from livekit.plugins.voxist import InitializationState
+
+        stt = VoxistSTT(api_key="test", validate_websocket=True)
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        stt._init_state = InitializationState.COMPLETED
+        stt._dialer = Mock(_token_url="ws://cached-token")
+
+        assert stt.is_ready is False
+
+        stt._ws_validated = True
+        assert stt.is_ready is True
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_late_success_clears_timeout_metadata(self):
+        """A shielded warm-up that succeeds after a caller timeout is clean."""
+        from livekit.plugins.voxist import InitializationState
+
+        stt = VoxistSTT(api_key="test", validate_websocket=False)
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_fetch():
+            started.set()
+            await release.wait()
+            return "ws://fresh-token"
+
+        dialer = AsyncMock()
+        dialer._get_token_url = slow_fetch
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.PENDING
+        stt._init_task = asyncio.create_task(stt._initialize_pool())
+
+        await started.wait()
+        assert await stt.wait_for_initialization(timeout=0.01) is False
+        assert stt.initialization_state is InitializationState.FAILED
+
+        release.set()
+        await stt._init_task
+
+        assert stt.initialization_state is InitializationState.COMPLETED
+        assert stt.initialization_error is None
+        assert stt._init_failed_at is None
+        await stt.aclose()
 
     @pytest.mark.asyncio
     async def test_state_transition_running(self):
@@ -1527,6 +1584,33 @@ class TestWebSocketReachabilityValidation:
             "validate_websocket=False must not dial"
         )
 
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_probe_close_is_bounded(self, monkeypatch):
+        """A peer that stalls its close handshake must not hang readiness."""
+        from livekit.plugins.voxist import InitializationState
+
+        class HangingProbeWebSocket:
+            async def close(self):
+                await asyncio.Event().wait()
+
+        stt = VoxistSTT(api_key="test", validate_websocket=True)
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+
+        dialer = AsyncMock()
+        dialer.dial.return_value = HangingProbeWebSocket()
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.COMPLETED
+        monkeypatch.setattr(stt, "READINESS_CLOSE_TIMEOUT_SECONDS", 0.01)
+
+        assert await asyncio.wait_for(
+            stt.wait_for_initialization(timeout=1.0), timeout=0.5
+        ) is True
+        assert stt._ws_validated is True
         await stt.aclose()
 
     @pytest.mark.asyncio

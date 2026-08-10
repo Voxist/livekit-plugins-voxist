@@ -320,6 +320,10 @@ class VoxistSTT(STT):
     # tighter or looser probe cadence.
     READINESS_RETRY_COOLDOWN_SECONDS = 30.0
 
+    # A readiness probe has already proved reachability when this close runs;
+    # do not let a peer that stalls its close handshake hold readiness open.
+    READINESS_CLOSE_TIMEOUT_SECONDS = 1.0
+
     @staticmethod
     def _now() -> float:
         """Monotonic clock seam for the readiness cooldown (tests override it
@@ -574,7 +578,13 @@ class VoxistSTT(STT):
         """
         dialer = await self._ensure_dialer()
         # Always 16kHz on the wire; the stream resamples its input.
-        return await dialer.dial(language, 16000)
+        ws = await dialer.dial(language, 16000)
+        # A real stream dial is also a successful reachability proof. This
+        # keeps is_ready useful for applications that use the stream directly
+        # instead of calling wait_for_initialization() first.
+        if self._validate_websocket:
+            self._ws_validated = True
+        return ws
 
     async def _initialize_pool(self) -> None:
         """
@@ -608,6 +618,12 @@ class VoxistSTT(STT):
         try:
             dialer = await self._ensure_dialer()
             await dialer._get_token_url()
+            # A prior timeout or transient transport error may have been
+            # recorded while this task continued in the background. A later
+            # success must clear that stale diagnostic state along with the
+            # FAILED transition.
+            self._init_error = None
+            self._init_failed_at = None
             self._init_state = InitializationState.COMPLETED
             logger.debug("Token pre-fetch complete (state: COMPLETED)")
         except AuthenticationError as e:
@@ -697,7 +713,27 @@ class VoxistSTT(STT):
             self._probe_failed_at = None
             self._probe_error = None
         try:
-            await ws.close()
+            await asyncio.wait_for(
+                ws.close(), timeout=self.READINESS_CLOSE_TIMEOUT_SECONDS
+            )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            # The peer accepted the probe, so readiness is already proven; a
+            # stalled close must not keep the caller waiting. Abort the
+            # underlying transport as the final cleanup step.
+            response = getattr(ws, "_response", None)
+            connection = getattr(response, "connection", None)
+            transport = getattr(connection, "transport", None)
+            if transport is not None:
+                try:
+                    transport.abort()
+                except (AttributeError, RuntimeError):
+                    pass
+            logger.warning(
+                "WebSocket readiness probe close timed out; aborted the "
+                "probe transport"
+            )
         except Exception as e:
             # Reachability is proven by the successful dial; a hiccup while
             # closing the probe socket must not fail readiness.
@@ -916,11 +952,16 @@ class VoxistSTT(STT):
         Returns:
             True if ready, False otherwise
         """
-        if self._init_state == InitializationState.COMPLETED:
-            return True
         if self._init_state == InitializationState.FAILED:
             return False
-        # Also ready if a token was fetched on demand by a stream
+        if self._validate_websocket:
+            # Token exchange is HTTPS-only. With the default readiness
+            # contract, a cached token is not enough: require either the
+            # explicit probe or a successful real stream dial.
+            return self._ws_validated
+        if self._init_state == InitializationState.COMPLETED:
+            return True
+        # In token-only mode, a token fetched on demand is sufficient.
         return self._dialer is not None and self._dialer._token_url is not None
 
     async def wait_for_initialization(self, timeout: float = 30.0) -> bool:

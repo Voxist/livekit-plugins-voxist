@@ -13,10 +13,16 @@ That covers TranscriptLostError and every export added after it.
 """
 
 import importlib
+from importlib.metadata import version
 
 import pytest
 
 import livekit.plugins.voxist as voxist
+
+
+def test_runtime_version_matches_installed_package_metadata():
+    """The public runtime version must match the artifact users installed."""
+    assert voxist.__version__ == version("livekit-plugins-voxist")
 
 
 def test_all_is_declared_and_unique():

@@ -22,9 +22,9 @@ classifiers = [
 ]
 
 dependencies = [
-    # 1.x floor: the plugin uses NOT_GIVEN/NotGivenOr and livekit.agents.stt
-    # APIs that do not exist in 0.8.x, so the old >=0.8.0 floor was never real.
-    "livekit-agents>=1.0.0",
+    # The plugin imports LanguageCode in addition to NOT_GIVEN/NotGivenOr.
+    # LanguageCode is part of the supported API from livekit-agents 1.6.0.
+    "livekit-agents>=1.6.0",
     # Matches livekit-agents' own aiohttp~=3.10 requirement.
     "aiohttp>=3.10",
     "numpy>=1.24.0",

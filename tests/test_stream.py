@@ -3201,3 +3201,95 @@ class TestRoundNineRegressions:
             "the engine finalized the session; the drain must not call that "
             "a lost transcript"
         )
+
+
+class TestEngineDoneAck:
+    """
+    The engine acks "Done" with a bare non-JSON "Done!" text frame.
+
+    Verified live against api-asr.voxist.com (lang=fr): it arrives ~0.12s
+    after Done, immediately behind the last final, and the socket then stays
+    OPEN indefinitely (12s later it was still open). The API's own reference
+    client skips the same frame (kroko/bench/asr_bench.py:103).
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_ack_is_not_logged_as_malformed(self, caplog):
+        """It is protocol, not garbage - and it arrives once per session."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+
+        ws.incoming.put_nowait(
+            SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+        )
+        ws.end()
+        with caplog.at_level(logging.DEBUG, logger="livekit.plugins.voxist"):
+            await asyncio.wait_for(stream._recv_results_task(), timeout=5.0)
+
+        assert not [
+            r for r in caplog.records if "invalid JSON" in r.message
+        ], "the engine's own ack must not be reported as malformed input"
+        assert stream._engine_acked_done
+
+    @pytest.mark.asyncio
+    async def test_the_ack_is_not_credited_as_engine_progress(self):
+        """It proves the engine finished, not that it transcribed anything."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+        stream._bytes_sent_since_progress = 900_000
+
+        ws.incoming.put_nowait(
+            SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+        )
+        ws.end()
+        await asyncio.wait_for(stream._recv_results_task(), timeout=5.0)
+
+        assert stream._bytes_sent_since_progress == 900_000
+        assert stream._last_final_at is None
+
+    @pytest.mark.asyncio
+    async def test_the_ack_ends_the_turn_without_waiting_out_the_idle_margin(
+        self, monkeypatch
+    ):
+        """
+        The point of the fast path: on an engine that never closes the socket
+        (lang=fr in production), the turn used to cost the full idle margin -
+        or the 5s backstop - of dead air after the engine had already
+        finished.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 3.0, raising=False
+        )
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 10.0, raising=False
+        )
+        ws = FakeWS()  # never closes, as the real gateway does not
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.1)
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        started = time.monotonic()
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+        elapsed = time.monotonic() - started
+        await task
+
+        assert stream._session_complete
+        assert elapsed < 2.0, (
+            f"the turn took {elapsed:.2f}s: the engine had already acked, so "
+            "neither the idle margin nor the backstop should have been waited "
+            "out"
+        )

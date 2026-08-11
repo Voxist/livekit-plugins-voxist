@@ -430,6 +430,9 @@ class VoxistSTTStream(RecognizeStream):
         #                            report; None until one arrives
         # ------------------------------------------------------------------
         self._done_sent = False
+        # The engine's own "Done!" acknowledgement arrived on this socket.
+        # Set by the receive task, read by the drain as a positive terminator.
+        self._engine_acked_done = False
         self._session_complete = False
         self._audio_consumed = False
         self._final_received = False
@@ -522,6 +525,7 @@ class VoxistSTTStream(RecognizeStream):
         # before end of input" guard and the "connection lost before Done"
         # guard for this whole attempt.
         self._done_sent = False
+        self._engine_acked_done = False
         self._transport_lookup_failed = False
         self._final_received_this_attempt = False
         self._interim_received_this_attempt = False
@@ -846,6 +850,26 @@ class VoxistSTTStream(RecognizeStream):
             # Read once per pass: the receive task can update it between the
             # two tests below, and None means "no transcript on this socket
             # yet" (the per-attempt reset in _run).
+            # The engine's own acknowledgement, when it sends one, is a
+            # POSITIVE terminator: it has flushed and finished, so there is
+            # nothing left to wait for. Measured live on lang=fr it lands
+            # ~0.12s after Done, which replaces up to 5s of dead air at the
+            # end of every turn on an engine that never closes the socket.
+            #
+            # Kept as a fast path, not the only path: the API's reference
+            # client treats "Done!" as a frame to skip rather than a
+            # terminator, so it may not be universal across engine variants.
+            # An engine that does not ack still ends the turn through the idle
+            # margin below, and a silent one through the backstop.
+            if self._engine_acked_done:
+                return self._outcome(
+                    concluded=True,
+                    detail=(
+                        "the engine acknowledged Done after returning its "
+                        "result"
+                    ),
+                )
+
             last_transcript_at = self._last_final_at
             answered_after_done = (
                 last_transcript_at is not None
@@ -1621,16 +1645,19 @@ class VoxistSTTStream(RecognizeStream):
         #   "backstop" the code claimed did not exist.
         #
         # What makes a resettable budget safe against the silence false
-        # positive is a property of the deployment, not of this plugin: the
-        # engine runs with endpointing enabled (--enable-endpoint=true,
-        # --rule1-min-trailing-silence=0.9), so it FINALIZES silent segments
-        # and emits {"type":"final","text":""} roughly once per second of
-        # silence. A healthy engine therefore keeps clearing the budget while
-        # the user says nothing, and only a genuinely mute engine lets it run.
-        # If a future engine stops punctuating silence, this reverts to
-        # false-positive behaviour - that dependency is the price of also
-        # catching a mid-session wedge, and it is the right trade because the
-        # alternative left the agent deaf for whole calls.
+        # positive is a property of the engine, and it is now MEASURED rather
+        # than inferred. Probed live against api-asr.voxist.com (lang=fr): the
+        # engine emits a partial/final pair roughly every 0.67s CONTINUOUSLY -
+        # 37 frames across 24 seconds of input carrying no speech - for pure
+        # digital zero, for comfort noise at peak 60, and for a non-speech
+        # tone alike. Every one of those clears the budget, so a healthy engine
+        # cannot accumulate it however long the user stays quiet, and only an
+        # engine that has genuinely stopped talking lets it run.
+        #
+        # (An earlier note here derived this from --enable-endpoint=true and
+        # sherpa-onnx convention. That flag turned out to appear only in a
+        # comment in the Banafo entrypoint, so the reasoning was unsound even
+        # though the conclusion held; the probe is what establishes it.)
         if self._bytes_sent_since_progress <= budget:
             return
 
@@ -1898,6 +1925,24 @@ class VoxistSTTStream(RecognizeStream):
             # frames are classified first, and only an engine transcript
             # counts as progress - see _note_engine_progress.
             if msg.type == aiohttp.WSMsgType.TEXT:
+                # The engine acks "Done" with a bare, non-JSON "Done!" text
+                # frame, forwarded verbatim by the gateway. Verified live
+                # against api-asr.voxist.com (lang=fr): it arrives ~0.1s after
+                # Done, immediately behind the last final. The API's own
+                # reference client skips it the same way
+                # (kroko/bench/asr_bench.py:103, `msg.startswith("Done")`).
+                #
+                # Two reasons this is handled before the JSON parse. It is not
+                # malformed input, so parsing it logged an ERROR on EVERY
+                # session; and it is the engine stating it has finished, which
+                # is a far better end-of-turn signal than the timers the drain
+                # otherwise has to fall back on.
+                if msg.data.startswith("Done"):
+                    self._engine_acked_done = True
+                    logger.debug(
+                        f"Stream {self._session_id} engine acked Done"
+                    )
+                    continue
                 try:
                     data = json.loads(msg.data)
                 except json.JSONDecodeError:

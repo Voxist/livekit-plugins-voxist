@@ -145,6 +145,10 @@ class MockVoxistServer:
         # Observability for tests: what the server actually saw
         self.connected_languages: list[str | None] = []
         self.done_received_count = 0
+        # Faithful by default: the real engine always acks. Settable to False
+        # to model an engine variant that does not, since the API's own
+        # reference client treats the ack as skippable rather than required.
+        self.send_done_ack = True
         self.finals_sent = 0
         self.segments_finalized: list[int] = []  # speech bytes per segment
         self.interim_delay_ms = interim_delay_ms
@@ -326,6 +330,15 @@ class MockVoxistServer:
                     if "Done" in msg.data:
                         self.done_received_count += 1
                         await finalize_segment()
+                        # The engine acks with a bare non-JSON "Done!" text
+                        # frame, which the gateway forwards verbatim. Verified
+                        # live against api-asr.voxist.com (lang=fr): it lands
+                        # ~0.12s after Done, right behind the last final.
+                        # Modelled here so the plugin's handling of it is
+                        # exercised by the integration suite and not only by
+                        # unit tests.
+                        if self.send_done_ack:
+                            await ws.send_str("Done!")
                         break
 
                 elif msg.type == aiohttp.WSMsgType.BINARY:
@@ -481,6 +494,10 @@ class MockVoxistServer:
         self.ws_upgrade_refusals = 0
         self.connected_languages = []
         self.done_received_count = 0
+        # Faithful by default: the real engine always acks. Settable to False
+        # to model an engine variant that does not, since the API's own
+        # reference client treats the ack as skippable rather than required.
+        self.send_done_ack = True
         self.finals_sent = 0
         self.segments_finalized = []
 

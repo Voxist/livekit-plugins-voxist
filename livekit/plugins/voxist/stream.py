@@ -731,7 +731,19 @@ class VoxistSTTStream(RecognizeStream):
         A transcript that arrived BEFORE "Done" does not end the drain: it
         says the engine was working earlier, not that it has finished
         flushing. That is why the pre-Done state is snapshotted here rather
-        than tested for non-emptiness.
+        than tested for non-emptiness. Ending the drain on a pre-Done
+        transcript would also break the mute-server case that matters: a
+        server which wedges the moment it is asked to finalize would pass as a
+        clean ending, and a session whose last segment never came would be
+        reported without the "trailing transcript may be missing" warning.
+
+        The snapshot cannot miss the engine's answer even though it is taken
+        after the write rather than at it: the caller resumes from
+        asyncio.wait the moment the send task completes, a same-loop callback,
+        while a response CAUSED by "Done" has to traverse the socket and be
+        dispatched by the selector - never in the same batch of ready
+        callbacks. And if it were ever missed, the drain would fall back to
+        the backstop, which is the behaviour that preceded this method.
 
         Both facts the loop needs are read, not awaited: the receive task's
         completion is awaitable, but a transcript's arrival is not - the
@@ -755,19 +767,18 @@ class VoxistSTTStream(RecognizeStream):
                 last_transcript_at is not None
                 and last_transcript_at != transcript_before_done
             )
-            if (
-                last_transcript_at is not None
-                and answered_after_done
-                and now - last_transcript_at >= self.POST_FINAL_IDLE_SECONDS
-            ):
-                return self._outcome(
-                    concluded=True,
-                    detail=(
-                        "the engine returned its result after Done and then "
-                        f"stayed quiet for {self.POST_FINAL_IDLE_SECONDS}s "
-                        "without closing the socket"
-                    ),
-                )
+            if answered_after_done:
+                assert last_transcript_at is not None  # implied; for the type
+                if now - last_transcript_at >= self.POST_FINAL_IDLE_SECONDS:
+                    return self._outcome(
+                        concluded=True,
+                        detail=(
+                            "the engine returned its result after Done and "
+                            "then stayed quiet for "
+                            f"{self.POST_FINAL_IDLE_SECONDS}s without closing "
+                            "the socket"
+                        ),
+                    )
             if now >= deadline:
                 return self._outcome(
                     concluded=False,

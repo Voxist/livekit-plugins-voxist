@@ -1,11 +1,15 @@
 """Unit tests for AudioProcessor."""
 
+import logging
 import time
 
 import numpy as np
 import pytest
 
-from livekit.plugins.voxist.audio_processor import AudioProcessor
+from livekit.plugins.voxist.audio_processor import (
+    MAX_FRAME_SIZE_BYTES,
+    AudioProcessor,
+)
 
 
 class TestAudioProcessor:
@@ -804,3 +808,37 @@ class TestLargeFrameIsAbsorbedLosslessly:
 
         assert len(chunks) == 1
         np.testing.assert_array_equal(chunks[0], audio)
+
+    @pytest.mark.parametrize(
+        "rate,chunk_ms",
+        [(16000, 100), (16000, 500), (48000, 100), (48000, 500), (8000, 100)],
+    )
+    def test_no_overflow_branch_is_ever_reached(self, rate, chunk_ms, caplog):
+        """
+        _add_to_buffer's overflow branches all DISCARD the oldest audio.
+
+        They are unreachable by construction - the sole caller feeds at most
+        advance_samples per pass and drains between passes - and this pins
+        that, across sample rates and chunk sizes, for a frame many times the
+        ring buffer. If piecewise feeding ever regresses, one of these lines
+        reappears and the utterance loses its opening.
+        """
+        p = AudioProcessor(sample_rate=rate, chunk_duration_ms=chunk_ms)
+        # Many times the 2-second ring buffer, but within the 1MB contract
+        # limit so this exercises the buffer rather than frame validation.
+        samples = min(rate * 20, (MAX_FRAME_SIZE_BYTES // 2))
+        assert samples > p._ring_buffer_size * 2, "frame must dwarf the buffer"
+        audio = np.random.default_rng(7).integers(
+            -20000, 20000, samples, dtype=np.int16
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="livekit.plugins.voxist"):
+            chunks = p.process_audio_frame(audio.tobytes())
+
+        discards = [
+            r.message
+            for r in caplog.records
+            if "oldest" in r.message or "keeping most recent" in r.message
+        ]
+        assert not discards, f"audio was discarded: {discards}"
+        assert chunks, "a frame this size must yield chunks"

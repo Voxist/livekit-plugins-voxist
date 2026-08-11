@@ -3848,12 +3848,18 @@ class TestRoundTwelveRegressions:
     # ---- the empty verdict's two-clause test, pinned at its boundaries
 
     @staticmethod
-    async def _verdict_stream(*, counter, gap):
+    async def _verdict_stream(*, counter, final_seen=True):
+        """
+        The property reads exactly three facts: a final was seen, no text
+        was seen, and the unanswered byte counter. No clock - a gap
+        parameter used to live here and its meaningful-looking values
+        implied the verdict still distinguished recent from stale
+        transcripts, the premise the rescue-clause deletion killed.
+        """
         stream = await make_stream()
         mock_event_ch(stream)
-        now = time.monotonic()
-        stream._last_final_at = now - gap
-        stream._last_progress_at = now - gap
+        stream._last_final_at = time.monotonic() if final_seen else None
+        stream._last_progress_at = stream._last_final_at
         stream._speaking = False
         stream._bytes_sent_since_progress = counter
         return stream
@@ -3866,13 +3872,13 @@ class TestRoundTwelveRegressions:
         nonzero counter under the limit. 16000B is half the 1s allowance:
         if the limit shrinks tenfold (3200B) or degrades to ==0, this fails.
         """
-        stream = await self._verdict_stream(counter=16_000, gap=60.0)
+        stream = await self._verdict_stream(counter=16_000)
         assert stream._engine_reported_empty_this_attempt
 
     @pytest.mark.asyncio
-    async def test_over_the_limit_with_a_stale_transcript_is_denied(self):
-        """The wedge signature: unanswered bytes AND a stale transcript."""
-        stream = await self._verdict_stream(counter=64_000, gap=4.0)
+    async def test_over_the_limit_is_denied(self):
+        """Bytes past the allowance: never certified, whatever the clock."""
+        stream = await self._verdict_stream(counter=64_000)
         assert not stream._engine_reported_empty_this_attempt, (
             "2s of speech the engine never answered, sent 4s ago, is a "
             "wedge - certifying it as empty is the loss this exists to stop"
@@ -3889,21 +3895,18 @@ class TestRoundTwelveRegressions:
         clean-empty certificate is byte-bounded and nothing else: large
         tails belong to the gate's warn/fatal tiers, which never say clean.
         """
-        for counter, gap in (
-            (640_000, 0.5),   # the drained-burst shape a recency test rescued
-            (256_000, 1.5),   # the batch-wedge shape the rate test rescued
-            (64_000, 2.2),    # the live-capture wedge shape
-        ):
-            stream = await self._verdict_stream(counter=counter, gap=gap)
+        for counter in (640_000, 256_000, 64_000):
+            stream = await self._verdict_stream(counter=counter)
             assert not stream._engine_reported_empty_this_attempt, (
-                f"counter={counter} gap={gap}: a tail past the byte "
-                "allowance must never be CERTIFIED clean, whatever its "
-                "shape - the warn/fatal tiers own it"
+                f"counter={counter}: a tail past the byte allowance must "
+                "never be CERTIFIED clean, whatever shape it arrived in - "
+                "the warn/fatal tiers own it"
             )
 
     @pytest.mark.asyncio
-    async def test_both_clauses_failing_is_always_denied(self):
-        stream = await self._verdict_stream(counter=640_000, gap=60.0)
+    async def test_no_final_seen_is_always_denied(self):
+        """An engine that never finalized anything has rendered no verdict."""
+        stream = await self._verdict_stream(counter=0, final_seen=False)
         assert not stream._engine_reported_empty_this_attempt
 
     # ---- the ack never concludes on its own
@@ -4135,9 +4138,7 @@ class TestRoundThirteenRegressions:
         """
         from livekit.plugins.voxist import stream as stream_module
 
-        stream = await TestRoundTwelveRegressions._verdict_stream(
-            counter=32_000, gap=60.0
-        )
+        stream = await TestRoundTwelveRegressions._verdict_stream(counter=32_000)
         assert stream._engine_reported_empty_this_attempt, (
             "exactly the 1s allowance is within the certificate"
         )
@@ -4248,8 +4249,6 @@ class TestRoundFourteenRegressions:
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
 
-        stop = asyncio.Event()
-
         async def scenario():
             stream._input_ch.send_nowait(speech_frame())
             await asyncio.sleep(0.05)
@@ -4262,16 +4261,25 @@ class TestRoundFourteenRegressions:
             )
             # The engine keeps DECODING: text partials right through the
             # backstop, never a final. No segment field - the documented
-            # blind-spot degradation the finding exploited.
-            while not stop.is_set():
+            # blind-spot degradation the finding exploited. The loop is
+            # always inside an await, so cancellation alone stops it.
+            while True:
                 ws.feed_json({"type": "partial", "text": "au rev"})
                 await asyncio.sleep(0.1)
 
         task = asyncio.create_task(scenario())
-        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
-            await asyncio.wait_for(stream._run(), timeout=10.0)
-        stop.set()
-        task.cancel()
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="livekit.plugins.voxist"
+            ):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            # In a finally, awaited, or a regression in _run leaks the 0.1s
+            # feed loop through the unwind and buries the real diagnostics
+            # under "Task was destroyed but it is pending!".
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
         assert stream._session_complete, "the pre-Done final was delivered"
         assert any(
@@ -4322,4 +4330,147 @@ class TestRoundFourteenRegressions:
         assert not stream._session_complete, (
             "text the session is KNOWN to have lost is not ambiguous; the "
             "middle tier may not complete it"
+        )
+
+
+class TestRoundFifteenRegressions:
+    """
+    Round 15's findings: the round-14 latch conflated "text seen" with
+    "text lost", failing in both directions at once, and the quiet check
+    keyed on any transcript instead of text.
+    """
+
+    @pytest.mark.asyncio
+    async def test_delivered_text_does_not_bar_a_retry_from_the_middle_tier(
+        self, caplog
+    ):
+        """
+        Round-15 finding 0. Attempt 1 DELIVERED the user's speech; a blip
+        forced a retry whose trailing room-noise ended with a 1-10s tail.
+        The seen-only latch barred the middle tier and a fully-delivered
+        session's retry died with a terminal error. Seen-minus-delivered is
+        the loss; delivered text is not.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        # What a successful attempt 1 leaves behind:
+        stream._text_seen_in_session = True
+        stream._final_received = True  # session-scoped delivered-final fact
+
+        async def scenario():
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            for _ in range(20):  # ~2s tail: the ambiguous band
+                stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.2)
+            if stream._last_progress_at is not None:
+                stream._last_progress_at -= 3.0
+            stream._input_ch.close()
+            await asyncio.sleep(0.1)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="livekit.plugins.voxist"
+            ):
+                await asyncio.wait_for(stream._run(), timeout=15.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert stream._session_complete, (
+            "a retry after fully DELIVERED text is the ambiguous middle, "
+            "not a known loss - fatal here destroys a healthy session"
+        )
+        assert any(
+            "had not answered the last" in r.message for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_undelivered_text_bars_the_clean_certificate_too(self):
+        """
+        Round-15 finding 1, the other face. Text seen-and-lost by a dead
+        attempt barred only the middle tier; a quiet retry with a sub-1s
+        tail was still CERTIFIED clean one tier up. A known loss may take
+        neither quiet tier.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._text_seen_in_session = True  # seen by a dead attempt...
+        # ...and nothing was ever delivered (both session flags False).
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # tiny tail: inside the clean allowance
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert not stream._session_complete, (
+            "text the session KNOWS it lost was certified as a clean empty "
+            "session because only the middle tier consulted the latch"
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_cadence_through_the_drain_is_still_quiet(
+        self, monkeypatch
+    ):
+        """
+        Round-15 finding 2. Keying the backstop's quiet check on ANY
+        transcript meant an engine whose empty cadence continued post-Done
+        never read as quiet: concluded=False, and a healthy no-text session
+        fell through both quiet tiers to the terminal raise. Cadence noise
+        is not speech; only TEXT denies the quiet.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.8, raising=False
+        )
+        ws = FakeWS()  # never closes
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.05)
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+            # The cadence keeps ticking: EMPTY partials, finals delayed past
+            # the drain window. Healthy, quiet, no text anywhere.
+            while True:
+                ws.feed_json({"type": "partial", "text": ""})
+                await asyncio.sleep(0.1)
+
+        task = asyncio.create_task(scenario())
+        try:
+            await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert stream._session_complete, (
+            "an empty cadence through the drain is a healthy quiet engine; "
+            "reading it as 'still talking' sent a silent participant to the "
+            "terminal raise"
         )

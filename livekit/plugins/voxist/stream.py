@@ -141,10 +141,17 @@ class _SessionOutcome:
             socket - the engine demonstrably worked, whatever happened at
             the tail. Distinguishes an ambiguous ending from an engine that
             never answered anything.
-        engine_produced_text: A transcript frame CARRIED TEXT on this
-            attempt. Text that exists but was never delivered is a KNOWN
-            loss, not an ambiguous tail - the middle verdict is barred from
-            it; only the all-empty ambiguity qualifies.
+        undelivered_text_seen: A transcript frame carried text at some point
+            THIS SESSION, and nothing was ever delivered to the caller. That
+            conjunction is a KNOWN loss, not an ambiguous tail - it bars both
+            the clean-empty certificate and the middle verdict. The first
+            version of this fact was "text was seen" alone, which failed in
+            both directions at once: text DELIVERED by an earlier attempt
+            barred a healthy retry from the middle tier (fatal instead of
+            warn-complete), while text seen-and-lost barred only the middle
+            tier and the clean certificate never looked, so the loss was
+            certified clean one tier up. Seen-minus-delivered is the loss;
+            neither half alone is.
         unanswered_tail_seconds: How much caller audio (at the wire rate)
             had been sent since the engine's last transcript when the
             attempt ended. The gate's middle verdict is bounded by it: below
@@ -174,7 +181,7 @@ class _SessionOutcome:
     engine_reported_empty: bool = False
     trailing_segment_unfinalized: bool = False
     engine_answered: bool = False
-    engine_produced_text: bool = False
+    undelivered_text_seen: bool = False
     unanswered_tail_seconds: float = 0.0
 
 
@@ -507,6 +514,9 @@ class VoxistSTTStream(RecognizeStream):
         # Count of finals on THIS socket. The drain detects a post-Done final
         # by comparing counts, never timestamps - see _await_engine_finalization.
         self._finals_count_this_attempt = 0
+        # When a transcript last CARRIED TEXT on this socket; the drain's
+        # quiet check reads this, so cadence noise cannot deny the quiet.
+        self._last_text_transcript_at: float | None = None
         # Highest engine segment number seen on a TEXT-bearing partial / on
         # any final. Their difference is the only available evidence of a
         # lost trailing utterance; see _note_segment. Reset in _run's
@@ -610,6 +620,7 @@ class VoxistSTTStream(RecognizeStream):
         self._last_progress_at = None
         self._last_final_at = None
         self._finals_count_this_attempt = 0
+        self._last_text_transcript_at = None
         # The engine restarts segment numbering at 0 on a NEW socket, so
         # stale maxima from a dead attempt defeat the trailing-loss detector
         # in both directions: a high stale _finalized_segment swallows a real
@@ -982,14 +993,24 @@ class VoxistSTTStream(RecognizeStream):
                             "bound expired"
                         ),
                     )
+                # Quiet means no TEXT. The engine's empty-cadence pairs can
+                # legitimately continue through the drain (a variant of the
+                # measured 0.67s behaviour), and keying quiet on ANY
+                # transcript made that healthy silence read as "still
+                # talking" - concluded=False, and a no-text quiet session
+                # fell through both quiet tiers to the terminal raise. What
+                # actually distinguishes an engine mid-decode from cadence
+                # noise is text: recognized speech rides text-bearing
+                # partials (measured), so those - and only those - deny the
+                # quiet.
                 quiet_for = (
-                    now - self._last_progress_at
-                    if self._last_progress_at is not None
-                    else float("inf")
+                    now - self._last_text_transcript_at
+                    if self._last_text_transcript_at is not None
+                    else None  # never any text: quiet by definition
                 )
-                if (
-                    self._engine_acked_done
-                    and quiet_for >= self.POST_FINAL_IDLE_SECONDS
+                if self._engine_acked_done and (
+                    quiet_for is None
+                    or quiet_for >= self.POST_FINAL_IDLE_SECONDS
                 ):
                     # The engine acknowledged Done and has ACTUALLY been
                     # quiet - checked, not assumed. The first version
@@ -1008,12 +1029,17 @@ class VoxistSTTStream(RecognizeStream):
                     # BACKSTOP with verified quiet is not the instant-ack
                     # exit two earlier findings killed: those concluded
                     # ~0.12s after Done and raced in-flight frames.
+                    quiet_note = (
+                        "no transcript text at all"
+                        if quiet_for is None
+                        else f"no transcript text for {quiet_for:.1f}s"
+                    )
                     return self._outcome(
                         concluded=True,
                         detail=(
                             "the engine acknowledged Done and stayed quiet "
-                            f"(no transcript for {quiet_for:.1f}s) through "
-                            "the drain window without closing the socket"
+                            f"({quiet_note}) through the drain window "
+                            "without closing the socket"
                         ),
                     )
                 return self._outcome(
@@ -1074,7 +1100,7 @@ class VoxistSTTStream(RecognizeStream):
         Both used to end in the same terminal TranscriptLostError, making a
         fatal error the default outcome for someone who never said anything.
 
-        Two conditions, and note what is NOT among them:
+        Three conditions, and note what is NOT among them:
 
         - A FINAL arrived on this socket (_last_final_at). A partial is not a
           finalization; an engine that opened a segment and died has rendered
@@ -1198,8 +1224,13 @@ class VoxistSTTStream(RecognizeStream):
                 engine_reported_empty=self._engine_reported_empty_this_attempt,
                 trailing_segment_unfinalized=self._trailing_segment_unfinalized,
                 engine_answered=self._last_final_at is not None,
-                engine_produced_text=(
-                    self._speaking or self._text_seen_in_session
+                undelivered_text_seen=(
+                    # _speaking implies the session latch (one latch site
+                    # sets both), so the latch alone carries "seen"; minus
+                    # anything delivered, it is a known loss.
+                    self._text_seen_in_session
+                    and not self._final_delivered_in_session
+                    and not self._interim_delivered_in_session
                 ),
                 unanswered_tail_seconds=(
                     self._bytes_sent_since_progress
@@ -1299,8 +1330,8 @@ class VoxistSTTStream(RecognizeStream):
         end-of-stream frame), not a cleverer reading of what we have.
 
         Raises:
-            TranscriptLostError: Case 4. Non-retryable by construction.
-            APIConnectionError: Case 6. Retried by the framework.
+            TranscriptLostError: Case 5. Non-retryable by construction.
+            APIConnectionError: Case 7. Retried by the framework.
         """
         try:
             if outcome.delivered_final:
@@ -1346,6 +1377,7 @@ class VoxistSTTStream(RecognizeStream):
             elif (
                 outcome.concluded
                 and outcome.engine_reported_empty
+                and not outcome.undelivered_text_seen
                 and not outcome.audio_was_dropped
             ):
                 # The engine answered for this audio and its answer was
@@ -1369,7 +1401,7 @@ class VoxistSTTStream(RecognizeStream):
             elif (
                 outcome.concluded
                 and outcome.engine_answered
-                and not outcome.engine_produced_text
+                and not outcome.undelivered_text_seen
                 and not outcome.trailing_segment_unfinalized
                 and not outcome.audio_was_dropped
                 and outcome.unanswered_tail_seconds
@@ -2436,6 +2468,11 @@ class VoxistSTTStream(RecognizeStream):
         # and an error frame can too; latching on either opened a speech turn
         # no transcript would ever close, leaving the caller waiting for an
         # END_OF_SPEECH that only arrives at session teardown.
+        if is_transcript and text:
+            # Any text-bearing transcript proves the engine is mid-speech
+            # decode; the drain's quiet check keys on this, never on the
+            # empty cadence.
+            self._last_text_transcript_at = time.monotonic()
         if is_transcript and not self._speaking and text:
             self._speaking = True
             # Session-scoped and never reset per attempt: text the engine

@@ -2672,7 +2672,6 @@ class TestBacklogBoundIsHard:
         stream._pre_drain_items = pre_drain
         stream._items_popped = popped
         stream._frame_durations.clear()
-        stream._frame_seconds_sum = 0.0
         for _ in range(samples):
             stream._note_frame_duration(mean)
 
@@ -2766,14 +2765,12 @@ class TestBacklogBoundIsHard:
         """With nothing to estimate from, guessing would drop audio."""
         stream = await make_stream()
         self._seed(stream, depth=10**6, samples=0)
-        stream._frame_seconds_sum = 0.0
         assert not stream._backlog_exceeds_the_bound()
 
     @pytest.mark.asyncio
     async def test_invalid_durations_are_not_measured(self):
         stream = await make_stream()
         self._seed(stream, depth=10, samples=0)
-        stream._frame_seconds_sum = 0.0
         for bad in (0.0, -1.0):
             stream._note_frame_duration(bad)
         assert len(stream._frame_durations) == 0
@@ -3319,6 +3316,15 @@ class TestEngineDoneAck:
         monkeypatch.setattr(
             VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 1.0, raising=False
         )
+        # The backstop is pushed far out so it cannot masquerade as the
+        # margin path: round 14 showed that if the fed final slips in before
+        # the drain snapshots its counter, the (then-5s) acked backstop
+        # ended the drain at >= 0.8s too - and the assertion passed with the
+        # margin code never executed. With an 8s backstop the upper bound
+        # below separates the two exits unambiguously.
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 8.0, raising=False
+        )
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
@@ -3342,10 +3348,16 @@ class TestEngineDoneAck:
         await task
 
         assert stream._session_complete
-        assert ended - final_at["t"] >= 0.8, (
-            f"the drain ended {ended - final_at['t']:.2f}s after the final: "
+        elapsed_after_final = ended - final_at["t"]
+        assert elapsed_after_final >= 0.8, (
+            f"the drain ended {elapsed_after_final:.2f}s after the final: "
             "the ack shortened the idle margin again, and a second flush "
             "final separated by decode time would have been dropped"
+        )
+        assert elapsed_after_final < 4.0, (
+            f"the drain took {elapsed_after_final:.2f}s after the final - "
+            "that is the 8s backstop exit, not the idle margin, so this "
+            "test never exercised the code it pins"
         )
 
 
@@ -3867,18 +3879,27 @@ class TestRoundTwelveRegressions:
         )
 
     @pytest.mark.asyncio
-    async def test_a_burst_drained_backlog_is_rescued_by_the_wall_clock(self):
+    async def test_no_rescue_clause_certifies_a_large_tail(self):
         """
-        Round-12 finding: a park-accumulated quiet backlog bursts out inside
-        one cadence period, so the counter holds 20s of room noise the
-        engine had not answered YET - denying the exemption there raised a
-        terminal TranscriptLostError on a legitimately quiet session.
+        Round-14 finding 1 falsified the last rescue premise. A recency test
+        rescued a wedge whose server closed promptly; a rate test rescued a
+        wedge during BATCH input, whose bytes beat real time by
+        construction - unbounded loss certified clean. There is no send-side
+        signature separating "not answered YET" from "never will be", so the
+        clean-empty certificate is byte-bounded and nothing else: large
+        tails belong to the gate's warn/fatal tiers, which never say clean.
         """
-        stream = await self._verdict_stream(counter=640_000, gap=0.5)
-        assert stream._engine_reported_empty_this_attempt, (
-            "a large counter with a RECENT transcript is drain speed, not "
-            "muteness"
-        )
+        for counter, gap in (
+            (640_000, 0.5),   # the drained-burst shape a recency test rescued
+            (256_000, 1.5),   # the batch-wedge shape the rate test rescued
+            (64_000, 2.2),    # the live-capture wedge shape
+        ):
+            stream = await self._verdict_stream(counter=counter, gap=gap)
+            assert not stream._engine_reported_empty_this_attempt, (
+                f"counter={counter} gap={gap}: a tail past the byte "
+                "allowance must never be CERTIFIED clean, whatever its "
+                "shape - the warn/fatal tiers own it"
+            )
 
     @pytest.mark.asyncio
     async def test_both_clauses_failing_is_always_denied(self):
@@ -4105,29 +4126,36 @@ class TestRoundThirteenRegressions:
     """
 
     @pytest.mark.asyncio
-    async def test_realtime_rate_bytes_are_not_a_burst(self):
+    async def test_the_verdict_reads_no_clock(self):
         """
-        Round-13 finding 1. A bare recent-transcript rescue (gap <= 2.5s)
-        also rescued a wedge whose server closed promptly, certifying up to
-        2.5s of eaten speech as clean. A burst's signature is RATE: 2s of
-        speech across a ~2.2s gap is live capture the engine never answered.
+        Round-14 findings 1 and 4, one stone: the property consults bytes
+        only. Freezing the module clock proves no gap is computed (the old
+        rate clause raced wall time with 0.3s of headroom in this very
+        test), and the byte boundary is pinned on both sides.
         """
-        stream = await make_stream()
-        mock_event_ch(stream)
-        now = time.monotonic()
-        stream._last_final_at = now - 2.2
-        stream._last_progress_at = now - 2.2
-        stream._speaking = False
-        stream._bytes_sent_since_progress = 64_000  # 2s at the wire rate
+        from livekit.plugins.voxist import stream as stream_module
 
-        assert not stream._engine_reported_empty_this_attempt, (
-            "real-time-rate unanswered bytes are a wedge's live capture, "
-            "however recent the last transcript - rescuing them certified "
-            "eaten speech as a clean empty session"
+        stream = await TestRoundTwelveRegressions._verdict_stream(
+            counter=32_000, gap=60.0
         )
-        # The genuine burst shape still passes: the same gap, 20s of bytes.
-        stream._bytes_sent_since_progress = 640_000
-        assert stream._engine_reported_empty_this_attempt
+        assert stream._engine_reported_empty_this_attempt, (
+            "exactly the 1s allowance is within the certificate"
+        )
+        stream._bytes_sent_since_progress = 32_001
+        assert not stream._engine_reported_empty_this_attempt
+
+        # No clock reads: a poisoned monotonic would explode if consulted.
+        def boom():
+            raise AssertionError("the verdict must not consult the clock")
+
+        import pytest as _pytest
+
+        with _pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                stream_module, "time", SimpleNamespace(monotonic=boom)
+            )
+            stream._bytes_sent_since_progress = 16_000
+            assert stream._engine_reported_empty_this_attempt
 
     @pytest.mark.asyncio
     async def test_post_done_finals_are_counted_not_timestamp_compared(
@@ -4192,4 +4220,106 @@ class TestRoundThirteenRegressions:
         assert stream._trailing_segment_unfinalized, (
             "a higher-numbered empty final vouched for text the plugin "
             "never saw finalized"
+        )
+
+
+class TestRoundFourteenRegressions:
+    """
+    Round 14's findings: the tier structure held; its edges did not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_talking_engine_is_not_a_quiet_backstop(
+        self, monkeypatch, caplog
+    ):
+        """
+        Round-14 finding 0. The acked backstop concluded on the ack alone,
+        classifying an engine still streaming text partials (alive,
+        mid-decode, no final yet) as a concluded-and-quiet exchange - a
+        clean success over silently truncated text when a pre-Done final
+        was on record. Quiet is now checked, not assumed: a talking engine
+        falls through to concluded=False and the gate says a trailing
+        transcript may be missing.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.8, raising=False
+        )
+        ws = FakeWS()  # never closes
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        stop = asyncio.Event()
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.05)
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+            # The engine keeps DECODING: text partials right through the
+            # backstop, never a final. No segment field - the documented
+            # blind-spot degradation the finding exploited.
+            while not stop.is_set():
+                ws.feed_json({"type": "partial", "text": "au rev"})
+                await asyncio.sleep(0.1)
+
+        task = asyncio.create_task(scenario())
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            await asyncio.wait_for(stream._run(), timeout=10.0)
+        stop.set()
+        task.cancel()
+
+        assert stream._session_complete, "the pre-Done final was delivered"
+        assert any(
+            "may have been lost" in r.message for r in caplog.records
+        ), (
+            "an engine still talking at the backstop is an ending imposed on "
+            "it - reporting it as a clean, quiet conclusion silently "
+            "truncates the text it was decoding"
+        )
+
+    @pytest.mark.asyncio
+    async def test_text_seen_by_a_dead_attempt_still_bars_the_middle_tier(
+        self,
+    ):
+        """
+        Round-14 finding 2. engine_produced_text was per-attempt state, so a
+        retry after an attempt that SAW text (interims off: seen, never
+        delivered) treated a known loss as ambiguous and completed with only
+        the middle-tier warning. The fact is session-scoped now.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        # What a dead attempt leaves behind: its finally cleared _speaking,
+        # but the session remembers the text.
+        stream._text_seen_in_session = True
+
+        async def scenario():
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            for _ in range(20):  # ~2s tail: inside the ambiguous band
+                stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.2)
+            if stream._last_progress_at is not None:
+                stream._last_progress_at -= 3.0
+            stream._input_ch.close()
+            await asyncio.sleep(0.1)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=15.0)
+        finally:
+            task.cancel()
+
+        assert not stream._session_complete, (
+            "text the session is KNOWN to have lost is not ambiguous; the "
+            "middle tier may not complete it"
         )

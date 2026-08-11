@@ -365,18 +365,6 @@ class VoxistSTTStream(RecognizeStream):
     # order of ambiguity as the documented malformed-text case.
     EMPTY_VERDICT_MAX_UNANSWERED_SECONDS = 1.0
 
-    # The rescue clause for burst draining, now shaped like the thing it
-    # rescues. A bare recent-transcript test (gap <= 2.5s) also rescued a
-    # WEDGE whose server closed promptly - certifying up to 2.5s of eaten
-    # speech as a clean empty session. What actually distinguishes a burst
-    # is its RATE: a drained backlog puts bytes on the wire far faster than
-    # real time (20s of audio inside a 0.5s gap), while a wedge's unanswered
-    # bytes are live capture, sent at exactly real time (2s of speech across
-    # a ~2s gap). The rescue therefore requires BOTH a recent transcript AND
-    # the unanswered bytes exceeding real-time rate by this factor.
-    BURST_RESCUE_MAX_GAP_SECONDS = 2.5
-    BURST_RESCUE_MIN_REALTIME_FACTOR = 2.0
-
     # The boundary between "ambiguous tail, complete loudly" and "the engine
     # demonstrably stopped, fail". Below this much unanswered trailing audio
     # the same signature is produced by a healthy quiet session on a loaded
@@ -503,6 +491,9 @@ class VoxistSTTStream(RecognizeStream):
         self._session_complete = False
         self._audio_consumed = False
         self._final_received = False
+        # A transcript frame carried text at ANY point this session. Session
+        # scope on purpose; see the latch in _process_result.
+        self._text_seen_in_session = False
         self._interim_delivered_before_this_attempt = False
         self._final_received_this_attempt = False
         self._interim_received_this_attempt = False
@@ -991,26 +982,38 @@ class VoxistSTTStream(RecognizeStream):
                             "bound expired"
                         ),
                     )
-                if self._engine_acked_done:
-                    # The engine acknowledged Done and then said nothing for
-                    # the ENTIRE drain window. Nothing is in flight after
-                    # that much quiet, and an engine that finalized the
-                    # trailing silence BEFORE end_input legitimately has
-                    # nothing to send after Done - reporting that as
-                    # concluded=False turned a healthy quiet participant on a
-                    # never-closing socket into a terminal
-                    # TranscriptLostError, because the empty verdict requires
-                    # a concluded exchange. Concluding at the BACKSTOP is not
-                    # the instant-ack exit two earlier findings killed: those
-                    # concluded ~0.12s after Done and raced in-flight frames;
-                    # this has waited out every timer the drain owns.
+                quiet_for = (
+                    now - self._last_progress_at
+                    if self._last_progress_at is not None
+                    else float("inf")
+                )
+                if (
+                    self._engine_acked_done
+                    and quiet_for >= self.POST_FINAL_IDLE_SECONDS
+                ):
+                    # The engine acknowledged Done and has ACTUALLY been
+                    # quiet - checked, not assumed. The first version
+                    # concluded on the ack alone at the deadline, which
+                    # classified an engine still streaming text partials
+                    # (alive, mid-decode, just no final yet) as a concluded
+                    # exchange and reported it "stayed quiet" while it was
+                    # talking the whole time; with a pre-Done final on
+                    # record, that read as a clean success over silently
+                    # truncated text. An engine that finalized the trailing
+                    # silence BEFORE end_input legitimately has nothing to
+                    # send after Done - THAT is the case this branch exists
+                    # for, and it is quiet by definition. A talking engine
+                    # falls through to concluded=False below: the ending was
+                    # imposed on it, and the gate says so. Concluding at the
+                    # BACKSTOP with verified quiet is not the instant-ack
+                    # exit two earlier findings killed: those concluded
+                    # ~0.12s after Done and raced in-flight frames.
                     return self._outcome(
                         concluded=True,
                         detail=(
                             "the engine acknowledged Done and stayed quiet "
-                            "through the full "
-                            f"{self.SESSION_DRAIN_TIMEOUT_SECONDS}s drain "
-                            "window without closing the socket"
+                            f"(no transcript for {quiet_for:.1f}s) through "
+                            "the drain window without closing the socket"
                         ),
                     )
                 return self._outcome(
@@ -1133,35 +1136,22 @@ class VoxistSTTStream(RecognizeStream):
             * self.WIRE_SAMPLE_RATE
             * 2  # Int16
         )
-        if self._bytes_sent_since_progress <= unanswered_limit:
-            return True
-        # Bytes alone confuse burst draining with muteness - the same
-        # bytes-vs-wall-clock confusion the stall detector needed a floor
-        # for. A park-accumulated quiet backlog can burst out inside one
-        # cadence period, leaving the counter holding 20s of room noise the
-        # engine simply had not answered YET when the server closed; denying
-        # the exemption there turned a legitimately quiet session into a
-        # terminal TranscriptLostError. If the engine's last transcript is
-        # RECENT in wall time, it was answering right up to the end and the
-        # large counter is drain speed, not muteness. A genuine wedge fails
-        # both tests: the counter holds the post-wedge speech AND the last
-        # transcript is as old as that speech is long (real-time capture
-        # means lost seconds ARE elapsed seconds), and the wedge paths that
-        # time out the drain never reach this property at all (concluded is
-        # False).
-        if self._last_progress_at is None:
-            return False
-        gap = time.monotonic() - self._last_progress_at
-        if gap > self.BURST_RESCUE_MAX_GAP_SECONDS:
-            return False
-        # Burst-shaped, not merely recent: real-time-rate bytes across the
-        # gap are live capture the engine never answered (a wedge), however
-        # fresh the last transcript is. See BURST_RESCUE_MIN_REALTIME_FACTOR.
-        realtime_bytes = gap * self.WIRE_SAMPLE_RATE * 2  # Int16
-        return (
-            self._bytes_sent_since_progress
-            > realtime_bytes * self.BURST_RESCUE_MIN_REALTIME_FACTOR
-        )
+        # No rescue clause. Two were tried and each certified real loss as
+        # clean: a recency test (gap <= 2.5s) rescued a wedge whose server
+        # closed promptly, and a rate test (bytes >> real time across the
+        # gap) rescued a wedge during BATCH input, whose bytes are faster
+        # than real time by construction - unbounded loss certified clean.
+        # There is no send-side signature that separates "the engine had not
+        # answered YET" from "the engine never will"; what actually resolves
+        # the burst case is TIME, and the drain already provides it: a live
+        # engine answers a drained backlog during the post-Done drain
+        # (resetting this counter before the verdict), and a close that
+        # arrives with the tail still unanswered lands in the gate's middle
+        # tier - completed with an explicit possible-loss warning - or, past
+        # WEDGE_FATAL_UNANSWERED_SECONDS, in the fatal band. This clause
+        # certifies CLEAN emptiness, and only a tail small enough that the
+        # measured cadence proves the engine saw it qualifies.
+        return self._bytes_sent_since_progress <= unanswered_limit
 
     def _outcome(self, *, concluded: bool, detail: str) -> _SessionOutcome:
         """
@@ -1208,7 +1198,9 @@ class VoxistSTTStream(RecognizeStream):
                 engine_reported_empty=self._engine_reported_empty_this_attempt,
                 trailing_segment_unfinalized=self._trailing_segment_unfinalized,
                 engine_answered=self._last_final_at is not None,
-                engine_produced_text=self._speaking,
+                engine_produced_text=(
+                    self._speaking or self._text_seen_in_session
+                ),
                 unanswered_tail_seconds=(
                     self._bytes_sent_since_progress
                     / (self.WIRE_SAMPLE_RATE * 2)
@@ -1256,11 +1248,25 @@ class VoxistSTTStream(RecognizeStream):
                                                    processed the audio and
                                                    found nothing to
                                                    transcribe
-          4. nothing delivered, real audio
+          4. nothing delivered, exchange
+             concluded, the engine answered
+             but its last stretch of audio
+             (<= WEDGE_FATAL_UNANSWERED_SECONDS)
+             went unanswered, and no text was
+             ever seen, no segment left open,
+             nothing dropped by us             -> success WITH a warning
+                                                   naming the unanswered
+                                                   window: the ambiguous
+                                                   middle, where a loaded
+                                                   pod's stretched cadence
+                                                   and a short-utterance
+                                                   wedge are identical from
+                                                   this side of the wire
+          5. nothing delivered, real audio
              consumed and unreplayable          -> TranscriptLostError
-          5. nothing delivered, nothing lost,
-             exchange concluded                 -> success, empty
           6. nothing delivered, nothing lost,
+             exchange concluded                 -> success, empty
+          7. nothing delivered, nothing lost,
              exchange never concluded           -> APIConnectionError: a
                                                    fresh dial may still work
 
@@ -1396,10 +1402,15 @@ class VoxistSTTStream(RecognizeStream):
                 # TranscriptLostError - one error event, immediate
                 # termination, no misleading "recoverable" retries).
                 #
-                # Reached only when the exchange was interrupted, or the engine
-                # never answered at all, or it produced text that never
-                # reached the caller - the case above has already taken the
-                # sessions whose engine answered "nothing to transcribe".
+                # The routes here, exhaustively: the exchange was
+                # interrupted (not concluded); or the engine never answered
+                # at all this attempt; or text was seen - this attempt or a
+                # dead one - and never reached the caller; or a segment was
+                # left open; or we dropped frames ourselves; or the
+                # unanswered tail exceeds WEDGE_FATAL_UNANSWERED_SECONDS,
+                # past any plausible pod load. The clean-empty case and the
+                # warned ambiguous-middle case above have already taken every
+                # ending the engine can be believed about.
                 # That is what keeps this raise meaningful instead of firing
                 # on every silent participant: a crashed engine and a
                 # heartbeat death both return NOTHING, and both still land
@@ -1828,8 +1839,13 @@ class VoxistSTTStream(RecognizeStream):
         transcribing something" and "the engine was punctuating silence"; only
         the former can be lost.
 
-        A FINAL closes its segment regardless of text: the engine rendered a
-        verdict on it, empty or not.
+        A final closes its segment only when IT TOO carries text. Empty
+        finals touch neither maximum - "a final closes regardless" was the
+        rule here twice, and both versions silenced the trailing-loss
+        warning: first when an empty cadence final REUSED the open text
+        segment's number, then (after a same-number guard) when a
+        HIGHER-numbered empty cadence final raised the finalized maximum
+        past the open one via max().
 
         Non-integer or absent values are ignored rather than guessed: an
         engine variant that omits the field simply leaves this blind, which
@@ -2422,6 +2438,12 @@ class VoxistSTTStream(RecognizeStream):
         # END_OF_SPEECH that only arrives at session teardown.
         if is_transcript and not self._speaking and text:
             self._speaking = True
+            # Session-scoped and never reset per attempt: text the engine
+            # produced is a fact about the SESSION's audio, and a retry must
+            # not forget it - _speaking is cleared in _run's finally, which
+            # once let a known text loss from a failed attempt take the
+            # gate's ambiguous-middle tier on the next one.
+            self._text_seen_in_session = True
             logger.debug(f"Stream {self._session_id} speech started")
 
             self._event_ch.send_nowait(

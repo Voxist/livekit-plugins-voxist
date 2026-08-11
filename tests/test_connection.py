@@ -2,6 +2,8 @@
 
 import asyncio
 import base64
+import gc
+import hashlib
 import json
 import ssl as ssl_module
 import time
@@ -679,13 +681,26 @@ class TestDialRateLimitWindow:
     def test_window_slides(self):
         limiter = _DialRateLimiter(max_dials=2, window=60.0)
 
-        assert limiter.try_acquire(100.0)
-        assert limiter.try_acquire(100.0)
-        assert not limiter.try_acquire(120.0)
+        assert limiter.reserve(100.0) == 0.0
+        assert limiter.reserve(100.0) == 0.0
+        # full at t=120: the earliest attempt (t=100) frees at t=160
+        assert limiter.reserve(120.0) == pytest.approx(40.0)
         # the first two attempts age out once t - 60 passes them
-        assert limiter.try_acquire(161.0)
-        assert limiter.try_acquire(161.0)
-        assert not limiter.try_acquire(161.0)
+        assert limiter.reserve(161.0) == 0.0
+        assert limiter.reserve(161.0) == 0.0
+        assert limiter.reserve(161.0) > 0.0
+
+    def test_the_reported_wait_is_the_earliest_possible_slot(self):
+        """The wait handed to a parked caller must be the moment the EARLIEST
+        charged attempt ages out - never a fixed backoff, which would either
+        overshoot (idle streams) or undershoot (a spin)."""
+        limiter = _DialRateLimiter(max_dials=2, window=10.0)
+        limiter.reserve(0.0)
+        limiter.reserve(5.0)
+
+        assert limiter.reserve(6.0) == pytest.approx(4.0)  # t=0 frees at t=10
+        limiter.reserve(10.0)  # the t=0 charge has aged out, so this succeeds
+        assert limiter.reserve(11.0) == pytest.approx(4.0)  # t=5 frees at t=15
 
     def test_defaults_match_the_retired_pool_budget(self):
         assert MAX_DIALS_PER_WINDOW == 30
@@ -698,39 +713,44 @@ class TestDialRateLimit:
     [12] With the pool gone, every stream dials independently under livekit's
     per-stream retry with no coordination: a gateway outage with N streams
     produced a thundering herd of dials (plus one HTTPS token exchange per
-    401-rejected cached token) against a gateway that may rate-limit or ban
-    the key. Dial ATTEMPTS are therefore capped per gateway credential, and
-    an exhausted window fails as a retryable ConnectionError - never a sleep.
+    401-rejected cached token) against a proxy pod that admits a fixed number
+    of concurrent sockets and closes the surplus with 1013 "retry in a few
+    seconds". Dial ATTEMPTS are therefore capped per gateway credential, and
+    an exhausted window makes the caller WAIT for the window to slide (see
+    TestDialRateLimitWaits for why refusing was a defect).
     """
 
     @pytest.mark.asyncio
-    async def test_exhausted_window_fails_retryably_without_dialing(self):
+    async def test_the_ordinary_dial_is_charged_exactly_once(self):
+        """One dial(), one charge. (Characterisation: the reviewer asked
+        whether charging before the token exchange AND again before the
+        post-401 redial could double-charge one logical dial and halve the
+        effective ceiling. It cannot - the second charge only happens on the
+        stale-token path, where a second exchange and a second socket really
+        do go on the wire.)"""
         ws = object()
-        session = FakeSession(
-            responses=[token_response("t")], ws_results=[ws, ws, ws]
-        )
-        dialer = make_dialer(session, max_dials_per_window=3)
+        session = FakeSession(responses=[token_response("t")], ws_results=[ws])
+        dialer = make_dialer(session, max_dials_per_window=5)
 
-        for _ in range(3):
-            assert await dialer.dial("fr", 16000) is ws
+        assert await dialer.dial("fr", 16000) is ws
 
-        with pytest.raises(ConnectionError) as excinfo:
-            await dialer.dial("fr", 16000)
-
-        message = str(excinfo.value)
-        assert "Dial rate limit" in message
-        assert "3 dial attempts per 60s" in message, message
-        assert len(session.ws_calls) == 3, "the 4th dial must not reach the wire"
+        assert dialer._rate_limiter.charged_attempts == 1
+        assert len(session.get_calls) == 1
+        assert len(session.ws_calls) == 1
 
     @pytest.mark.asyncio
     async def test_budget_is_shared_across_dialer_instances(self):
-        """Process-wide, not per dialer: the gateway's rate-limit/ban budget
-        for one key does not grow because a process hosts several plugins."""
+        """Process-wide, not per dialer: one pod's admission budget for one
+        key does not grow because a process hosts several plugins."""
         ws = object()
         first = FakeSession(responses=[token_response("t")], ws_results=[ws])
         second = FakeSession(responses=[token_response("t")], ws_results=[ws])
         d1 = make_dialer(first, max_dials_per_window=1)
-        d2 = make_dialer(second, max_dials_per_window=1)
+        # A wait bound short enough to assert on: the shared window is the
+        # 60s default, so the default bound would park d2 for a full minute.
+        d2 = make_dialer(
+            second, max_dials_per_window=1, max_dial_rate_limit_wait=0.02
+        )
 
         assert d1._rate_limiter is d2._rate_limiter
 
@@ -766,7 +786,9 @@ class TestDialRateLimit:
             responses=[token_response("fresh")],
             ws_results=[handshake_error(401)],
         )
-        dialer = make_dialer(session, max_dials_per_window=1)
+        dialer = make_dialer(
+            session, max_dials_per_window=1, max_dial_rate_limit_wait=0.02
+        )
         prime_cache(dialer, "stale")
 
         with pytest.raises(ConnectionError) as excinfo:
@@ -778,3 +800,270 @@ class TestDialRateLimit:
         )
         assert len(session.ws_calls) == 1, "no second socket"
         assert session.get_calls == [], "and no extra token exchange either"
+
+
+@pytest.mark.no_auto_mock_token
+class TestDialRateLimitWaits:
+    """
+    [B] An exhausted window must DELAY a dial, not refuse it.
+
+    The defect: the limiter used to fail the dial with a retryable
+    ConnectionError, so our own throttle spent livekit's finite retry budget.
+    RecognizeStream._main_task grants max_retry (default 3) + 1 attempts at
+    ~retry_interval (default 2s) apart and only resets _num_retries when a
+    FINAL_TRANSCRIPT arrives - which during an outage never happens. All four
+    attempts therefore landed inside the same 60s window, every one refused by
+    us rather than by the gateway, and the stream died permanently with
+    "failed to recognize speech after 3 attempts" even though the gateway
+    recovered seconds later. The deleted pool slept out the window instead.
+
+    These tests use real (small) windows and the real clock: the wait loop
+    reads the clock it sleeps against, so a frozen FakeClock cannot drive it.
+    Only lower bounds are asserted on elapsed time, so a loaded machine can
+    never make them flaky.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_window_waits_and_then_dials(self):
+        ws = object()
+        session = FakeSession(
+            responses=[token_response("t")], ws_results=[ws, ws]
+        )
+        dialer = make_dialer(
+            session, max_dials_per_window=1, dial_rate_limit_window=0.2
+        )
+
+        assert await dialer.dial("fr", 16000) is ws
+
+        started = time.perf_counter()
+        assert await dialer.dial("fr", 16000) is ws, (
+            "the second dial was refused instead of waiting for the window"
+        )
+        elapsed = time.perf_counter() - started
+
+        assert elapsed >= 0.1, (
+            f"the second dial returned in {elapsed:.3f}s, so it cannot have "
+            "waited for the 0.2s window to slide"
+        )
+        assert len(session.ws_calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_a_slot_beyond_the_wait_bound_fails_retryably_at_once(self):
+        """Waiting must never park a caller indefinitely. reserve() reports
+        the exact moment the earliest slot frees, so when that is past the
+        caller's bound there is nothing to wait for - it fails immediately,
+        and the message names the bound so the throttle is not mistaken for
+        the gateway being down."""
+        ws = object()
+        session = FakeSession(responses=[token_response("t")], ws_results=[ws])
+        dialer = make_dialer(
+            session,
+            max_dials_per_window=1,
+            dial_rate_limit_window=30.0,
+            max_dial_rate_limit_wait=0.05,
+        )
+
+        assert await dialer.dial("fr", 16000) is ws
+
+        with pytest.raises(ConnectionError) as excinfo:
+            await dialer.dial("fr", 16000)
+
+        message = str(excinfo.value)
+        assert "Dial rate limit" in message
+        assert "1 dial attempts per 30s" in message, message
+        assert "of the 0.05s bound" in message, (
+            "the refusal must be attributed to the caller's wait bound, not "
+            f"presented as a flat refusal to dial; got: {message}"
+        )
+        assert len(session.ws_calls) == 1, "the refused dial never reached the wire"
+
+    @pytest.mark.asyncio
+    async def test_a_starved_waiter_gives_up_at_its_bound(self):
+        """The bound is what makes waiting safe: two callers contend for one
+        slot, the winner takes it, and the loser - whose next slot is a whole
+        window away - gives up at its bound instead of waiting forever."""
+        ws = object()
+        session = FakeSession(
+            responses=[token_response("t")], ws_results=[ws, ws]
+        )
+        dialer = make_dialer(
+            session, max_dials_per_window=1, dial_rate_limit_window=0.3
+        )
+        assert await dialer.dial("fr", 16000) is ws  # fills the window
+
+        started = time.perf_counter()
+        first, second = await asyncio.gather(
+            dialer.dial("fr", 16000),
+            dialer.dial("fr", 16000),
+            return_exceptions=True,
+        )
+        elapsed = time.perf_counter() - started
+
+        outcomes = [first, second]
+        assert sum(o is ws for o in outcomes) == 1, outcomes
+        losers = [o for o in outcomes if o is not ws]
+        assert len(losers) == 1 and isinstance(losers[0], ConnectionError), outcomes
+        assert "Dial rate limit" in str(losers[0])
+        assert elapsed >= 0.2, (
+            f"both dials resolved in {elapsed:.3f}s, so neither waited for the "
+            "0.3s window to slide"
+        )
+        assert len(session.ws_calls) == 2, "one waiter got its socket"
+
+    def test_the_default_wait_bound_is_the_window(self):
+        """The window is the largest wait the limiter can ever ask for, so a
+        bound of one window means a caller that is merely EARLY always gets its
+        slot instead of dying - the refusal path is reachable only under
+        contention. A shorter default would reinstate the defect above."""
+        dialer = make_dialer(FakeSession(), dial_rate_limit_window=17.0)
+        assert dialer._max_dial_rate_limit_wait == 17.0
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_parked_dial_leaves_no_charge_or_held_lock(self):
+        """
+        [B] Cancellation correctness for the wait, and the two properties the
+        reviewer asked to confirm:
+
+        - the threading.Lock is genuinely not held across the await (a parked
+          waiter must not block a dialer on another event loop, and a
+          cancellation cannot release a threading.Lock)
+        - a caller cancelled while parked charges nothing: the attempt is
+          appended only by the iteration that actually proceeds
+        """
+        ws = object()
+        session = FakeSession(
+            responses=[token_response("t")], ws_results=[ws, ws]
+        )
+        dialer = make_dialer(
+            session, max_dials_per_window=1, dial_rate_limit_window=5.0
+        )
+        assert await dialer.dial("fr", 16000) is ws
+
+        parked = asyncio.create_task(dialer.dial("fr", 16000))
+        await asyncio.sleep(0.05)  # let it reach the wait
+        assert not parked.done(), (
+            "the second dial failed instead of parking for a free slot"
+        )
+
+        limiter = dialer._rate_limiter
+        acquired = limiter._lock.acquire(blocking=False)
+        if acquired:
+            limiter._lock.release()
+        assert acquired, "the threading.Lock is held across the await"
+        assert limiter.charged_attempts == 1, "the parked waiter charged a slot"
+
+        parked.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await parked
+
+        assert len(session.ws_calls) == 1, "the cancelled dial reached the wire"
+        assert limiter.charged_attempts == 1, (
+            "cancellation left a phantom charge in the window"
+        )
+        assert limiter._lock.acquire(blocking=False), (
+            "the cancelled waiter stranded the lock"
+        )
+        limiter._lock.release()
+
+
+@pytest.mark.no_auto_mock_token
+class TestDialLimiterRegistryLifetime:
+    """
+    [B] The process-wide budget must outlive any individual dialer.
+
+    The defect: _dial_limiters was a weakref.WeakValueDictionary whose only
+    strong reference was VoxistDialer._rate_limiter, so the "process-wide"
+    budget silently reset to a full window as soon as the last dialer for a
+    credential was collected. The common LiveKit agent shape builds one
+    VoxistSTT per job and awaits aclose() in a finally, so during an outage
+    each job burned its dials, its teardown let the limiter be collected, and
+    the next job started with an empty deque - handing the gateway exactly the
+    unbounded herd the limiter exists to prevent.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_budget_survives_dialer_teardown_and_gc(self):
+        ws = object()
+        first = FakeSession(responses=[token_response("t")], ws_results=[ws])
+        # A generous window: gc.collect() on a loaded interpreter is not free,
+        # and the assertion below is a LOWER bound on the successor's wait, so
+        # the window only has to outlast the teardown.
+        dialer = make_dialer(
+            first, max_dials_per_window=1, dial_rate_limit_window=0.6
+        )
+        assert await dialer.dial("fr", 16000) is ws
+
+        # Job over: the only dialer for this credential goes away.
+        del dialer
+        gc.collect()
+
+        # Next job, same credential: it must inherit the spent window.
+        second = FakeSession(responses=[token_response("t")], ws_results=[ws])
+        successor = make_dialer(
+            second, max_dials_per_window=1, dial_rate_limit_window=0.6
+        )
+
+        started = time.perf_counter()
+        assert await successor.dial("fr", 16000) is ws
+        elapsed = time.perf_counter() - started
+
+        assert elapsed >= 0.15, (
+            f"the successor dialed in {elapsed:.3f}s, so teardown reset the "
+            "process-wide window to a full budget"
+        )
+
+    def test_a_charged_limiter_outlives_gc_but_an_idle_one_is_evicted(
+        self, monkeypatch
+    ):
+        """Strong references alone would leak one entry per credential
+        forever, so growth is bounded by idle eviction instead: an entry is
+        reclaimed only once its window has been empty for well over the window
+        duration, by which point dropping it cannot restore a budget its owner
+        had not already earned back."""
+        clock = FakeClock(1000.0)
+        monkeypatch.setattr(connection, "time", clock)
+        fingerprint = hashlib.sha256(b"k").hexdigest()[:16]
+        mine = f"wss://host/ws|{fingerprint}|2/10.0"
+
+        limiter = connection._limiter_for(
+            base_url="wss://host/ws", api_key="k", max_dials=2, window=10.0
+        )
+        limiter.reserve(clock.now)
+        del limiter
+        gc.collect()
+
+        assert list(connection._dial_limiters) == [mine], (
+            "a charged limiter was collected the moment nobody held it"
+        )
+        survivor = connection._limiter_for(
+            base_url="wss://host/ws", api_key="k", max_dials=2, window=10.0
+        )
+        assert survivor.charged_attempts == 1
+
+        # Still inside window + grace: not yet reclaimable. (The sweep runs on
+        # every _limiter_for call, so another credential's lookup drives it.)
+        idle_at = 1000.0 + 10.0 + connection._DIAL_LIMITER_IDLE_GRACE_SECONDS
+        clock.now = idle_at - 1
+        connection._limiter_for(
+            base_url="wss://other/ws", api_key="k", max_dials=2, window=10.0
+        )
+        assert mine in connection._dial_limiters
+
+        # Past window + grace with an empty window: reclaimed.
+        clock.now = idle_at + 1
+        connection._limiter_for(
+            base_url="wss://third/ws", api_key="k", max_dials=2, window=10.0
+        )
+        assert mine not in connection._dial_limiters, connection._dial_limiters
+
+    def test_reset_dial_rate_limits_clears_the_registry(self):
+        """The test seam must fully reset whatever structure backs the
+        registry, or state leaks between tests."""
+        connection._limiter_for(
+            base_url="wss://host/ws", api_key="k", max_dials=1, window=5.0
+        ).reserve(0.0)
+        assert connection._dial_limiters
+
+        reset_dial_rate_limits()
+
+        assert connection._dial_limiters == {}

@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -46,7 +46,7 @@ from livekit.agents.stt import (
 
 from livekit import rtc  # type: ignore[attr-defined]
 
-from .audio_processor import AudioProcessor
+from .audio_processor import MAX_FRAME_SIZE_BYTES, AudioProcessor
 from .exceptions import ConnectionError as VoxistConnectionError
 from .exceptions import TranscriptLostError
 from .log import logger
@@ -161,21 +161,23 @@ class VoxistSTTStream(RecognizeStream):
     # is unbounded and push_frame() never blocks, so without this a slow
     # uplink grows the backlog until the process is OOM-killed. At 10ms frames
     # this is ~10s of audio; beyond that, transcripts would arrive too late to
-    # be useful anyway, so the oldest frames are dropped rather than queued.
+    # be useful anyway, so frames are dropped rather than queued.
+    #
+    # Exceeding the cap is necessary but NOT sufficient to drop: the backlog
+    # must also be failing to drain. See _uplink_is_falling_behind for why
+    # depth alone silently discarded most of a batch caller's audio.
     MAX_INPUT_BACKLOG_FRAMES = 1000
 
     # Mid-session liveness bound, measured in AUDIO DELIVERED, not wall
     # time. aiohttp's heartbeat only detects transport death; the gateway's
     # WS layer keeps answering pings even when the engine behind it has
     # wedged, so a mute-but-connected server used to mean silent
-    # zero-transcripts until end_input. The detector therefore counts the
-    # bytes actually written to the socket since the engine last returned a
-    # TRANSCRIPT (not since any frame arrived - see _note_engine_progress):
-    # once that exceeds this many seconds' worth of audio at the wire rate,
-    # the server has been handed ~30s of audio and has transcribed none of
-    # it, and the attempt fails as APIConnectionError so the framework
-    # redials. See _check_server_liveness for why this replaced a wall clock
-    # armed by a peak-amplitude gate.
+    # zero-transcripts until end_input. Two conditions must BOTH hold before
+    # the attempt is abandoned (see _check_server_liveness): this many
+    # seconds' worth of SPEECH-BEARING audio has been written since the
+    # engine last returned a transcript, AND this much wall time has passed
+    # since then. Either alone produced false positives that cost far more
+    # than the detector saves.
     STALL_DETECTION_SECONDS = 30.0
 
     # Bound on ws.close() during teardown. aiohttp waits up to its ws_close
@@ -278,6 +280,12 @@ class VoxistSTTStream(RecognizeStream):
         self._real_audio_this_attempt = False
         self._bytes_sent_since_progress = 0
         self._last_progress_at: float | None = None
+        # Fallback origin for the stall detector's wall-clock floor while no
+        # transcript has arrived yet. Reset per attempt, like the pair above.
+        self._attempt_started_at = time.monotonic()
+        # Last over-cap backlog depth, for the drain-direction test in
+        # _uplink_is_falling_behind. None means "not currently over the cap".
+        self._backlog_high_water: int | None = None
 
         # Latch so an unreachable transport is reported once, not per chunk
         self._transport_lookup_failed = False
@@ -351,6 +359,7 @@ class VoxistSTTStream(RecognizeStream):
         self._real_audio_this_attempt = False
         self._bytes_sent_since_progress = 0
         self._last_progress_at = None
+        self._attempt_started_at = time.monotonic()
 
         try:
             await self._run_attempt()
@@ -785,13 +794,29 @@ class VoxistSTTStream(RecognizeStream):
                 if self._carries_signal(data.data):
                     self._audio_consumed = True
                     self._real_audio_this_attempt = True
-                if self._input_ch.qsize() > self.MAX_INPUT_BACKLOG_FRAMES:
+                if self._uplink_is_falling_behind():
                     self._note_dropped_frame()
                     continue
 
                 frame_bytes = bytes(data.data)
-                for chunk in self._audio_processor.process_audio_frame(frame_bytes):
-                    await self._send_audio_chunk(chunk)
+                # Sliced, not rejected. The processor raises a bare ValueError
+                # above MAX_FRAME_SIZE_BYTES (a resource-exhaustion guard), and
+                # that ValueError is not an APIError, so it escaped the whole
+                # error taxonomy: it unwound _run without the completion gate
+                # ever running, leaving _session_complete False and killing the
+                # stream with a bare ValueError at the call site. Legitimate
+                # callers hit it - a batch caller pushing ~11s of 48kHz mono,
+                # or livekit's own AudioResampler emitting a large frame.
+                #
+                # Slicing satisfies what the guard is actually for (bounded
+                # allocation per call) without discarding audio: the processor
+                # buffers across calls, so N sequential slices yield the same
+                # chunk stream as one oversized call would have. Slices are
+                # sample-aligned because the limit is even and the processor
+                # reads mono Int16.
+                for piece in self._iter_frame_slices(frame_bytes):
+                    for chunk in self._audio_processor.process_audio_frame(piece):
+                        await self._send_audio_chunk(chunk)
                 self._check_server_liveness()
             else:
                 logger.warning(
@@ -901,6 +926,70 @@ class VoxistSTTStream(RecognizeStream):
             return True
         return all(isinstance(item, self._FlushSentinel) for item in tuple(queue))
 
+    @staticmethod
+    def _iter_frame_slices(frame_bytes: bytes) -> Iterator[bytes]:
+        """
+        Yield frame_bytes in pieces the audio processor will accept.
+
+        Yields the frame unchanged in the overwhelmingly common case, so the
+        hot path pays one comparison. See the call site for why an oversized
+        frame is sliced rather than rejected.
+        """
+        limit = MAX_FRAME_SIZE_BYTES
+        if len(frame_bytes) <= limit:
+            yield frame_bytes
+            return
+        logger.warning(
+            f"Frame of {len(frame_bytes)}B exceeds the {limit}B processor "
+            "limit; sending it in slices rather than dropping it"
+        )
+        for start in range(0, len(frame_bytes), limit):
+            yield frame_bytes[start : start + limit]
+
+    def _uplink_is_falling_behind(self) -> bool:
+        """
+        True when the backlog is over the cap AND is not draining.
+
+        The cap exists to stop a slow uplink growing the backlog until the
+        process is OOM-killed. It used to fire on backlog DEPTH alone, which
+        confused a bursty PRODUCER with a slow CONSUMER and made the repo's
+        own documented usage lose most of its audio: push_frame() is
+        synchronous and never yields, so `for f in frames: s.push_frame(f)`
+        puts the entire file in the channel before the send loop runs once. On
+        its first iteration the loop saw 6000 queued frames, discarded down to
+        1000, and silently dropped ~83% of the session - while the uplink was
+        never behind at all and every send completed instantly.
+
+        Dropping on depth also did not achieve what it was for: push_frame has
+        already allocated those frames, so discarding them reclaims the queue
+        slot but not the memory spike that supposedly justified it.
+
+        The discriminator is whether the backlog SHRINKS. Each iteration
+        removes exactly one frame, so a burst from a producer that has
+        stopped (or that pushes slower than we drain) shrinks monotonically
+        and nothing is dropped - a file transcribes whole. A producer pushing
+        faster than the uplink drains grows the backlog, and once it is over
+        the cap and still not shrinking, frames are dropped as before. A
+        producer exactly matching the drain rate holds it steady, which also
+        drops: at the cap that is ~10s of accumulated latency, so the audio is
+        already too stale to be worth sending.
+
+        Returns:
+            True if this frame should be dropped to bound the backlog.
+        """
+        backlog = self._input_ch.qsize()
+        if backlog <= self.MAX_INPUT_BACKLOG_FRAMES:
+            # Under the cap: reset the reference so a later burst is measured
+            # from its own start rather than from a stale high-water mark.
+            self._backlog_high_water = None
+            return False
+
+        previous = self._backlog_high_water
+        self._backlog_high_water = backlog
+        # First observation over the cap proves nothing about direction yet;
+        # give the loop one iteration to show whether it is draining.
+        return previous is not None and backlog >= previous
+
     def _note_engine_progress(self) -> None:
         """
         Record that the ASR engine produced a transcript; clears the budget
@@ -924,6 +1013,10 @@ class VoxistSTTStream(RecognizeStream):
         Frames NOT credited are still handled normally by the caller - they
         are logged, and {"type": "error"} still raises. They simply do not buy
         the server another STALL_DETECTION_SECONDS of muteness.
+
+        Setting _last_progress_at also permanently disarms the detector for
+        this socket; see _check_server_liveness for why proving itself once is
+        enough, and what that deliberately gives up.
         """
         self._bytes_sent_since_progress = 0
         self._last_progress_at = time.monotonic()
@@ -989,20 +1082,68 @@ class VoxistSTTStream(RecognizeStream):
         budget = int(
             self.STALL_DETECTION_SECONDS * self.WIRE_SAMPLE_RATE * 2  # Int16
         )
+        # The bound applies ONLY until the engine has proven itself on this
+        # socket. Once any transcript has arrived, mid-session policing stops.
+        #
+        # This is what separates "the engine is wedged" from "the user is
+        # silent" WITHOUT trying to classify the audio - which is the part the
+        # plugin cannot do. Counting every byte meant livekit's continuously
+        # pushing pipeline accumulated a full 30s budget during any ordinary
+        # user pause (someone listening to a long agent answer) and killed a
+        # healthy attempt. livekit resets RecognizeStream._num_retries only on
+        # FINAL_TRANSCRIPT (livekit/agents/stt/stt.py:531-533), so retries
+        # bound CONSECUTIVE failures with no transcript in between - and a
+        # single sustained silence is exactly that: each reconnect finds the
+        # user still quiet, trips again, and around two minutes in max_retry
+        # is gone and the agent is deaf for the rest of the call.
+        #
+        # An amplitude gate is NOT the answer and must not be reintroduced.
+        # One existed (peak 500) and was deliberately removed because a
+        # quiet or under-gained speaker never armed it, so a genuine wedge
+        # went undetected for exactly the sessions that most needed it - see
+        # tests/test_stream.py::...::test_quiet_speaker_wedge_is_detected,
+        # whose audio peaks at 60. Comfort noise and quiet speech are not
+        # separable by peak level, so the discriminator has to come from the
+        # SERVER's behaviour rather than the caller's signal.
+        #
+        # What this gives up, stated plainly: an engine that works and then
+        # wedges MID-session is no longer caught at 30s, only at end of
+        # session where the completion gate raises for consumed audio that
+        # produced no transcript. That is the narrow case, it still surfaces
+        # as an error, and it is worth trading for never falsely accusing a
+        # healthy engine - a false accusation is permanent, a late true one
+        # costs one turn.
+        if self._last_progress_at is not None:
+            return
+
         if self._bytes_sent_since_progress <= budget:
             return
 
-        mute_for = (
-            f"{time.monotonic() - self._last_progress_at:.1f}s"
-            if self._last_progress_at is not None
-            else "the whole attempt"
-        )
+        # Wall-clock floor. The byte budget alone is not enough: a sender
+        # faster than real time reaches 30s worth of audio in seconds, so a
+        # batch/file caller - or a live caller's catch-up burst after a
+        # network hiccup - tripped the detector on a perfectly healthy engine
+        # that simply had not been given 30s of wall time to respond. The
+        # retry then found the input already consumed and escalated to a
+        # terminal TranscriptLostError, so a false positive here destroyed
+        # the session outright.
+        #
+        # Measured from the start of the attempt: the guard above means no
+        # transcript has ever arrived on this socket, so that IS the last
+        # point at which the engine could have been believed healthy. For a
+        # real-time caller both conditions cross at the same moment, so this
+        # costs nothing in the case the detector was designed for; it only
+        # holds back the fast sender.
+        mute_seconds = time.monotonic() - self._attempt_started_at
+        if mute_seconds < self.STALL_DETECTION_SECONDS:
+            return
+
         logger.warning(
             f"Stream {self._session_id} has sent "
             f"{self._bytes_sent_since_progress}B of audio "
-            f"(>{self.STALL_DETECTION_SECONDS}s worth) without a single "
-            f"transcript for {mute_for} - the server is connected but the "
-            "engine is not transcribing; abandoning the attempt"
+            f"(>{self.STALL_DETECTION_SECONDS}s worth) over {mute_seconds:.1f}s "
+            "without a single transcript - the server is connected but the "
+            "engine has never responded; abandoning the attempt"
         )
         raise APIConnectionError(
             "no response from server while streaming audio"

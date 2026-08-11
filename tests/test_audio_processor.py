@@ -730,3 +730,77 @@ class TestRingBufferOptimization:
             for chunk in chunks:
                 assert chunk.dtype == np.int16  # Voxist expects raw Int16 PCM
                 assert len(chunk) == 1600
+
+
+class TestLargeFrameIsAbsorbedLosslessly:
+    """
+    A frame longer than the ring buffer must not lose its oldest audio.
+
+    _add_to_buffer's overflow branches drop the OLDEST samples to make room -
+    right for a live ring buffer with a slow reader, catastrophic when the
+    reader is the next statement. A frame longer than _ring_buffer_size (2s at
+    the input rate) was truncated to its final 2s BEFORE any chunk was
+    extracted, so a batch caller pushing 5s blocks silently lost 60% of each
+    one, and the lost part was always the START of the utterance.
+    """
+
+    def test_first_chunk_is_the_start_of_the_frame(self):
+        """The tell: truncation kept the TAIL, so chunk 0 came from the middle."""
+        p = AudioProcessor(sample_rate=16000)
+        # 5 seconds at 16kHz: well over the 2-second ring buffer
+        samples = 5 * 16000
+        assert samples > p._ring_buffer_size, "frame must exceed the buffer"
+        # A non-periodic pattern on purpose: an `arange % N` ramp aliases,
+        # and with N=3000 the truncated tail started at sample 48000 - an
+        # exact multiple - so it compared EQUAL to the frame's opening and
+        # this test passed against the very bug it exists to catch.
+        audio = np.random.default_rng(1234).integers(
+            -20000, 20000, samples, dtype=np.int16
+        )
+
+        chunks = p.process_audio_frame(audio.tobytes())
+
+        assert chunks, "a 5s frame must yield chunks"
+        np.testing.assert_array_equal(
+            chunks[0],
+            audio[: p.chunk_samples],
+            err_msg="chunk 0 must be the frame's opening audio, not its tail",
+        )
+
+    def test_every_sample_is_covered(self):
+        """Stride overlap duplicates audio; nothing may be missing."""
+        p = AudioProcessor(sample_rate=16000)
+        samples = 5 * 16000
+        # A non-periodic pattern on purpose: an `arange % N` ramp aliases,
+        # and with N=3000 the truncated tail started at sample 48000 - an
+        # exact multiple - so it compared EQUAL to the frame's opening and
+        # this test passed against the very bug it exists to catch.
+        audio = np.random.default_rng(1234).integers(
+            -20000, 20000, samples, dtype=np.int16
+        )
+
+        chunks = p.process_audio_frame(audio.tobytes())
+        chunks += p.flush()
+
+        # Rebuild the stream from the non-overlapping part of each chunk.
+        rebuilt = [chunks[0]]
+        for c in chunks[1:]:
+            rebuilt.append(c[p.stride_samples :])
+        covered = int(np.concatenate(rebuilt).size)
+
+        assert covered >= samples * 0.99, (
+            f"only {covered} of {samples} samples survived the buffer"
+        )
+
+    def test_a_frame_that_fits_is_unaffected(self):
+        """The ordinary live path must behave exactly as before."""
+        p = AudioProcessor(sample_rate=16000)
+        # Exactly one 100ms chunk at 16kHz, the ordinary live frame size
+        audio = (np.arange(p.chunk_samples, dtype=np.int32) % 3000).astype(
+            np.int16
+        )
+
+        chunks = p.process_audio_frame(audio.tobytes())
+
+        assert len(chunks) == 1
+        np.testing.assert_array_equal(chunks[0], audio)

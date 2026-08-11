@@ -14,6 +14,7 @@ from livekit.agents.stt import SpeechEventType
 from livekit.agents.types import APIConnectOptions
 
 from livekit import rtc
+from livekit.plugins.voxist.audio_processor import MAX_FRAME_SIZE_BYTES
 from livekit.plugins.voxist.exceptions import ConnectionError as VoxistConnectionError
 from livekit.plugins.voxist.exceptions import TranscriptLostError
 from livekit.plugins.voxist.stream import VoxistSTTStream
@@ -384,11 +385,21 @@ class TestInputBacklogBound:
             stream._input_ch.send_nowait(frame())
         stream._input_ch.close()
 
+        # Dropping requires the backlog to be over the cap AND not draining.
+        # A pre-filled channel drains monotonically, so force the
+        # not-draining condition that a genuinely overwhelmed uplink has -
+        # otherwise this test measures producer burstiness, which is exactly
+        # what _uplink_is_falling_behind now refuses to punish.
+        real_qsize = stream._input_ch.qsize
+        monkeypatch.setattr(
+            stream._input_ch, "qsize", lambda: max(real_qsize(), 999), raising=False
+        )
+
         await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
 
-        # The frame in hand has already left the channel when the check runs,
-        # so cap + 1 frames survive.
-        assert stream.dropped_frames == total - 10 - 1
+        # Every frame after the first observation is dropped: the first pass
+        # over the cap cannot know the direction yet.
+        assert stream.dropped_frames == total - 1
         assert stream._done_sent, "the session must still end with Done"
         assert ws.send_str.await_args.args[0] == "Done"
 
@@ -1284,6 +1295,14 @@ class TestConsumedAudioPredicate:
             stream._input_ch.send_nowait(speech_frame())
         stream.end_input()
 
+        # Dropping now also requires the backlog to be failing to drain; hold
+        # the reported depth steady so this test still exercises a drop rather
+        # than silently becoming a no-drop test (see
+        # _uplink_is_falling_behind).
+        monkeypatch.setattr(
+            stream._input_ch, "qsize", lambda: 5, raising=False
+        )
+
         await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
 
         assert stream.dropped_frames > 0
@@ -1716,6 +1735,12 @@ class TestServerStallDetection:
             * VoxistSTTStream.WIRE_SAMPLE_RATE
             * 2  # Int16
         )
+        # The wall-clock floor is a SECOND necessary condition; age the
+        # attempt origin past it so this test isolates the byte bound.
+        stream._attempt_started_at -= (
+            VoxistSTTStream.STALL_DETECTION_SECONDS + 1.0
+        )
+
         stream._bytes_sent_since_progress = expected
         stream._check_server_liveness()  # exactly at the bound: not a stall
 
@@ -2351,3 +2376,227 @@ class TestLanguageCodeHandling:
             if c.args[0].alternatives
         ]
         assert languages and all(str(x).lower() == "fr-medical" for x in languages)
+
+
+class TestStallDetectorFalsePositives:
+    """
+    The detector must never abort a HEALTHY attempt.
+
+    Its accusation ("we gave the engine speech and it said nothing") costs
+    more than it saves when wrong: RecognizeStream._num_retries is set once in
+    __init__ and never reset after a successful stretch, so every spurious
+    APIConnectionError is permanently deducted from the stream's lifetime
+    budget and the fourth one leaves the agent deaf for the rest of the call.
+    A missed accusation only defers the same error to the completion gate at
+    session end. Hence two independent necessary conditions, each tested here.
+    """
+
+    @staticmethod
+    def _budget() -> int:
+        return int(
+            VoxistSTTStream.STALL_DETECTION_SECONDS
+            * VoxistSTTStream.WIRE_SAMPLE_RATE
+            * 2  # Int16
+        )
+
+    @pytest.mark.asyncio
+    async def test_long_pause_after_a_transcript_never_trips(self):
+        """
+        Finding: ordinary user silence killed healthy attempts.
+
+        livekit's pipeline pushes continuously, so a user listening to a long
+        agent answer streams minutes of room noise. Counting every byte meant
+        a full 30s budget accumulated during any pause and the attempt died -
+        livekit resets RecognizeStream._num_retries only on FINAL_TRANSCRIPT,
+        so a single sustained silence trips the detector again on every
+        reconnect and exhausts max_retry within about two minutes.
+
+        The discriminator is the SERVER's behaviour, not the audio's level: an
+        engine that has produced a transcript on this socket is not wedged.
+        Deliberately NOT an amplitude gate - one existed at peak 500 and was
+        removed because it blinded the detector to quiet speakers, which
+        test_quiet_speaker_wedge_is_detected still pins.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+
+        # The engine answered once: this socket is proven.
+        await stream._process_result({"type": "final", "text": "bonjour"})
+        assert stream._last_progress_at is not None
+
+        # Now the user goes quiet for minutes while audio keeps flowing.
+        budget = self._budget()
+        loud = np.full(1600, 8000, dtype=np.int16)
+        while stream._bytes_sent_since_progress <= budget * 3:
+            await stream._send_audio_chunk(loud)
+        stream._attempt_started_at -= 600.0  # ten minutes in
+
+        stream._check_server_liveness()  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_quiet_audio_still_arms_it_before_any_transcript(self):
+        """No amplitude gate: an under-gained speaker must still be protected."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+
+        quiet = np.full(1600, 60, dtype=np.int16)  # peak 60, as the fixture
+        while stream._bytes_sent_since_progress <= self._budget():
+            await stream._send_audio_chunk(quiet)
+        stream._attempt_started_at -= (
+            VoxistSTTStream.STALL_DETECTION_SECONDS + 1.0
+        )
+
+        with pytest.raises(APIConnectionError, match="no response"):
+            stream._check_server_liveness()
+
+    @pytest.mark.asyncio
+    async def test_bytes_alone_do_not_trip_it_wall_time_is_also_required(self):
+        """
+        Finding: a faster-than-real-time sender reached 30s of audio in
+        seconds.
+
+        Batch/file callers and a live caller's catch-up burst after a network
+        hiccup both do this. Tripping there aborted a healthy attempt whose
+        retry then found the input consumed and escalated to a terminal
+        TranscriptLostError, destroying the session outright.
+
+        Both halves are asserted here so neither condition can be dropped
+        without a failure.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+
+        loud = np.full(1600, 8000, dtype=np.int16)
+        while stream._bytes_sent_since_progress <= self._budget():
+            await stream._send_audio_chunk(loud)
+
+        assert stream._bytes_sent_since_progress > self._budget()
+        assert stream._last_progress_at is None, "detector must still be armed"
+        # Byte budget blown, but no wall time has passed: healthy fast sender.
+        stream._check_server_liveness()
+
+        # Same byte state, but now the engine really has been mute that long.
+        stream._attempt_started_at -= (
+            VoxistSTTStream.STALL_DETECTION_SECONDS + 1.0
+        )
+        with pytest.raises(APIConnectionError, match="no response"):
+            stream._check_server_liveness()
+
+
+class TestBacklogDropsOnlyWhenNotDraining:
+    """
+    The cap bounds a slow CONSUMER; it must not punish a bursty PRODUCER.
+
+    push_frame() is synchronous and never yields, so the repo's own
+    documented `for f in frames: s.push_frame(f)` puts a whole file in the
+    channel before the send loop runs once. Dropping on depth alone discarded
+    ~83% of it while every send completed instantly.
+    """
+
+    @staticmethod
+    def _with_depths(stream, depths):
+        it = iter(depths)
+        stream._input_ch = SimpleNamespace(qsize=lambda: next(it), closed=False)
+        return [stream._uplink_is_falling_behind() for _ in depths]
+
+    @pytest.mark.asyncio
+    async def test_draining_burst_keeps_every_frame(self):
+        stream = await make_stream()
+        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
+        # A stopped producer: the loop removes one frame per iteration, so the
+        # backlog only shrinks. Nothing may be dropped, however deep it got.
+        verdicts = self._with_depths(
+            stream, [cap * 6, cap * 6 - 1, cap * 4, cap * 2, cap + 1, cap - 1]
+        )
+        assert verdicts == [False] * 6, (
+            "a draining backlog is a bursty producer, not a slow uplink"
+        )
+
+    @pytest.mark.asyncio
+    async def test_growing_backlog_still_drops(self):
+        stream = await make_stream()
+        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
+        verdicts = self._with_depths(stream, [cap + 100, cap + 200, cap + 300])
+        # First observation cannot know the direction yet; after that, growth
+        # over the cap is a genuinely overwhelmed uplink.
+        assert verdicts == [False, True, True]
+
+    @pytest.mark.asyncio
+    async def test_steady_over_cap_backlog_drops(self):
+        """At the cap this is ~10s of latency: too stale to be worth sending."""
+        stream = await make_stream()
+        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
+        assert self._with_depths(stream, [cap * 2] * 3) == [False, True, True]
+
+    @pytest.mark.asyncio
+    async def test_dropping_the_backlog_below_the_cap_rearms_cleanly(self):
+        """A later burst must be judged on its own, not a stale high-water."""
+        stream = await make_stream()
+        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
+        verdicts = self._with_depths(
+            stream, [cap + 500, cap - 1, cap + 500, cap + 400]
+        )
+        assert verdicts == [False, False, False, False]
+
+
+class TestOversizedFrameIsSlicedNotRejected:
+    """
+    The processor's 1MB guard raised a bare ValueError - not an APIError - so
+    it unwound _run without the completion gate running, leaving
+    _session_complete False and killing the stream with a ValueError at the
+    call site. Legitimate callers hit it: ~11s of 48kHz mono, or livekit's own
+    AudioResampler emitting a large frame.
+    """
+
+    def test_slices_are_bounded_and_lossless(self):
+        original = bytes(MAX_FRAME_SIZE_BYTES * 2 + 100)
+        pieces = list(VoxistSTTStream._iter_frame_slices(original))
+
+        assert len(pieces) == 3
+        assert all(len(p) <= MAX_FRAME_SIZE_BYTES for p in pieces)
+        assert b"".join(pieces) == original, "slicing must not lose a sample"
+        assert all(len(p) % 2 == 0 for p in pieces), "Int16 alignment"
+
+    def test_ordinary_frame_is_yielded_untouched(self):
+        frame = bytes(3200)
+        pieces = list(VoxistSTTStream._iter_frame_slices(frame))
+        assert pieces == [frame]
+
+    @pytest.mark.asyncio
+    async def test_oversized_frame_reaches_the_wire_without_raising(self):
+        """End-to-end: the audio is sent, not lost, and no ValueError escapes."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        # Int16, so 600k samples is ~1.2MB of bytes: over the 1MB limit.
+        big = speech_frame(samples=600_000)
+        frame_bytes = len(bytes(big.data))
+        assert frame_bytes > MAX_FRAME_SIZE_BYTES, (
+            f"frame must exceed the limit to exercise slicing, got {frame_bytes}B"
+        )
+
+        async def scenario():
+            stream._input_ch.send_nowait(big)
+            await asyncio.sleep(0.2)
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # end_input
+            await asyncio.sleep(0.05)
+            ws.end()  # gateway closes after Done
+
+        task = asyncio.create_task(scenario())
+        # No ValueError escapes, and the audio actually went out.
+        await asyncio.wait_for(stream._run(), timeout=30.0)
+        await task
+
+        assert sum(len(b) for b in ws.sent_bytes) >= frame_bytes * 0.99, (
+            "the whole oversized frame must reach the wire"
+        )
+        assert stream.dropped_frames == 0

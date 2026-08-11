@@ -381,11 +381,28 @@ class AudioProcessor:
         # Track original sample count for logging
         num_samples = len(int16_audio)
 
-        # Add samples to ring buffer with overflow handling
-        self._add_to_buffer(int16_audio)
-
-        # Extract all available chunks
-        chunks = self._extract_available_chunks()
+        # Absorbed in pieces the ring buffer can hold, draining chunks out
+        # between pieces, so no sample is ever discarded for being early.
+        #
+        # _add_to_buffer's overflow branches drop the OLDEST samples to make
+        # room, which is correct for a live ring buffer under a slow reader
+        # but catastrophic here: the reader is the very next statement. A
+        # single frame longer than the buffer (_ring_buffer_size is 2 seconds
+        # at the input rate) used to arrive, overflow, and be truncated to its
+        # final 2 seconds before anything was extracted - so a batch caller
+        # pushing 5-second blocks silently lost 60% of every block, with only
+        # a debug-level "exceeds buffer capacity" line to show for it. The
+        # loss was in the OLDEST audio, i.e. the start of every utterance.
+        #
+        # Feeding at most advance_samples per pass guarantees the buffer never
+        # has to trim: each pass adds less than one chunk's worth of new audio
+        # and _extract_available_chunks then consumes everything a full chunk
+        # can cover.
+        chunks: list[np.ndarray] = []
+        piece_size = max(1, self.advance_samples)
+        for start in range(0, num_samples, piece_size):
+            self._add_to_buffer(int16_audio[start : start + piece_size])
+            chunks.extend(self._extract_available_chunks())
 
         # Update legacy buffer for backward compatibility
         self._update_legacy_buffer()

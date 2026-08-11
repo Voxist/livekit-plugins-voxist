@@ -6,6 +6,7 @@ import inspect
 import logging
 import os
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
@@ -2198,3 +2199,73 @@ class TestSessionLoopIntrospectionFailsLoud:
 
 async def _make_session() -> aiohttp.ClientSession:
     return aiohttp.ClientSession()
+
+
+class TestProbeTransportAbortIsReportedHonestly:
+    """
+    On the close-timeout path aiohttp has usually already released the
+    connection, so there is no transport left to abort - and the log said
+    "aborted the probe transport" regardless, telling an operator chasing a
+    leaked socket that cleanup had happened when it had not.
+
+    No test covered this at all: inverting the helper's return value left the
+    whole stt suite green.
+    """
+
+    @staticmethod
+    def _ws_with_transport(transport):
+        return SimpleNamespace(
+            _response=SimpleNamespace(
+                connection=SimpleNamespace(transport=transport)
+            )
+        )
+
+    def test_a_reachable_transport_is_aborted_and_reported(self):
+        aborted = []
+        ws = self._ws_with_transport(
+            SimpleNamespace(abort=lambda: aborted.append(True))
+        )
+        assert VoxistSTT._abort_probe_transport(ws) is True
+        assert aborted == [True]
+
+    def test_an_already_released_connection_reports_no_abort(self):
+        ws = SimpleNamespace(_response=SimpleNamespace(connection=None))
+        assert VoxistSTT._abort_probe_transport(ws) is False
+
+    def test_a_transport_that_refuses_reports_no_abort(self):
+        def boom():
+            raise RuntimeError("already closed")
+
+        ws = self._ws_with_transport(SimpleNamespace(abort=boom))
+        assert VoxistSTT._abort_probe_transport(ws) is False
+
+    @pytest.mark.asyncio
+    async def test_the_close_timeout_log_matches_what_happened(self, caplog):
+        """The log must distinguish an abort from a no-op."""
+        stt = VoxistSTT(api_key="k", validate_websocket=False)
+
+        class HangingWS:
+            def __init__(self, transport):
+                self._response = SimpleNamespace(
+                    connection=SimpleNamespace(transport=transport)
+                )
+
+            async def close(self):
+                await asyncio.Event().wait()
+
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            # Nothing left to abort: the honest message says so.
+            await stt._close_probe_socket(HangingWS(None))
+            released = [r.message for r in caplog.records]
+            caplog.clear()
+            # A live transport: the abort really happens.
+            aborted = []
+            await stt._close_probe_socket(
+                HangingWS(SimpleNamespace(abort=lambda: aborted.append(True)))
+            )
+            real = [r.message for r in caplog.records]
+
+        assert any("already released" in m for m in released), released
+        assert not any("already released" in m for m in real), real
+        assert any("aborted the probe transport" in m for m in real), real
+        assert aborted == [True]

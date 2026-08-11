@@ -1026,21 +1026,30 @@ class VoxistSTT(STT):
         )
 
     @staticmethod
-    def _abort_probe_transport(ws: aiohttp.ClientWebSocketResponse) -> None:
+    def _abort_probe_transport(ws: aiohttp.ClientWebSocketResponse) -> bool:
         """Drop the probe socket's transport without awaiting anything.
 
         Used where a clean close is impossible or already gave up: the socket
         is short-lived and about to be discarded either way, and leaking it
         would leak a server-side engine session with it.
+
+        Returns whether a transport was actually aborted, because often none
+        is reachable. On the close-timeout path in particular aiohttp has
+        already released the connection, so `ws._response.connection` is None
+        and there is nothing left to abort - and the caller used to log
+        "aborted the probe transport" regardless, telling an operator
+        diagnosing a leaked socket that cleanup had happened when it had not.
         """
         response = getattr(ws, "_response", None)
         connection = getattr(response, "connection", None)
         transport = getattr(connection, "transport", None)
-        if transport is not None:
-            try:
-                transport.abort()
-            except (AttributeError, RuntimeError):
-                pass
+        if transport is None:
+            return False
+        try:
+            transport.abort()
+        except (AttributeError, RuntimeError):
+            return False
+        return True
 
     async def _close_probe_socket(
         self, ws: aiohttp.ClientWebSocketResponse
@@ -1059,11 +1068,23 @@ class VoxistSTT(STT):
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            self._abort_probe_transport(ws)
-            logger.warning(
-                "WebSocket readiness probe close timed out; aborted the "
-                "probe transport"
-            )
+            if self._abort_probe_transport(ws):
+                logger.warning(
+                    "WebSocket readiness probe close timed out; aborted the "
+                    "probe transport"
+                )
+            else:
+                # aiohttp has usually already released the connection by the
+                # time close() times out, so there is no transport left to
+                # abort. Say so rather than claiming a cleanup that did not
+                # happen: the socket is then left to aiohttp's own connector
+                # teardown, and the server-side session to the gateway's
+                # timeout.
+                logger.warning(
+                    "WebSocket readiness probe close timed out and its "
+                    "transport was already released; leaving it to aiohttp's "
+                    "connector teardown"
+                )
         except Exception as e:
             logger.debug(f"Closing the warm-up WebSocket failed: {e!r}")
 

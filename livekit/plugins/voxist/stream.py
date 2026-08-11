@@ -1628,9 +1628,14 @@ class VoxistSTTStream(RecognizeStream):
         are logged, and {"type": "error"} still raises. They simply do not buy
         the server another STALL_DETECTION_SECONDS of muteness.
 
-        Setting _last_progress_at also permanently disarms the detector for
-        this socket; see _check_server_liveness for why proving itself once is
-        enough, and what that deliberately gives up.
+        Setting _last_progress_at RESETS the detector's budget and moves the
+        origin of its wall-clock floor; it does not disarm anything. A version
+        briefly shipped in this PR did disarm permanently on the first
+        transcript, which left the agent deaf for whole calls after a
+        mid-session wedge AND reported success - see _check_server_liveness,
+        which now documents why a resettable budget is safe (measured: the
+        engine emits a partial/final pair roughly every 0.67s even on input
+        carrying no speech).
 
         Args:
             is_final: Whether the frame was a "final" rather than a "partial".

@@ -2511,40 +2511,56 @@ class TestStallDetectorFalsePositives:
         )
 
     @pytest.mark.asyncio
-    async def test_long_pause_after_a_transcript_never_trips(self):
+    async def test_a_long_pause_punctuated_by_the_engine_never_trips(self):
         """
-        Finding: ordinary user silence killed healthy attempts.
+        The mechanism that makes a resettable budget safe, exercised directly.
 
-        livekit's pipeline pushes continuously, so a user listening to a long
-        agent answer streams minutes of room noise. Counting every byte meant
-        a full 30s budget accumulated during any pause and the attempt died -
-        livekit resets RecognizeStream._num_retries only on FINAL_TRANSCRIPT,
-        so a single sustained silence trips the detector again on every
-        reconnect and exhausts max_retry within about two minutes.
+        Measured live: the engine emits a partial/final pair roughly every
+        0.67s even on input carrying no speech - 37 frames across 24s. Each
+        one clears the budget, so a healthy engine cannot accumulate it however
+        long the user stays quiet.
 
-        The discriminator is the SERVER's behaviour, not the audio's level: an
-        engine that has produced a transcript on this socket is not wedged.
-        Deliberately NOT an amplitude gate - one existed at peak 500 and was
-        removed because it blinded the detector to quiet speakers, which
-        test_quiet_speaker_wedge_is_detected still pins.
+        The previous version of this test aged `_attempt_started_at`, which
+        `_check_server_liveness` stops reading the moment `_last_progress_at`
+        is set, so it could not fail for its stated reason. This ages BOTH
+        clocks so that only the budget reset can be what prevents the raise:
+        with the reset removed the budget accumulates across iterations while
+        the aged clock keeps the wall-time floor satisfied, and it fires.
         """
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
         stream._ws = ws
 
-        # The engine answered once: this socket is proven.
-        await stream._process_result({"type": "final", "text": "bonjour"})
-        assert stream._last_progress_at is not None
-
-        # Now the user goes quiet for minutes while audio keeps flowing.
         budget = self._budget()
         loud = np.full(1600, 8000, dtype=np.int16)
-        while stream._bytes_sent_since_progress <= budget * 3:
-            await stream._send_audio_chunk(loud)
-        stream._attempt_started_at -= 600.0  # ten minutes in
+        # 80% of a budget per round, so four rounds stream >3x the bound.
+        chunks_per_round = int(budget * 0.8 / loud.nbytes)
+        total = 0
 
-        stream._check_server_liveness()  # must not raise
+        for _ in range(4):
+            # A FIXED amount per iteration, not a loop on the budget: with
+            # the reset removed, a budget-conditioned loop sends fewer bytes
+            # each round and the test then fails on its own bookkeeping
+            # instead of on the detector firing.
+            for _ in range(chunks_per_round):
+                await stream._send_audio_chunk(loud)
+                total += loud.nbytes
+
+            # The engine punctuates the silence, as it does every ~0.67s.
+            await stream._process_result({"type": "final", "text": ""})
+
+            # Age both clocks AFTER the transcript, not before. Ageing first
+            # let the transcript refresh the wall-clock origin and it was then
+            # the clock, not the budget reset, that prevented the raise - so
+            # the test passed with the reset removed.
+            stream._attempt_started_at -= 60.0
+            assert stream._last_progress_at is not None
+            stream._last_progress_at -= 60.0
+
+            stream._check_server_liveness()  # must never raise
+
+        assert total > budget * 3, "must stream well past the bound"
 
     @pytest.mark.asyncio
     async def test_quiet_audio_still_arms_it_before_any_transcript(self):
@@ -3172,11 +3188,18 @@ class TestRoundNineRegressions:
         gate then raised the fatal TranscriptLostError on a session the engine
         had actually finalized.
         """
+        # Deterministic by construction rather than by timing: an idle margin
+        # LARGER than the drain bound makes the ordinary idle path
+        # unreachable, so whichever moment the final lands, the deadline
+        # branch is the one under test. The previous version slept 0.45s
+        # against a 0.5s bound with a 0.4s margin - a ~50ms window that a
+        # loaded CI box would miss in either direction, passing without ever
+        # touching the branch.
         monkeypatch.setattr(
-            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.5, raising=False
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 1.0, raising=False
         )
         monkeypatch.setattr(
-            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 0.4, raising=False
+            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 30.0, raising=False
         )
         ws = FakeWS()  # Kroko: never closes
         stream = await make_stream(dial=AsyncMock(return_value=ws))
@@ -3186,9 +3209,10 @@ class TestRoundNineRegressions:
             stream._input_ch.send_nowait(speech_frame())
             await asyncio.sleep(0.05)
             stream._input_ch.close()  # Done
-            # Answer late: inside the drain bound, but with less than the
-            # idle margin left before it expires.
-            await asyncio.sleep(0.45)
+            # Answer inside the drain bound. The idle margin can never
+            # elapse before the deadline, so this always exercises the
+            # deadline branch.
+            await asyncio.sleep(0.2)
             ws.feed_json({"type": "final", "text": ""})
 
         task = asyncio.create_task(scenario())

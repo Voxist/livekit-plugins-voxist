@@ -79,7 +79,6 @@ DEFAULT_CONFIG = {
     'base_url': 'wss://api-asr.voxist.com/ws',
     'language': 'fr',
     'interim_results': True,
-    'connection_pool_size': 2,
     'connection_timeout': 10.0,
     'heartbeat_interval': 30.0,
     'chunk_duration_ms': 100,
@@ -88,3 +87,8 @@ DEFAULT_CONFIG = {
     'reconnect_backoff': 1.0,
     'max_backoff': 30.0,
 }
+# NOTE: no 'connection_pool_size'. There is no pool - one WebSocket per
+# stream, dialed by that stream - and the key survived the rewrite that
+# deleted the pool. VoxistSTT still ACCEPTS the argument, deprecated, so
+# existing callers keep working; advertising it as a default would suggest
+# it still does something.

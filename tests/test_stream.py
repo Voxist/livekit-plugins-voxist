@@ -529,6 +529,15 @@ class TestInputBacklogBound:
             stream._input_ch.send_nowait(frame())
         stream._input_ch.close()
 
+        # A drop now needs the backlog over the cap AND not draining, and a
+        # pre-filled channel drains monotonically. Hold the reported depth
+        # steady so this test still exercises the drop path instead of
+        # quietly becoming a no-drop test - see _uplink_is_falling_behind,
+        # which deliberately no longer punishes a bursty producer.
+        monkeypatch.setattr(
+            stream._input_ch, "qsize", lambda: 999, raising=False
+        )
+
         loop = asyncio.get_running_loop()
         loop_time_before = loop.time()
 
@@ -536,7 +545,7 @@ class TestInputBacklogBound:
             await asyncio.wait_for(stream._send_audio_task(), timeout=10.0)
 
             drops = [r for r in caplog.records if "dropping audio" in r.message]
-            assert stream.dropped_frames == 200 - 5 - 1
+            assert stream.dropped_frames == 200 - 1
             assert len(drops) == 1
 
             # The limiter genuinely tracks elapsed time rather than just

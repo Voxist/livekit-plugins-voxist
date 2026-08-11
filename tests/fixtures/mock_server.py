@@ -84,7 +84,7 @@ class MockVoxistServer:
             send_interim: Whether to send interim results
             interim_delay_ms: Delay before sending interim result
             error_mode: Error simulation mode (None, "auth_failure", "wedge",
-                        "ws_blocked").
+                        "ws_blocked", "ws_upgraded_then_rejected").
                         "wedge" models a wedged ENGINE behind a healthy
                         gateway: the WebSocket layer stays connected (aiohttp
                         answers pings at protocol level) and keeps accepting
@@ -97,6 +97,18 @@ class MockVoxistServer:
                         hands out a valid-looking token URL while /ws answers
                         a plain HTTP 200 instead of upgrading. Refusals are
                         counted in self.ws_upgrade_refusals.
+                        "ws_upgraded_then_rejected" models a gateway that
+                        refuses at the APPLICATION layer: the token endpoint is
+                        healthy, the WebSocket upgrade SUCCEEDS (a real 101,
+                        counted in self.connections_count), and only then is
+                        the socket closed with 1008 - the gateway's documented
+                        answer for an invalid or expired app-level credential
+                        and for an exhausted wallet balance. Distinct from
+                        "auth_failure", which fails the token exchange with a
+                        401 and so never upgrades at all, and from
+                        "ws_blocked", which never upgrades either. This is the
+                        only mode where a client that observes nothing but the
+                        101 concludes the deployment is healthy.
             on_audio_received: Callback when audio is received (for testing)
             api_key_header: Header carrying the API key on the token exchange
                             (must match VoxistDialer's api_key_header, whose
@@ -205,8 +217,9 @@ class MockVoxistServer:
         4. Treat "Done" as end-of-SESSION: flush a final, then close
 
         error_mode shortcuts this: "ws_blocked" never upgrades at all,
-        "auth_failure" closes with 1008, "wedge" accepts everything and
-        answers nothing.
+        "auth_failure" closes with 1008, "ws_upgraded_then_rejected" upgrades
+        for a VALID credential and then closes with 1008, "wedge" accepts
+        everything and answers nothing.
         """
         if self.error_mode == "ws_blocked":
             # Broken WebSocket path behind a healthy token endpoint: answer
@@ -228,6 +241,17 @@ class MockVoxistServer:
 
             if self.error_mode == "auth_failure":
                 await ws.close(code=1008, message=b"Invalid API key")
+                return ws
+
+            if self.error_mode == "ws_upgraded_then_rejected":
+                # The credential is fine at the token endpoint and the upgrade
+                # already succeeded; the refusal happens at the application
+                # layer, after the 101. A client that treats the handshake as
+                # proof of a working deployment cannot tell this apart from a
+                # healthy connect.
+                await ws.close(
+                    code=1008, message=b"Application layer refused the session"
+                )
                 return ws
 
             is_valid = credential in (self.valid_api_key, self.ws_token)

@@ -311,12 +311,17 @@ class TestSessionDialing:
             api_key="test", base_url=f"ws://{server.host}:{server.port}/ws"
         )
         ready = await stt.wait_for_initialization(timeout=5.0)
+        # Read BEFORE aclose(). is_ready reports the readiness of a LIVE
+        # plugin, and a closed one is never ready (stream() raises on it), so
+        # asserting it after the teardown below asserted the opposite of what
+        # this test is about.
+        ready_property = stt.is_ready
 
         await stt.aclose()
         await server.stop()
 
         assert ready is True
-        assert stt.is_ready
+        assert ready_property is True
         assert server.token_requests_count == 1
 
     @pytest.mark.asyncio

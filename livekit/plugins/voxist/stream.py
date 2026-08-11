@@ -1294,17 +1294,25 @@ class VoxistSTTStream(RecognizeStream):
             return
 
         msg_type = data.get("type")
+        is_transcript = msg_type in ("partial", "final")
 
         # Liveness accounting happens here, after classification, because only
         # a transcript frame proves the thing the detector is watching for.
-        if msg_type in ("partial", "final"):
+        if is_transcript:
             self._note_engine_progress()
 
         # Detect start of speech. "text" is server-supplied: anything that
         # is not a string (absent, null, a number) counts as no text.
+        #
+        # Gated on is_transcript for the same reason the budget above is: a
+        # "text" key is a SHAPE, not a meaning. The gateway's redirect frame
+        # carries a target that can land in "text", and an error frame can
+        # too; latching on either opened a speech turn no transcript would
+        # ever close, leaving the caller waiting for an END_OF_SPEECH that
+        # only arrives at session teardown.
         raw_text = data.get("text")
         text = raw_text.strip() if isinstance(raw_text, str) else ""
-        if not self._speaking and text:
+        if is_transcript and not self._speaking and text:
             self._speaking = True
             logger.debug(f"Stream {self._session_id} speech started")
 

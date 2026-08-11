@@ -1450,6 +1450,51 @@ class TestDefensiveResultProcessing:
 
         assert any("unknown message type" in r.message for r in caplog.records)
 
+    @pytest.mark.parametrize(
+        "frame_obj",
+        [
+            # The gateway's redirect target can land in "text"
+            {"type": "redirect", "target": "wss://node2", "text": "node2"},
+            {"type": "some-future-frame", "text": "not a transcript"},
+            {"text": "no type at all"},
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_non_transcript_frame_does_not_open_a_speech_turn(
+        self, frame_obj
+    ):
+        """
+        START_OF_SPEECH must follow frame MEANING, not the presence of "text".
+
+        A "text" key is a shape. Latching _speaking on it opened a speech turn
+        for frames that carry no transcript, and nothing closes that turn
+        until session teardown - the caller waits for an END_OF_SPEECH that
+        never comes mid-session.
+        """
+        stream = await make_stream()
+        stream._event_ch = Mock()
+
+        await stream._process_result(frame_obj)
+
+        assert not stream._speaking, (
+            f"{frame_obj!r} carries no transcript and must not start speech"
+        )
+        assert stream._event_ch.send_nowait.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_transcript_frame_does_open_a_speech_turn(self):
+        """The other half: a real transcript still starts the turn."""
+        stream = await make_stream()
+        stream._event_ch = Mock()
+
+        await stream._process_result({"type": "partial", "text": "bonjour"})
+
+        assert stream._speaking
+        emitted = [
+            c.args[0].type for c in stream._event_ch.send_nowait.call_args_list
+        ]
+        assert SpeechEventType.START_OF_SPEECH in emitted
+
     @pytest.mark.asyncio
     async def test_error_frame_still_raises(self):
         stream = await make_stream()

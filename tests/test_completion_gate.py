@@ -584,41 +584,108 @@ class TestDrainStillReportsFactsNotVerdicts:
         src = inspect.getsource(VoxistSTTStream._await_engine_finalization)
         tree = ast.parse(textwrap.dedent(src))
 
-        # Parsed, not grepped. The substring version failed the moment a
-        # COMMENT in this function mentioned TranscriptLostError to explain
-        # which defect an ordering fix prevented - a test that forbids naming
-        # a thing is not a test that forbids doing it, and it pushed back
-        # against documenting the reason.
-        assigned = {
-            t.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Assign)
-            for t in node.targets
-            if isinstance(t, ast.Attribute)
-        }
-        assert "_session_complete" not in assigned, (
-            "the drain must not decide completion"
-        )
+        # Parsed, not grepped - but broadly. The substring version failed the
+        # moment a COMMENT here mentioned TranscriptLostError to explain which
+        # defect an ordering fix prevented, and the first AST rewrite
+        # overcorrected into a check that missed setattr, AugAssign, tuple
+        # targets and `raise <name>` - reading as protection while forbidding
+        # almost nothing.
+        FORBIDDEN_NAMES = {"_session_complete", "_finish_session"}
 
-        raised = {
-            node.exc.func.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Raise)
-            and isinstance(node.exc, ast.Call)
-            and isinstance(node.exc.func, ast.Name)
-        }
-        assert "TranscriptLostError" not in raised, (
+        touched: set[str] = set()
+        for node in ast.walk(tree):
+            # Attribute writes in every assignment form
+            targets: list[ast.expr] = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+                targets = [node.target]
+            elif isinstance(node, ast.NamedExpr):
+                targets = [node.target]
+            for t in targets:
+                for sub in ast.walk(t):
+                    if isinstance(sub, ast.Attribute):
+                        touched.add(sub.attr)
+                    elif isinstance(sub, ast.Name):
+                        touched.add(sub.id)
+            # Any call, however routed, plus setattr's string argument
+            if isinstance(node, ast.Call):
+                fn = node.func
+                if isinstance(fn, ast.Attribute):
+                    touched.add(fn.attr)
+                elif isinstance(fn, ast.Name):
+                    touched.add(fn.id)
+                    if fn.id in ("setattr", "getattr"):
+                        for arg in node.args:
+                            if isinstance(arg, ast.Constant) and isinstance(
+                                arg.value, str
+                            ):
+                                touched.add(arg.value)
+            # Every raise, including `raise exc` and a bare re-raise
+            if isinstance(node, ast.Raise) and node.exc is not None:
+                for sub in ast.walk(node.exc):
+                    if isinstance(sub, ast.Name):
+                        touched.add(sub.id)
+                    elif isinstance(sub, ast.Attribute):
+                        touched.add(sub.attr)
+
+        assert not (FORBIDDEN_NAMES & touched), (
+            f"the drain must not decide completion, but touches "
+            f"{sorted(FORBIDDEN_NAMES & touched)}"
+        )
+        assert "TranscriptLostError" not in touched, (
             "the terminal error has exactly one raise site, and it is the gate"
         )
 
-        called = {
-            node.func.attr
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-        }
-        assert "_finish_session" not in called, (
-            "the drain reports facts; the gate renders the verdict"
-        )
+        # The check must be able to SEE each forbidden form, or it is not a
+        # check. Each of these once slipped past a version of this test.
+        for snippet, name in [
+            ("def f(self):\n    self._session_complete = True", "_session_complete"),
+            ("def f(self):\n    setattr(self, '_session_complete', True)", "_session_complete"),
+            ("def f(self):\n    self._session_complete, x = True, 1", "_session_complete"),
+            (
+                "def f(self):\n    exc = TranscriptLostError('x')\n    raise exc",
+                "TranscriptLostError",
+            ),
+            ("def f(self):\n    raise TranscriptLostError('x')", "TranscriptLostError"),
+            ("def f(self):\n    self._finish_session(o)", "_finish_session"),
+        ]:
+            probe = ast.parse(snippet)
+            seen: set[str] = set()
+            for node in ast.walk(probe):
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = list(node.targets)
+                elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+                    targets = [node.target]
+                for t in targets:
+                    for sub in ast.walk(t):
+                        if isinstance(sub, ast.Attribute):
+                            seen.add(sub.attr)
+                        elif isinstance(sub, ast.Name):
+                            seen.add(sub.id)
+                if isinstance(node, ast.Call):
+                    fn = node.func
+                    if isinstance(fn, ast.Attribute):
+                        seen.add(fn.attr)
+                    elif isinstance(fn, ast.Name):
+                        seen.add(fn.id)
+                        if fn.id in ("setattr", "getattr"):
+                            for arg in node.args:
+                                if isinstance(arg, ast.Constant) and isinstance(
+                                    arg.value, str
+                                ):
+                                    seen.add(arg.value)
+                if isinstance(node, ast.Raise) and node.exc is not None:
+                    for sub in ast.walk(node.exc):
+                        if isinstance(sub, ast.Name):
+                            seen.add(sub.id)
+                        elif isinstance(sub, ast.Attribute):
+                            seen.add(sub.attr)
+            assert name in seen, (
+                f"the detector cannot see {name!r} in {snippet!r}, so this "
+                "invariant does not constrain what it claims"
+            )
 
     @pytest.mark.asyncio
     async def test_server_close_during_the_drain_still_surfaces_its_error(self):

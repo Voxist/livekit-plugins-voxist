@@ -123,6 +123,19 @@ class _SessionOutcome:
             Defaults to False so any caller that does not state the fact gets
             the conservative reading: no acknowledgement, so an empty result
             is treated as loss.
+        audio_was_dropped: Frames were discarded to bound the input backlog,
+            so the engine was never sent part of the caller's audio.
+
+            This is the one loss the engine cannot possibly report on, and it
+            invalidates its empty verdict: "I found nothing" is only a verdict
+            on what it RECEIVED. Without this fact the gate accepted that
+            verdict for the whole session, so audio the plugin itself threw
+            away was logged as "an empty session, not a lost one" - the
+            completion gate exists to stop exactly that reading, and it was
+            reaching it on self-inflicted loss.
+
+            Defaults to False so a caller that omits it gets the reading that
+            does not silently excuse loss.
         detail: Human-readable description of how the attempt ended, used
             verbatim in the log or error message the verdict produces.
     """
@@ -132,7 +145,23 @@ class _SessionOutcome:
     unrecoverable_audio: bool
     concluded: bool
     detail: str
+    audio_was_dropped: bool = False
     engine_reported_empty: bool = False
+
+
+def _frame_seconds(frame: rtc.AudioFrame) -> float:
+    """
+    Duration of one caller frame, or 0.0 if it cannot be determined.
+
+    Reads the frame's own rate rather than assuming the wire rate: the caller
+    may push 48kHz that the AudioProcessor resamples later, and the backlog
+    bound is about how much of the CALLER's audio is waiting.
+    """
+    rate = getattr(frame, "sample_rate", 0) or 0
+    samples = getattr(frame, "samples_per_channel", 0) or 0
+    if rate <= 0 or samples <= 0:
+        return 0.0
+    return samples / rate
 
 
 class VoxistSTTStream(RecognizeStream):
@@ -168,7 +197,7 @@ class VoxistSTTStream(RecognizeStream):
     #
     # What the plugin guarantees instead, independent of transport type:
     #   1. no send blocks longer than SEND_TIMEOUT_SECONDS,
-    #   2. the input backlog is bounded by MAX_INPUT_BACKLOG_FRAMES.
+    #   2. the input backlog is bounded by MAX_INPUT_BACKLOG_SECONDS.
 
     # A send that cannot complete in this long means the uplink is stalled.
     SEND_TIMEOUT_SECONDS = 5.0
@@ -243,16 +272,42 @@ class VoxistSTTStream(RecognizeStream):
     # unlimited warning would emit ~100 lines/second per stream.
     DROP_LOG_INTERVAL_SECONDS = 5.0
 
-    # Cap on unsent audio frames held in the input channel. livekit's channel
-    # is unbounded and push_frame() never blocks, so without this a slow
-    # uplink grows the backlog until the process is OOM-killed. At 10ms frames
-    # this is ~10s of audio; beyond that, transcripts would arrive too late to
-    # be useful anyway, so frames are dropped rather than queued.
+    # OOM backstop on the input channel, expressed as DURATION of unsent
+    # audio. livekit's channel is unbounded and push_frame() never blocks, so
+    # without a ceiling a slow uplink grows the backlog until the process is
+    # killed. This is the ONLY thing the bound is for.
     #
-    # Exceeding the cap is necessary but NOT sufficient to drop: the backlog
-    # must also be failing to drain. See _uplink_is_falling_behind for why
-    # depth alone silently discarded most of a batch caller's audio.
-    MAX_INPUT_BACKLOG_FRAMES = 1000
+    # It is deliberately generous and deliberately dumb. Three previous
+    # versions each tried to tell "a burst that will drain" (a batch caller,
+    # do not drop) from "a producer outpacing the uplink" (live overload, do
+    # drop), and all three were wrong because that intent is not observable
+    # from this side of the channel:
+    #
+    #   - depth alone discarded ~83% of a batch caller's file;
+    #   - comparing successive depths removed the bound entirely, because the
+    #     send loop pops before the check and rarely yields, so the depth
+    #     always fell by one and the predicate read its own drop as draining
+    #     (measured peak depth 9928 against a nominal 1000);
+    #   - `not _input_ch.closed` discarded a batch caller's file again for any
+    #     ASYNC producer, since the channel is only closed in the same task
+    #     step for a synchronous push loop - and it also dropped the backlog
+    #     that accumulates while the dialer is parked in the rate limiter.
+    #
+    # So no inference. A generous absolute ceiling, and above it frames are
+    # dropped, unconditionally and loudly.
+    #
+    # Why a live conversation cannot reach it: every send either completes
+    # within SEND_TIMEOUT_SECONDS or raises, so a genuinely STALLED uplink
+    # ends the attempt long before two minutes of audio accumulates. Only an
+    # uplink that keeps succeeding while running slower than real time can
+    # walk the backlog up, and two minutes of that is already far past the
+    # point where a transcript would be useful.
+    #
+    # The accepted cost: a caller that hands us more than this in one burst
+    # loses the excess. livekit's own pipeline pushes in real time and never
+    # approaches it; the exposed case is bulk/file transcription, which should
+    # push incrementally.
+    MAX_INPUT_BACKLOG_SECONDS = 120.0
 
     # Mid-session liveness bound, measured in AUDIO DELIVERED, not wall
     # time. aiohttp's heartbeat only detects transport death; the gateway's
@@ -375,9 +430,6 @@ class VoxistSTTStream(RecognizeStream):
         #                            report; None until one arrives
         # ------------------------------------------------------------------
         self._done_sent = False
-        # Monotonic time "Done" was written, or None. Pairs with _done_sent so
-        # a post-Done final can be told from a mid-session one.
-        self._done_sent_at: float | None = None
         self._session_complete = False
         self._audio_consumed = False
         self._final_received = False
@@ -470,7 +522,6 @@ class VoxistSTTStream(RecognizeStream):
         # before end of input" guard and the "connection lost before Done"
         # guard for this whole attempt.
         self._done_sent = False
-        self._done_sent_at = None
         self._transport_lookup_failed = False
         self._final_received_this_attempt = False
         self._interim_received_this_attempt = False
@@ -879,57 +930,54 @@ class VoxistSTTStream(RecognizeStream):
     @property
     def _engine_reported_empty_this_attempt(self) -> bool:
         """
-        Whether the engine rendered a POST-DONE verdict and it was empty.
+        Whether the engine finalized this attempt and found nothing in it.
 
-        An engine that answers "Done" with {"type": "final", "text": ""} has
-        told us it processed the audio and found nothing to transcribe. That
+        An engine that finalizes with {"type": "final", "text": ""} has told us
+        it processed the audio and found nothing to transcribe. That
         distinguishes a participant sitting on an open mic (room noise,
         coughing, another language - all non-zero samples, so all "real audio"
-        by _carries_signal) from an engine that crashed, which returns NOTHING.
+        by _carries_signal) from an engine that crashed, which answers NOTHING.
         Both used to end in the same terminal TranscriptLostError, making a
         fatal error the default outcome for someone who never said anything.
 
-        The bar is deliberately high, and the first version of this got it
-        wrong in a way that recreated the defect class three earlier rounds
-        were spent eliminating - total transcript loss reported as success.
-        That version asked only "did any transcript frame arrive, and did none
-        of them carry text", which a SINGLE empty frame anywhere in the attempt
-        satisfied. Because the engine endpoints silence (rule1, 0.9s), the
-        opening second of every call produces exactly such a frame - so an
-        engine that emitted one empty final and then wedged certified itself as
-        having found nothing in the five minutes of speech that followed, and
-        the session completed successfully with one INFO line.
+        Two conditions, and note what is NOT among them:
 
-        Three conditions now, all necessary:
-
-        - "Done" was written. Before that the engine has been asked nothing,
-          so it cannot have answered; a mid-session empty final is a verdict
-          on ONE segment, never on the session.
-        - A FINAL arrived after "Done" (_last_final_at, which only
-          _note_engine_progress(is_final=True) sets). A partial is not a
-          verdict - an engine that opened a segment and died is a loss - and
-          neither is a mid-session final that happens to be the last one seen.
+        - A FINAL arrived on this socket (_last_final_at). A partial is not a
+          finalization; an engine that opened a segment and died has rendered
+          no verdict.
         - Nothing the engine sent carried text (_speaking, latched by
           _process_result on the first text-bearing transcript and cleared per
           attempt by _run's finally). Text the engine produced but the plugin
           failed to deliver is LOSS, not an empty report.
 
-        Remaining ambiguity, deliberately unresolved: a frame whose "text" is
-        malformed rather than absent (renamed field, null, numeric) is read as
+        There is deliberately NO comparison against when "Done" was written.
+        An earlier version required _last_final_at >= _done_sent_at, and that
+        was wrong twice over. It was too STRICT: an engine that finalized the
+        trailing silence before end_input and then had nothing more to say
+        sent nothing after Done, so a quiet participant went back to being
+        fatal - the exact default this exemption exists to remove. And it was
+        UNSOUND: those two stamps are unsynchronized time.monotonic() reads
+        taken in different tasks (the send task writes one, the receive task
+        the other), so a final the engine emitted BEFORE it saw Done could be
+        received and stamped after the send returned. The verdict then turned
+        on task interleaving, making both a false success and a false fatal
+        reachable on ordinary engine behaviour.
+
+        What carries the weight instead is `concluded`, which the caller passes
+        to _outcome and which means the exchange ended the way the protocol
+        says - the server closed after Done, or the engine answered and went
+        quiet. A wedged engine cannot produce that: it never closes and never
+        answers, so the drain times out, concluded is False, and the exemption
+        is unavailable. That is what stops one stray empty frame certifying a
+        session, and it does not require ordering two clocks.
+
+        Remaining ambiguity, unresolved on purpose: a frame whose "text" is
+        malformed rather than absent (renamed field, null, numeric) reads as
         empty, because _process_result cannot tell "the engine said nothing"
-        from "we could not read what it said". Requiring a post-Done final
-        bounds the damage to one session's verdict instead of certifying a
-        whole attempt off one stray frame, but a systematic protocol drift
-        would still read as uniformly empty results. Detecting that belongs in
-        frame validation, not here.
+        from "we could not read what it said". Detecting protocol drift
+        belongs in frame validation, not here.
         """
-        if not self._done_sent or self._last_final_at is None:
-            return False
-        return (
-            self._last_final_at >= self._done_sent_at
-            if self._done_sent_at is not None
-            else False
-        ) and not self._speaking
+        return self._last_final_at is not None and not self._speaking
 
     def _outcome(self, *, concluded: bool, detail: str) -> _SessionOutcome:
         """
@@ -972,6 +1020,7 @@ class VoxistSTTStream(RecognizeStream):
                 unrecoverable_audio=True,
                 concluded=concluded,
                 detail=detail,
+                audio_was_dropped=self._dropped_frames > 0,
                 engine_reported_empty=self._engine_reported_empty_this_attempt,
             )
         return _SessionOutcome(
@@ -987,6 +1036,7 @@ class VoxistSTTStream(RecognizeStream):
             # vouch for audio it never received. Claiming otherwise would let
             # an empty final for three frames of captured silence certify the
             # turn a dead attempt swallowed as "legitimately empty".
+            audio_was_dropped=self._dropped_frames > 0,
             engine_reported_empty=False,
         )
 
@@ -1078,7 +1128,11 @@ class VoxistSTTStream(RecognizeStream):
                     "read only FINAL_TRANSCRIPT events will see this "
                     "session's tail as lost"
                 )
-            elif outcome.concluded and outcome.engine_reported_empty:
+            elif (
+                outcome.concluded
+                and outcome.engine_reported_empty
+                and not outcome.audio_was_dropped
+            ):
                 # The engine answered for this audio and its answer was
                 # "nothing". An empty result is a legitimate result: it is
                 # what a participant who never said anything recognizable
@@ -1086,6 +1140,11 @@ class VoxistSTTStream(RecognizeStream):
                 # error. INFO rather than debug because a caller staring at a
                 # session with no transcript deserves to find out from the
                 # logs that the engine, not the plugin, decided it was empty.
+                #
+                # Gated on audio_was_dropped because the engine can only
+                # report on audio it RECEIVED: with frames discarded to bound
+                # the backlog, its "nothing" is not a verdict on the session
+                # and this path would excuse the plugin's own loss.
                 logger.info(
                     f"Stream {self._session_id} produced no transcript: "
                     f"{outcome.detail} - the engine processed the audio and "
@@ -1217,7 +1276,7 @@ class VoxistSTTStream(RecognizeStream):
                 if self._carries_signal(data.data):
                     self._audio_consumed = True
                     self._real_audio_this_attempt = True
-                if self._uplink_is_falling_behind():
+                if self._backlog_exceeds_the_bound(_frame_seconds(data)):
                     self._note_dropped_frame()
                     continue
 
@@ -1257,10 +1316,6 @@ class VoxistSTTStream(RecognizeStream):
                 self._ws.send_str("Done"), "Done signal"
             )
             self._done_sent = True
-            # When, not just whether: a final is the engine's verdict on the
-            # session only if it arrived AFTER we asked. See
-            # _engine_reported_empty_this_attempt.
-            self._done_sent_at = time.monotonic()
             logger.debug(f"Stream {self._session_id} sent Done signal")
         elif not self._done_sent:
             # No socket to finalize on - the session cannot complete cleanly.
@@ -1395,59 +1450,33 @@ class VoxistSTTStream(RecognizeStream):
             yield frame_bytes[start:end]
             start = end
 
-    def _uplink_is_falling_behind(self) -> bool:
+    def _backlog_exceeds_the_bound(self, frame_seconds: float) -> bool:
         """
-        True when the backlog is over the cap and MORE audio is still coming.
+        True when the unsent backlog is past MAX_INPUT_BACKLOG_SECONDS.
 
-        The cap stops a slow uplink growing the backlog until the process is
-        OOM-killed, and it must be a HARD bound - the previous two versions
-        each failed at one end:
+        Stateless, O(1), and it infers nothing about the producer - see that
+        constant for why three attempts at inference all failed.
 
-        - Dropping on depth alone confused a bursty PRODUCER with a slow
-          CONSUMER. push_frame() is synchronous and never yields, so the
-          repo's own documented `for f in frames: s.push_frame(f)` put a whole
-          file in the channel before the send loop ran once; the loop saw 6000
-          queued frames, discarded down to 1000, and silently lost ~83% of the
-          session while every send completed instantly.
+        The backlog's duration is estimated as depth x the duration of the
+        frame in hand. Frames from one source are uniform in practice (a
+        capture pipeline does not vary its frame size mid-stream), so this is
+        exact in the normal case and an estimate only if a caller mixes sizes.
+        Summing the real queue would be O(depth) on the per-frame hot path and
+        would need to reach into livekit's private deque, which this plugin
+        already treats as unavailable by default.
 
-        - Trying to detect draining by comparing successive depths removed the
-          bound ENTIRELY, because the comparison cannot see what it assumed.
-          The loop pops before this runs and only yields when a chunk is
-          actually sent (~1 iteration in 8 at 16kHz/10ms), and livekit's
-          Chan.recv() never suspends while the queue is non-empty - so between
-          two observations no producer can run and the depth always falls by
-          one. The predicate read its own drop as "draining" and admitted the
-          next frame, locking into one-drop-one-send. Measured against a
-          producer 2x the uplink: peak depth 2495 -> 4951 -> 9928 as the
-          session lengthened, versus a pinned 1000 before the change.
-
-        The discriminator is neither depth nor direction but whether the
-        producer can still ADD anything: `_input_ch.closed`. A closed channel
-        holds a finite backlog that only shrinks, so draining it is bounded
-        and nothing is dropped - a file transcribes whole, which is the batch
-        case the depth version broke. An open channel over the cap has a live
-        producer outpacing the uplink, so the frame is dropped and the depth
-        is bounded at the cap - the OOM case the direction version broke.
-
-        No hidden state, and it cannot be fooled by call frequency: this reads
-        two facts about the channel and mutates nothing, so calling it twice
-        or zero times cannot corrupt a running total the way the high-water
-        version could.
-
-        The residual cost, stated: a closed channel holding a very long
-        backlog is held in memory until sent rather than trimmed. That memory
-        was already allocated by push_frame before this code ever saw it, and
-        the alternative is discarding audio the caller explicitly finished
-        handing us - so holding it is both the honest and the cheaper choice.
+        Args:
+            frame_seconds: Duration of the frame currently being handled.
+                Non-positive (an empty or malformed frame) disables the check
+                for that frame rather than guessing.
 
         Returns:
             True if this frame should be dropped to bound the backlog.
         """
-        if self._input_ch.qsize() <= self.MAX_INPUT_BACKLOG_FRAMES:
+        if frame_seconds <= 0:
             return False
-        # A closed channel cannot grow: end_input() has run, so the backlog
-        # is a finite tail to be transcribed, not evidence of overload.
-        return not self._input_ch.closed
+        backlog_seconds = self._input_ch.qsize() * frame_seconds
+        return backlog_seconds > self.MAX_INPUT_BACKLOG_SECONDS
 
     def _pending_input_only_sentinels(self) -> bool:
         """
@@ -1703,7 +1732,7 @@ class VoxistSTTStream(RecognizeStream):
 
         logger.warning(
             f"Stream {self._session_id} dropping audio to bound the input "
-            f"backlog (cap {self.MAX_INPUT_BACKLOG_FRAMES} frames, "
+            f"backlog (cap {self.MAX_INPUT_BACKLOG_SECONDS}s of audio, "
             f"{self._dropped_frames} dropped so far on this stream) - the "
             "uplink is not keeping up with real time, so the transcript will "
             "have gaps"

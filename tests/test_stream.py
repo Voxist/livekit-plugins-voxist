@@ -378,24 +378,26 @@ class TestInputBacklogBound:
 
     @pytest.mark.asyncio
     async def test_cap_is_sane(self):
-        assert 100 <= VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES <= 6000
+        # Generous enough that a live conversation never reaches it (a stalled
+        # uplink raises via SEND_TIMEOUT_SECONDS first), small enough to be an
+        # actual OOM ceiling.
+        assert 30.0 <= VoxistSTTStream.MAX_INPUT_BACKLOG_SECONDS <= 600.0
 
     @pytest.mark.asyncio
     async def test_frames_over_the_cap_are_dropped(self, monkeypatch):
         stream = await make_stream()
         ws = attach_mock_ws(stream)
-        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 10)
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 0.1
+        )  # 10 frames of 10ms
 
         total = 40
         for _ in range(total):
             stream._input_ch.send_nowait(frame())
         stream._input_ch.close()
 
-        # Dropping requires the backlog to be over the cap AND not draining.
-        # A pre-filled channel drains monotonically, so force the
-        # not-draining condition that a genuinely overwhelmed uplink has -
-        # otherwise this test measures producer burstiness, which is exactly
-        # what _uplink_is_falling_behind now refuses to punish.
+        # A closed channel's real depth falls as the loop drains it; pin it so
+        # the bound is actually exceeded while the loop runs.
         stream._input_ch = _OverloadedChannel(stream._input_ch, 999)
 
         await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
@@ -410,7 +412,9 @@ class TestInputBacklogBound:
     async def test_no_drops_below_the_cap(self, monkeypatch):
         stream = await make_stream()
         attach_mock_ws(stream)
-        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 100)
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
+        )
 
         for _ in range(20):
             stream._input_ch.send_nowait(frame())
@@ -450,7 +454,9 @@ class TestInputBacklogBound:
         """A sentinel is honoured at its own position, never displaced."""
         stream = await make_stream()
         attach_mock_ws(stream)
-        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 1000)
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 10.0
+        )
 
         events = []
         stream._audio_processor = Mock()
@@ -478,7 +484,9 @@ class TestInputBacklogBound:
         """A backlog of sentinels must never wedge the loop (old regression)."""
         stream = await make_stream()
         attach_mock_ws(stream)
-        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 0.05
+        )
 
         for _ in range(20):
             stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
@@ -490,7 +498,9 @@ class TestInputBacklogBound:
     async def test_drop_warning_is_rate_limited(self, monkeypatch, caplog):
         stream = await make_stream()
         attach_mock_ws(stream)
-        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 0.05
+        )
         monkeypatch.setattr(VoxistSTTStream, "DROP_LOG_INTERVAL_SECONDS", 3600.0)
 
         # Patch the *name* `time` inside the plugin's own module namespace -
@@ -532,11 +542,7 @@ class TestInputBacklogBound:
             stream._input_ch.send_nowait(frame())
         stream._input_ch.close()
 
-        # A drop now needs the backlog over the cap AND not draining, and a
-        # pre-filled channel drains monotonically. Hold the reported depth
-        # steady so this test still exercises the drop path instead of
-        # quietly becoming a no-drop test - see _uplink_is_falling_behind,
-        # which deliberately no longer punishes a bursty producer.
+        # Pin the depth so the bound stays exceeded while the loop runs.
         stream._input_ch = _OverloadedChannel(stream._input_ch, 999)
 
         loop = asyncio.get_running_loop()
@@ -1344,7 +1350,9 @@ class TestConsumedAudioPredicate:
         A frame discarded to bound the backlog has still irrevocably left
         the channel: no retry can replay it, so it is consumed.
         """
-        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 0)
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 0.001
+        )
         stream = await make_stream()
         attach_mock_ws(stream)
         mock_event_ch(stream)
@@ -1353,10 +1361,7 @@ class TestConsumedAudioPredicate:
             stream._input_ch.send_nowait(speech_frame())
         stream.end_input()
 
-        # Dropping now also requires the backlog to be failing to drain; hold
-        # the reported depth steady so this test still exercises a drop rather
-        # than silently becoming a no-drop test (see
-        # _uplink_is_falling_behind).
+        # Pin the depth so the bound is exceeded while the loop runs.
         stream._input_ch = _OverloadedChannel(stream._input_ch, 5)
 
         await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
@@ -2597,14 +2602,17 @@ class TestStallDetectorFalsePositives:
 
 class _OverloadedChannel:
     """
-    A real channel that reports a pinned depth and an OPEN producer.
+    A real channel that reports a pinned depth.
 
-    Drops now require the backlog to be over the cap AND the channel still
-    open (see _uplink_is_falling_behind), but a test must close the channel to
-    make the send loop terminate. This delegates iteration to the real channel
-    - so the loop still ends - while reporting the overload conditions, which
-    keeps these tests exercising the drop path instead of quietly becoming
-    no-drop tests.
+    A test must close the channel for the send loop to terminate, but closing
+    it also empties it, so `qsize()` would fall below any interesting bound
+    before the loop ran. Pinning the depth keeps these tests on the drop path.
+
+    It pins ONLY the depth. An earlier version also forced `closed` to False,
+    which silently inverted the send loop's end-of-session sentinel branch -
+    the double was steering a code path production never takes. The drop
+    predicate no longer consults `closed` at all, so there is nothing to
+    override.
     """
 
     def __init__(self, real, depth):
@@ -2613,10 +2621,6 @@ class _OverloadedChannel:
 
     def qsize(self):
         return self._depth
-
-    @property
-    def closed(self):
-        return False
 
     def __aiter__(self):
         return self._real.__aiter__()
@@ -2627,85 +2631,134 @@ class _OverloadedChannel:
 
 class TestBacklogBoundIsHard:
     """
-    The cap must bound a slow CONSUMER without punishing a bursty PRODUCER.
+    A generous absolute ceiling, and nothing else.
 
-    Two previous versions each failed at one end. Dropping on depth alone
-    discarded ~83% of a batch caller's file. Trying to infer "draining" from
-    successive depths removed the bound entirely - the loop pops before the
-    check and rarely yields, so the depth always fell by one and the predicate
-    read its own drop as draining, letting the channel grow without limit.
-
-    The discriminator is whether the producer can still add anything, which
-    the channel already knows: `closed`.
+    Three previous versions tried to tell "a burst that will drain" from "a
+    producer outpacing the uplink" - by depth, then by direction, then by
+    `closed` - and each was correct for one case and wrong for the other,
+    because that intent is not observable from this side of the channel. This
+    version infers nothing, so the tests here pin the ABSENCE of inference as
+    much as the bound itself.
     """
 
     @staticmethod
-    def _chan(depth, *, closed):
-        return SimpleNamespace(qsize=lambda: depth, closed=closed)
+    def _chan(depth):
+        return SimpleNamespace(qsize=lambda: depth, closed=False)
+
+    @staticmethod
+    def _frames_for(seconds, frame_seconds=0.01):
+        return int(seconds / frame_seconds)
 
     @pytest.mark.asyncio
-    async def test_closed_channel_never_drops_however_deep(self):
-        """The batch case: end_input() has run, so this is a finite tail."""
+    async def test_over_the_bound_drops(self, monkeypatch):
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
+        )
         stream = await make_stream()
-        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
-        for depth in (cap + 1, cap * 6, cap * 100):
-            stream._input_ch = self._chan(depth, closed=True)
-            assert not stream._uplink_is_falling_behind(), (
-                f"depth {depth} on a closed channel is a file to transcribe, "
-                "not evidence of overload"
-            )
+        stream._input_ch = self._chan(101)  # 1.01s of 10ms frames
+        assert stream._backlog_exceeds_the_bound(0.01)
 
     @pytest.mark.asyncio
-    async def test_open_channel_over_cap_drops_every_time(self):
-        """The overload case: a live producer is outpacing the uplink."""
+    async def test_at_or_under_the_bound_never_drops(self, monkeypatch):
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
+        )
         stream = await make_stream()
-        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
-        # Every call must drop, including repeats at a FALLING depth - the
-        # bug was reading a falling depth as recovery.
-        for depth in (cap + 1, cap + 500, cap + 499, cap + 498, cap + 1):
-            stream._input_ch = self._chan(depth, closed=False)
-            assert stream._uplink_is_falling_behind(), (
-                f"depth {depth} over the cap on an open channel must drop"
-            )
+        for depth in (0, 1, 50, 100):  # <= 1.00s
+            stream._input_ch = self._chan(depth)
+            assert not stream._backlog_exceeds_the_bound(0.01)
 
     @pytest.mark.asyncio
-    async def test_at_or_under_the_cap_never_drops(self):
-        stream = await make_stream()
-        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
-        for closed in (True, False):
-            for depth in (0, 1, cap - 1, cap):
-                stream._input_ch = self._chan(depth, closed=closed)
-                assert not stream._uplink_is_falling_behind()
-
-    @pytest.mark.asyncio
-    async def test_the_predicate_holds_no_state(self):
+    async def test_the_channel_being_closed_makes_no_difference(
+        self, monkeypatch
+    ):
         """
-        Calling it twice, or never, cannot corrupt a running total.
+        THE regression. Keying the drop on `closed` discarded a batch caller's
+        file for any ASYNC producer - the channel is only closed in the same
+        task step for a synchronous push loop - and it also dropped the
+        backlog that accumulates while the dialer is parked in the rate
+        limiter, which the same commit had just argued was legitimate.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
+        )
+        stream = await make_stream()
+        for closed in (True, False):
+            for depth, expected in ((50, False), (500, True)):
+                stream._input_ch = SimpleNamespace(
+                    qsize=lambda d=depth: d, closed=closed
+                )
+                assert stream._backlog_exceeds_the_bound(0.01) is expected, (
+                    "the verdict must depend on the bound alone, never on "
+                    f"channel state (closed={closed}, depth={depth})"
+                )
 
+    @pytest.mark.asyncio
+    async def test_an_unmeasurable_frame_disables_the_check(self):
+        """Guessing a duration would drop audio on a malformed frame."""
+        stream = await make_stream()
+        stream._input_ch = self._chan(10**6)
+        for bad in (0.0, -1.0):
+            assert not stream._backlog_exceeds_the_bound(bad)
+
+    @pytest.mark.asyncio
+    async def test_the_predicate_holds_no_state(self, monkeypatch):
+        """
         The direction version kept a high-water mark and was correct only if
         called exactly once per frame - a coupling nothing enforced.
         """
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
+        )
         stream = await make_stream()
-        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
-        stream._input_ch = self._chan(cap + 10, closed=False)
-        assert [stream._uplink_is_falling_behind() for _ in range(5)] == [
+        stream._input_ch = self._chan(500)
+        assert [stream._backlog_exceeds_the_bound(0.01) for _ in range(5)] == [
             True
         ] * 5
+
+    @pytest.mark.asyncio
+    async def test_an_async_batch_burst_is_kept_whole(self):
+        """
+        A file-sized backlog on a still-OPEN channel must not be dropped.
+
+        This is the state the `closed` version got wrong: it only spared a
+        backlog once end_input had run, so an async producer - a file read in
+        chunks, or any burst the send loop starts draining before the caller
+        finishes - had its audio discarded down to the cap even though the
+        backlog was finite and draining.
+
+        Asserted against the REAL channel in exactly that state (deep, open)
+        rather than through a timed session: the timing version raced the drain
+        and proved nothing on either side of the fix.
+        """
+        stream = await make_stream()
+
+        for _ in range(1500):  # 15s of 10ms frames
+            stream._input_ch.send_nowait(speech_frame(160))
+
+        assert stream._input_ch.qsize() > 1000, "past the old frame cap"
+        assert not stream._input_ch.closed, "the async-producer state"
+
+        assert not stream._backlog_exceeds_the_bound(0.01), (
+            "15s of queued audio is far under the 120s ceiling; an open "
+            "channel is not evidence of overload"
+        )
 
     @pytest.mark.asyncio
     async def test_depth_stays_bounded_against_a_producer_beating_the_uplink(
         self, monkeypatch
     ):
         """
-        End-to-end, with a real slow socket - the test that was missing.
+        End-to-end with a real slow socket - the property the bound exists for.
 
-        The unit tests above check the predicate; only this one checks the
-        PROPERTY the cap exists for. The predicate version passed its own unit
-        tests while the real send loop let the channel grow to 9928 frames,
-        because the unit tests fed it a scripted depth sequence that a live
-        loop never produces.
+        The direction version passed its own unit tests while the real send
+        loop let the channel grow to 9928 frames, because those tests fed it a
+        scripted depth sequence a live loop never produces.
         """
-        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 50)
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 0.5
+        )  # 50 frames of 10ms
+        cap_frames = 50
 
         class SlowWS(FakeWS):
             async def send_bytes(self, data):
@@ -2740,22 +2793,23 @@ class TestBacklogBoundIsHard:
 
         prod = asyncio.create_task(producer())
         fin = asyncio.create_task(finisher())
+        # The bound is the premise, not whether this scripted session also
+        # ends cleanly - so a cascade from the socket closing mid-drain must
+        # not mask the assertions. Narrowed to the plugin's own errors, NOT
+        # bare Exception: suppressing everything also swallowed the wait_for
+        # TimeoutError, so a DEADLOCKED send loop passed this test.
         try:
-            # The backlog bound is the premise; whether this particular
-            # scripted session also ends cleanly is not. Swallow the outcome so
-            # the assertions below are what fails, rather than a cascade from
-            # the socket closing while an unbounded backlog was still draining.
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(APIConnectionError, TranscriptLostError):
                 await asyncio.wait_for(stream._run(), timeout=20.0)
         finally:
             stop.set()
             for t in (prod, fin):
                 t.cancel()
 
-        assert peak <= VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES * 3, (
-            f"backlog reached {peak} frames against a cap of "
-            f"{VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES}: the bound is not "
-            "holding, so a long call would grow the channel until OOM"
+        assert peak <= cap_frames * 3, (
+            f"backlog reached {peak} frames against a bound of ~{cap_frames}: "
+            "the ceiling is not holding, so a long call would grow the "
+            "channel until OOM"
         )
         assert stream.dropped_frames > 0, (
             "an overwhelmed uplink must actually drop, or the test proves "
@@ -2967,59 +3021,109 @@ class TestRoundNineRegressions:
         )
 
     @pytest.mark.asyncio
-    async def test_a_mid_session_empty_final_is_not_a_verdict_on_the_session(
-        self,
-    ):
+    async def test_an_empty_final_then_a_wedge_is_never_a_clean_session(self):
         """
-        One empty final certified an entire attempt as "engine found nothing".
+        The engine endpoints silence, so the opening second of every call
+        produces {"type":"final","text":""}. One such frame must not certify a
+        session in which the engine then died and swallowed real speech.
 
-        The engine endpoints silence (rule1, 0.9s), so the opening second of
-        every call produces exactly such a frame. Crediting it meant an engine
-        that emitted one empty final and then wedged reported SUCCESS over
-        minutes of lost speech.
+        What refuses it is `concluded`: a wedged engine neither closes nor
+        answers, so the drain times out, and the gate's empty-result exemption
+        requires a concluded exchange. Deliberately NOT a comparison against
+        when Done was written - that was too strict (an engine that finalized
+        before end_input and then had nothing more to say made a quiet
+        participant fatal) and unsound (the two stamps are unsynchronized
+        monotonic reads in different tasks).
         """
-        ws = FakeWS()
+        ws = FakeWS()  # wedges: never answers again, never closes
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
-        stream._ws = ws
 
-        # Opening silence, finalized as empty - before Done.
-        await stream._process_result({"type": "final", "text": ""})
-        assert not stream._engine_reported_empty_this_attempt, (
-            "a mid-session empty final is a verdict on ONE segment, never on "
-            "the session"
+        async def scenario():
+            # Opening silence, finalized as empty.
+            ws.feed_json({"type": "final", "text": ""})
+            await asyncio.sleep(0.05)
+            # Then real speech the engine never transcribes.
+            for _ in range(20):
+                stream._input_ch.send_nowait(speech_frame())
+                await asyncio.sleep(0.005)
+            stream._input_ch.close()
+
+        task = asyncio.create_task(scenario())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=15.0)
+        finally:
+            task.cancel()
+
+        assert not stream._session_complete, (
+            "an empty final from before the wedge must not certify the speech "
+            "that followed it"
         )
 
     @pytest.mark.asyncio
-    async def test_an_empty_partial_is_never_a_verdict(self):
-        """A partial is not a finalization, even after Done."""
+    async def test_an_empty_final_before_done_still_earns_the_exemption(self):
+        """
+        The other side: requiring a POST-Done final made a quiet participant
+        fatal whenever the engine finalized the trailing silence before
+        end_input and then had nothing further to send.
+        """
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
-        stream._ws = ws
 
-        stream._done_sent = True
-        stream._done_sent_at = time.monotonic()
-        await stream._process_result({"type": "partial", "text": ""})
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            # Engine finalizes the segment as empty BEFORE Done is written.
+            ws.feed_json({"type": "final", "text": ""})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.05)
+            ws.end()  # gateway closes after Done: the exchange concluded
 
-        assert not stream._engine_reported_empty_this_attempt, (
-            "an engine that opened a segment and died has rendered no verdict"
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task
+
+        assert stream._session_complete, (
+            "a concluded exchange whose engine reported nothing is an empty "
+            "session, not a fatal one"
         )
 
     @pytest.mark.asyncio
-    async def test_a_post_done_empty_final_IS_a_verdict(self):
-        """The other half: the legitimate empty result must still be one."""
+    async def test_dropped_audio_denies_the_empty_exemption(self, monkeypatch):
+        """
+        The engine can only report on audio it RECEIVED. With frames discarded
+        to bound the backlog, its "nothing" is not a verdict on the session -
+        and without this the plugin's own loss was logged as "an empty session,
+        not a lost one".
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 0.001
+        )
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
-        stream._ws = ws
 
-        stream._done_sent = True
-        stream._done_sent_at = time.monotonic()
-        await asyncio.sleep(0.01)
-        await stream._process_result({"type": "final", "text": ""})
+        async def scenario():
+            for _ in range(40):
+                stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": ""})
+            await asyncio.sleep(0.05)
+            ws.end()
 
-        assert stream._engine_reported_empty_this_attempt
+        task = asyncio.create_task(scenario())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+
+        assert stream.dropped_frames > 0, "the premise needs a real drop"
 
     @pytest.mark.asyncio
     async def test_the_wall_clock_floor_does_not_count_dial_latency(self):

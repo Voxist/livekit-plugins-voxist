@@ -1671,10 +1671,10 @@ class TestServerStallDetection:
             * VoxistSTTStream.WIRE_SAMPLE_RATE
             * 2  # Int16
         )
-        stream._bytes_sent_since_message = expected
+        stream._bytes_sent_since_progress = expected
         stream._check_server_liveness()  # exactly at the bound: not a stall
 
-        stream._bytes_sent_since_message = expected + 1
+        stream._bytes_sent_since_progress = expected + 1
         with pytest.raises(APIConnectionError, match="no response"):
             stream._check_server_liveness()
 
@@ -1761,7 +1761,7 @@ class TestServerStallDetection:
         assert not run_task.done(), (
             "a silent user must not be able to trip the liveness bound"
         )
-        assert stream._bytes_sent_since_message == 0
+        assert stream._bytes_sent_since_progress == 0
 
         run_task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -1789,7 +1789,7 @@ class TestServerStallDetection:
         await asyncio.sleep(0.2)  # mid-session boundary: silence is injected
 
         assert ws.send_bytes.await_count > 0, "the silence must reach the wire"
-        assert stream._bytes_sent_since_message == 0, (
+        assert stream._bytes_sent_since_progress == 0, (
             "injected endpointing silence must not move the liveness bound"
         )
         assert not task.done(), "and it must certainly not trip it"
@@ -1805,26 +1805,138 @@ class TestServerStallDetection:
 
         chunk = np.zeros(1600, dtype=np.int16)  # 3200B
         await stream._send_audio_chunk(chunk)
-        assert stream._bytes_sent_since_message == 3200
+        assert stream._bytes_sent_since_progress == 3200
         await stream._send_audio_chunk(chunk)
-        assert stream._bytes_sent_since_message == 6400
+        assert stream._bytes_sent_since_progress == 6400
 
     @pytest.mark.asyncio
-    async def test_any_server_message_resets_the_byte_budget(self):
+    async def test_transcript_frame_resets_the_byte_budget(self):
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
         stream._ws = ws
-        stream._bytes_sent_since_message = 900_000  # nearly at the bound
+        stream._bytes_sent_since_progress = 900_000  # nearly at the bound
 
         ws.feed_json({"type": "partial", "text": "bonjour"})
         ws.end()
         await asyncio.wait_for(stream._recv_results_task(), timeout=5.0)
 
-        assert stream._bytes_sent_since_message == 0, (
-            "a received message proves liveness and must reset the budget"
+        assert stream._bytes_sent_since_progress == 0, (
+            "a transcript proves the engine is working and must reset the "
+            "budget"
         )
-        assert stream._last_message_at is not None
+        assert stream._last_progress_at is not None
+
+    @pytest.mark.parametrize(
+        "frame_obj,resets",
+        [
+            # Engine transcripts: the only proof the ASR is consuming audio.
+            ({"type": "partial", "text": "bonjour"}, True),
+            ({"type": "final", "text": "bonjour"}, True),
+            # A segment the engine finalized as silence is still engine work.
+            ({"type": "final", "text": ""}, True),
+            # The gateway's own pub/sub control frame - says nothing about
+            # the engine.
+            ({"type": "redirect", "url": "wss://elsewhere"}, False),
+            ({"type": "some-future-frame"}, False),
+            ({"text": "no type at all"}, False),
+            ("a bare JSON string", False),
+            (None, False),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_only_transcript_frames_count_as_progress(
+        self, frame_obj, resets
+    ):
+        """
+        The stall budget must be cleared by transcripts, not by traffic.
+
+        Resetting on any frame (the shipped behaviour this replaced) let a
+        gateway that emits control frames on a timer hold the budget at zero
+        forever, disarming the detector precisely in the case it exists for:
+        WS layer healthy, engine wedged.
+        """
+        stream = await make_stream()
+        mock_event_ch(stream)
+        stream._bytes_sent_since_progress = 900_000
+
+        await stream._process_result(frame_obj)
+
+        if resets:
+            assert stream._bytes_sent_since_progress == 0
+            assert stream._last_progress_at is not None
+        else:
+            assert stream._bytes_sent_since_progress == 900_000, (
+                f"{frame_obj!r} is not evidence the engine is transcribing "
+                "and must not buy the server another stall window"
+            )
+            assert stream._last_progress_at is None
+
+    @pytest.mark.asyncio
+    async def test_unparseable_frame_does_not_count_as_progress(self):
+        """Garbage on the wire is not liveness either."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+        stream._bytes_sent_since_progress = 900_000
+
+        ws.incoming.put_nowait(
+            SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="{not json")
+        )
+        ws.end()
+        await asyncio.wait_for(stream._recv_results_task(), timeout=5.0)
+
+        assert stream._bytes_sent_since_progress == 900_000
+        assert stream._last_progress_at is None
+
+    @pytest.mark.asyncio
+    async def test_chatty_gateway_does_not_disarm_the_stall_detector(
+        self, monkeypatch
+    ):
+        """
+        End-to-end: a server that talks but never transcribes still trips.
+
+        This is the regression that matters. The detector was armed by
+        transcripts but disarmed by ANY frame, so a gateway emitting redirect
+        frames faster than the byte bound accumulates - a plausible pub/sub
+        keepalive pattern - meant a wedged engine went undetected for the
+        whole session, delivering silent zero-transcripts to the caller.
+        """
+        # raising=False so reverting the fix fails on BEHAVIOUR, not setattr
+        monkeypatch.setattr(
+            VoxistSTTStream, "STALL_DETECTION_SECONDS", 0.2, raising=False
+        )
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        stopped = asyncio.Event()
+
+        async def pump():
+            """Real audio keeps flowing, as from a live microphone."""
+            for _ in range(200):
+                if stopped.is_set():
+                    return
+                stream._input_ch.send_nowait(speech_frame(320))  # 20ms
+                await asyncio.sleep(0.02)
+
+        async def chatter():
+            """The gateway is talkative but the engine never transcribes."""
+            while not stopped.is_set():
+                ws.feed_json({"type": "redirect", "url": "wss://elsewhere"})
+                await asyncio.sleep(0.05)
+
+        pump_task = asyncio.create_task(pump())
+        chatter_task = asyncio.create_task(chatter())
+        try:
+            with pytest.raises(APIConnectionError, match="no response"):
+                await asyncio.wait_for(stream._run(), timeout=5.0)
+        finally:
+            stopped.set()
+            await pump_task
+            chatter_task.cancel()
+        assert not stream._session_complete
 
     @pytest.mark.asyncio
     async def test_no_per_frame_int32_copy_on_the_hot_path(self):

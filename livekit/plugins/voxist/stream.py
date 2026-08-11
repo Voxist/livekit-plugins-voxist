@@ -169,12 +169,13 @@ class VoxistSTTStream(RecognizeStream):
     # WS layer keeps answering pings even when the engine behind it has
     # wedged, so a mute-but-connected server used to mean silent
     # zero-transcripts until end_input. The detector therefore counts the
-    # bytes actually written to the socket since the last message arrived
-    # from the server: once that exceeds this many seconds' worth of audio
-    # at the wire rate, the server has been handed ~30s of audio and has
-    # said nothing, and the attempt fails as APIConnectionError so the
-    # framework redials. See _check_server_liveness for why this replaced a
-    # wall clock armed by a peak-amplitude gate.
+    # bytes actually written to the socket since the engine last returned a
+    # TRANSCRIPT (not since any frame arrived - see _note_engine_progress):
+    # once that exceeds this many seconds' worth of audio at the wire rate,
+    # the server has been handed ~30s of audio and has transcribed none of
+    # it, and the attempt fails as APIConnectionError so the framework
+    # redials. See _check_server_liveness for why this replaced a wall clock
+    # armed by a peak-amplitude gate.
     STALL_DETECTION_SECONDS = 30.0
 
     # Bound on ws.close() during teardown. aiohttp waits up to its ws_close
@@ -258,13 +259,15 @@ class VoxistSTTStream(RecognizeStream):
         #                            or on the session's (see _outcome):
         #                            an attempt that shipped only silence
         #                            owes nothing and can lose nothing.
-        #   _bytes_sent_since_message  caller-audio bytes written to THIS
-        #                            socket since the last message arrived
-        #                            from the server (stall detection, see
-        #                            STALL_DETECTION_SECONDS)
-        #   _last_message_at         monotonic time of the last message from
-        #                            the server on THIS socket, for the
-        #                            stall report; None until one arrives
+        #   _bytes_sent_since_progress caller-audio bytes written to THIS
+        #                            socket since the ASR engine last
+        #                            returned a transcript frame (stall
+        #                            detection, see STALL_DETECTION_SECONDS).
+        #                            "Progress" is deliberately narrower than
+        #                            "any frame": see _note_engine_progress.
+        #   _last_progress_at        monotonic time of the last transcript
+        #                            frame on THIS socket, for the stall
+        #                            report; None until one arrives
         # ------------------------------------------------------------------
         self._done_sent = False
         self._session_complete = False
@@ -273,8 +276,8 @@ class VoxistSTTStream(RecognizeStream):
         self._final_received_this_attempt = False
         self._interim_received_this_attempt = False
         self._real_audio_this_attempt = False
-        self._bytes_sent_since_message = 0
-        self._last_message_at: float | None = None
+        self._bytes_sent_since_progress = 0
+        self._last_progress_at: float | None = None
 
         # Latch so an unreachable transport is reported once, not per chunk
         self._transport_lookup_failed = False
@@ -346,8 +349,8 @@ class VoxistSTTStream(RecognizeStream):
         self._final_received_this_attempt = False
         self._interim_received_this_attempt = False
         self._real_audio_this_attempt = False
-        self._bytes_sent_since_message = 0
-        self._last_message_at = None
+        self._bytes_sent_since_progress = 0
+        self._last_progress_at = None
 
         try:
             await self._run_attempt()
@@ -898,6 +901,33 @@ class VoxistSTTStream(RecognizeStream):
             return True
         return all(isinstance(item, self._FlushSentinel) for item in tuple(queue))
 
+    def _note_engine_progress(self) -> None:
+        """
+        Record that the ASR engine produced a transcript; clears the budget
+        _check_server_liveness measures.
+
+        Called ONLY for "partial"/"final" frames, and that narrowness is the
+        whole point. The detector exists to catch a server whose WS layer is
+        healthy while the engine behind it has wedged, so it must credit only
+        evidence the ENGINE is consuming audio. An earlier version reset the
+        budget at the top of the receive loop, before any classification, so
+        every frame counted - including the gateway's own pub/sub control
+        frames ({"type": "redirect", ...}), unknown types, non-object JSON,
+        and frames that failed to parse at all. A gateway emitting any of
+        those on a timer would hold the budget at zero forever and the
+        detector could never fire, which is exactly the failure it was added
+        to catch.
+
+        A transcript with empty text still counts: a segment the engine
+        finalized as silence is proof it processed the audio.
+
+        Frames NOT credited are still handled normally by the caller - they
+        are logged, and {"type": "error"} still raises. They simply do not buy
+        the server another STALL_DETECTION_SECONDS of muteness.
+        """
+        self._bytes_sent_since_progress = 0
+        self._last_progress_at = time.monotonic()
+
     def _check_server_liveness(self) -> None:
         """
         Detect a mute-but-connected server; called per caller frame sent.
@@ -905,11 +935,12 @@ class VoxistSTTStream(RecognizeStream):
         aiohttp's heartbeat only catches transport death - the gateway's WS
         layer answers pings even when the engine behind it is wedged. The
         question that matters is therefore "how much of the caller's audio
-        has the server swallowed without saying anything", and that is what
-        is measured: caller-audio BYTES written to this socket since the last
-        message arrived (_bytes_sent_since_message, reset by the receive loop
-        on every message), against the byte-equivalent of
-        STALL_DETECTION_SECONDS of audio at the 16kHz wire rate.
+        has the server swallowed without transcribing any of it", and that is
+        what is measured: caller-audio BYTES written to this socket since the
+        engine last returned a transcript (_bytes_sent_since_progress, reset
+        by _note_engine_progress), against the byte-equivalent of
+        STALL_DETECTION_SECONDS of audio at the 16kHz wire rate. Non-transcript
+        frames do not clear it - a chatty gateway is not a working engine.
 
         Counting delivered audio rather than wall time is what makes this
         self-normalising, and each property fixes a defect the previous
@@ -958,20 +989,20 @@ class VoxistSTTStream(RecognizeStream):
         budget = int(
             self.STALL_DETECTION_SECONDS * self.WIRE_SAMPLE_RATE * 2  # Int16
         )
-        if self._bytes_sent_since_message <= budget:
+        if self._bytes_sent_since_progress <= budget:
             return
 
         mute_for = (
-            f"{time.monotonic() - self._last_message_at:.1f}s"
-            if self._last_message_at is not None
+            f"{time.monotonic() - self._last_progress_at:.1f}s"
+            if self._last_progress_at is not None
             else "the whole attempt"
         )
         logger.warning(
             f"Stream {self._session_id} has sent "
-            f"{self._bytes_sent_since_message}B of audio "
-            f"(>{self.STALL_DETECTION_SECONDS}s worth) without receiving a "
-            f"single message for {mute_for} - the server is connected but "
-            "not responding; abandoning the attempt"
+            f"{self._bytes_sent_since_progress}B of audio "
+            f"(>{self.STALL_DETECTION_SECONDS}s worth) without a single "
+            f"transcript for {mute_for} - the server is connected but the "
+            "engine is not transcribing; abandoning the attempt"
         )
         raise APIConnectionError(
             "no response from server while streaming audio"
@@ -1187,7 +1218,7 @@ class VoxistSTTStream(RecognizeStream):
         if caller_audio:
             # Counted only once the send has actually completed: the bound
             # is about audio the server has received, not audio we queued.
-            self._bytes_sent_since_message += len(audio_bytes)
+            self._bytes_sent_since_progress += len(audio_bytes)
 
     async def _recv_results_task(self) -> None:
         """
@@ -1200,10 +1231,9 @@ class VoxistSTTStream(RecognizeStream):
         """
         assert self._ws is not None
         async for msg in self._ws:
-            # Any message proves the server is alive: reset the audio budget
-            # the send loop measures (see _check_server_liveness).
-            self._bytes_sent_since_message = 0
-            self._last_message_at = time.monotonic()
+            # NOTE: the stall budget is deliberately NOT reset here. Arriving
+            # frames are classified first, and only an engine transcript
+            # counts as progress - see _note_engine_progress.
             if msg.type == aiohttp.WSMsgType.TEXT:
                 try:
                     data = json.loads(msg.data)
@@ -1264,6 +1294,11 @@ class VoxistSTTStream(RecognizeStream):
             return
 
         msg_type = data.get("type")
+
+        # Liveness accounting happens here, after classification, because only
+        # a transcript frame proves the thing the detector is watching for.
+        if msg_type in ("partial", "final"):
+            self._note_engine_progress()
 
         # Detect start of speech. "text" is server-supplied: anything that
         # is not a string (absent, null, a number) counts as no text.

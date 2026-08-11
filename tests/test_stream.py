@@ -2707,3 +2707,53 @@ class TestOversizedFrameIsSlicedNotRejected:
             "the whole oversized frame must reach the wire"
         )
         assert stream.dropped_frames == 0
+
+
+class TestDrainWaitsForAFinalNotAnyTranscript:
+    """
+    Kroko never closes after Done, so the drain ends the turn on the engine
+    going quiet after answering. The terminator must therefore be a FINAL: a
+    post-Done partial proves the engine is alive but not that it has finished,
+    and ending the turn on one truncates the final still in flight.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_post_done_partial_does_not_end_the_turn(self, monkeypatch):
+        monkeypatch.setattr(
+            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 0.05, raising=False
+        )
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 1.0, raising=False
+        )
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # end_input -> Done
+            await asyncio.sleep(0.1)
+            # The engine is alive and still working: partials only.
+            for _ in range(6):
+                ws.feed_json({"type": "partial", "text": "bonj"})
+                await asyncio.sleep(0.05)
+            # Only now does it finalize.
+            ws.feed_json({"type": "final", "text": "bonjour"})
+
+        task = asyncio.create_task(scenario())
+        try:
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        finally:
+            task.cancel()
+
+        finals = [
+            c.args[0]
+            for c in stream._event_ch.send_nowait.call_args_list
+            if c.args[0].type == SpeechEventType.FINAL_TRANSCRIPT
+        ]
+        assert finals, (
+            "the drain ended the turn on a partial and truncated the final "
+            "that was still coming"
+        )
+        assert finals[-1].alternatives[0].text == "bonjour"

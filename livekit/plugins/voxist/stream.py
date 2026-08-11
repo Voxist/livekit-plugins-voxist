@@ -380,6 +380,10 @@ class VoxistSTTStream(RecognizeStream):
         self._real_audio_this_attempt = False
         self._bytes_sent_since_progress = 0
         self._last_progress_at: float | None = None
+        # Restricted to finals; the post-Done drain's terminator. Separate
+        # from _last_progress_at because liveness counts any transcript but
+        # finalization only counts a final.
+        self._last_final_at: float | None = None
         # Fallback origin for the stall detector's wall-clock floor while no
         # transcript has arrived yet. Reset per attempt, like the pair above.
         self._attempt_started_at = time.monotonic()
@@ -468,6 +472,7 @@ class VoxistSTTStream(RecognizeStream):
         self._real_audio_this_attempt = False
         self._bytes_sent_since_progress = 0
         self._last_progress_at = None
+        self._last_final_at = None
         self._attempt_started_at = time.monotonic()
 
         try:
@@ -763,7 +768,10 @@ class VoxistSTTStream(RecognizeStream):
         "the ASR engine returned a transcript frame at time T, on this
         socket".
         """
-        transcript_before_done = self._last_progress_at
+        # A FINAL, not any transcript: a post-Done partial proves the engine
+        # is alive but not that it has finished, and returning on one would
+        # truncate the final still in flight.
+        transcript_before_done = self._last_final_at
         deadline = time.monotonic() + self.SESSION_DRAIN_TIMEOUT_SECONDS
 
         while True:
@@ -771,7 +779,7 @@ class VoxistSTTStream(RecognizeStream):
             # Read once per pass: the receive task can update it between the
             # two tests below, and None means "no transcript on this socket
             # yet" (the per-attempt reset in _run).
-            last_transcript_at = self._last_progress_at
+            last_transcript_at = self._last_final_at
             answered_after_done = (
                 last_transcript_at is not None
                 and last_transcript_at != transcript_before_done
@@ -1371,7 +1379,7 @@ class VoxistSTTStream(RecognizeStream):
         """
         return self._probe_pending_input_only_sentinels() is not False
 
-    def _note_engine_progress(self) -> None:
+    def _note_engine_progress(self, *, is_final: bool) -> None:
         """
         Record that the ASR engine produced a transcript; clears the budget
         _check_server_liveness measures.
@@ -1398,9 +1406,19 @@ class VoxistSTTStream(RecognizeStream):
         Setting _last_progress_at also permanently disarms the detector for
         this socket; see _check_server_liveness for why proving itself once is
         enough, and what that deliberately gives up.
+
+        Args:
+            is_final: Whether the frame was a "final" rather than a "partial".
+                Both prove the engine is alive, so both clear the budget, but
+                only a final is a FINALIZATION - which is what the post-Done
+                drain waits for. Ending a turn on a post-Done partial would
+                truncate the final that was still coming.
         """
+        now = time.monotonic()
         self._bytes_sent_since_progress = 0
-        self._last_progress_at = time.monotonic()
+        self._last_progress_at = now
+        if is_final:
+            self._last_final_at = now
 
     def _check_server_liveness(self) -> None:
         """
@@ -1821,7 +1839,7 @@ class VoxistSTTStream(RecognizeStream):
         # Liveness accounting happens here, after classification, because only
         # a transcript frame proves the thing the detector is watching for.
         if is_transcript:
-            self._note_engine_progress()
+            self._note_engine_progress(is_final=msg_type == "final")
 
         # Detect start of speech. "text" is server-supplied: anything that
         # is not a string (absent, null, a number) counts as no text.

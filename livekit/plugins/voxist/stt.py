@@ -140,6 +140,7 @@ class VoxistSTT(STT):
         enable_metrics: bool = True,
         http_session: aiohttp.ClientSession | None = None,
         api_key_header: str = "X-LVL-KEY",
+        punctuation_mode: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
         validate_websocket: bool = True,
     ):
@@ -170,6 +171,12 @@ class VoxistSTT(STT):
             enable_metrics: Emit LiveKit metrics events
             http_session: Optional aiohttp session (for advanced use)
             api_key_header: HTTP header name for API key (default: X-LVL-KEY)
+            punctuation_mode: Engine punctuation behaviour, sent on the connect
+                URL. None (default) leaves the engine's automatic punctuation
+                on. "Dictated" turns it OFF so the speaker's own spoken
+                punctuation is used instead - verified live: the same audio
+                returns without automatic commas or sentence periods. Requires
+                the gateway's V2 feature flag, and is effectively French-only.
             ssl_context: Optional SSL context for TLS. Needed to reach a
                 deployment whose certificate is signed by a private CA:
                 certificate verification is always enabled, so without a
@@ -271,6 +278,7 @@ class VoxistSTT(STT):
         # retry (conn_options.max_retry) and liveness by aiohttp's heartbeat.
         self._ssl_context = ssl_context
         self._api_key_header = api_key_header
+        self._punctuation_mode = punctuation_mode
         self._heartbeat_interval = heartbeat_interval
         self._connection_timeout = connection_timeout
         self._owns_session = http_session is None
@@ -753,7 +761,9 @@ class VoxistSTT(STT):
         # dies immediately after connecting. Readiness has one source of
         # proof, the probe, which actually watches for that close; see the
         # readiness definition above _reachability_proven.
-        return await dialer.dial(language, 16000)
+        return await dialer.dial(
+            language, 16000, punctuation_mode=self._punctuation_mode
+        )
 
     async def _initialize_pool(self) -> None:
         """

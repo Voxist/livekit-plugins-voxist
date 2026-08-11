@@ -108,6 +108,23 @@ def prime_cache(dialer: VoxistDialer, token: str) -> str:
     return url
 
 
+def _dialer_capturing_url(monkeypatch):
+    """A primed dialer whose ws_connect URL is captured, no network."""
+    session = FakeSession(ws_results=[object()])
+    dialer = make_dialer(session)
+    prime_cache(dialer, "tok")
+    captured: list[str] = []
+
+    original = session.ws_connect
+
+    async def spy(url, **kwargs):
+        captured.append(url)
+        return await original(url, **kwargs)
+
+    monkeypatch.setattr(session, "ws_connect", spy)
+    return dialer, captured
+
+
 @pytest.mark.no_auto_mock_token
 class TestStaleCachedTokenRedial:
     """
@@ -1067,3 +1084,46 @@ class TestDialLimiterRegistryLifetime:
         reset_dial_rate_limits()
 
         assert connection._dial_limiters == {}
+
+
+class TestPunctuationModeOnTheDialUrl:
+    """
+    punctuation_mode rides the connect URL, verified live: with 'Dictated' the
+    same audio returns without automatic commas or sentence periods.
+
+    Deliberately NOT a {"config": {...}} message. That message can also carry
+    sample_rate and the gateway bills on the last rate it was told, so a config
+    echoing the caller's 48000 while the wire carries 16kHz would under-report
+    usage threefold.
+    """
+
+    @pytest.mark.asyncio
+    async def test_it_is_appended_when_set(self, monkeypatch):
+        dialer, captured = _dialer_capturing_url(monkeypatch)
+        await dialer.dial("fr", 16000, punctuation_mode="Dictated")
+        assert "punctuation_mode=Dictated" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_it_is_absent_by_default(self, monkeypatch):
+        dialer, captured = _dialer_capturing_url(monkeypatch)
+        await dialer.dial("fr", 16000)
+        assert "punctuation_mode" not in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_sample_rate_is_always_the_wire_rate(self, monkeypatch):
+        """The billing hazard: the URL must never carry the caller's rate."""
+        dialer, captured = _dialer_capturing_url(monkeypatch)
+        await dialer.dial("fr", 16000, punctuation_mode="Dictated")
+        assert "sample_rate=16000" in captured[0]
+
+    @pytest.mark.asyncio
+    async def test_a_hostile_value_cannot_inject_query_parameters(
+        self, monkeypatch
+    ):
+        dialer, captured = _dialer_capturing_url(monkeypatch)
+        await dialer.dial(
+            "fr", 16000, punctuation_mode="Dictated&sample_rate=48000"
+        )
+        assert "sample_rate=48000" not in captured[0], (
+            "an unsanitized punctuation_mode could forge the billing rate"
+        )

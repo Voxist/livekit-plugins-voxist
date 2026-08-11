@@ -3293,3 +3293,96 @@ class TestEngineDoneAck:
             "neither the idle margin nor the backstop should have been waited "
             "out"
         )
+
+
+class TestSegmentLifecycle:
+    """
+    The engine numbers its segments and increments per utterance - verified
+    live on api-asr.voxist.com, where 12s of French produced segments 0/1/2
+    with a final for each. That makes a lost trailing utterance DETECTABLE,
+    which this plugin previously documented as impossible.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_finalized_segment_is_not_reported_as_loss(self):
+        stream = await make_stream()
+        mock_event_ch(stream)
+        for seg in (0, 1, 2):
+            await stream._process_result(
+                {"type": "partial", "text": "x", "segment": seg}
+            )
+            await stream._process_result(
+                {"type": "final", "text": "x", "segment": seg}
+            )
+        assert not stream._trailing_segment_unfinalized
+
+    @pytest.mark.asyncio
+    async def test_an_opened_but_unfinalized_segment_is_detected(self):
+        """The case the gate could previously only guess at."""
+        stream = await make_stream()
+        mock_event_ch(stream)
+        await stream._process_result(
+            {"type": "partial", "text": "bonjour", "segment": 0}
+        )
+        await stream._process_result(
+            {"type": "final", "text": "bonjour", "segment": 0}
+        )
+        # The engine starts segment 1 and then dies.
+        await stream._process_result(
+            {"type": "partial", "text": "au rev", "segment": 1}
+        )
+        assert stream._trailing_segment_unfinalized
+
+    @pytest.mark.asyncio
+    async def test_an_engine_that_omits_the_field_stays_blind(self):
+        """Absent numbering degrades to the old behaviour, never to fake loss."""
+        stream = await make_stream()
+        mock_event_ch(stream)
+        await stream._process_result({"type": "partial", "text": "x"})
+        assert not stream._trailing_segment_unfinalized
+        for bad in (None, "1", 1.5, True):
+            stream._open_segment = None
+            stream._finalized_segment = None
+            await stream._process_result(
+                {"type": "partial", "text": "x", "segment": bad}
+            )
+            assert not stream._trailing_segment_unfinalized, f"segment={bad!r}"
+
+    @pytest.mark.asyncio
+    async def test_the_warning_says_IS_missing_not_MAY_be(self, caplog):
+        """
+        A concluded exchange can still have left a segment open - and the ack
+        fast path makes concluding early the normal case, so this had been
+        reported as a clean success.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "partial", "text": "bonjour", "segment": 0})
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            await asyncio.sleep(0.05)
+            # A new utterance opens and is never finalized.
+            ws.feed_json({"type": "partial", "text": "au rev", "segment": 1})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.05)
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task
+
+        assert stream._session_complete, "the delivered final still counts"
+        assert any(
+            "unfinalized engine segment" in r.message for r in caplog.records
+        ), (
+            "an exchange that concluded with a segment still open must say so; "
+            f"got {[r.message for r in caplog.records]}"
+        )

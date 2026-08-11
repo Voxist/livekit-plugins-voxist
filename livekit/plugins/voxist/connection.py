@@ -633,7 +633,10 @@ class VoxistDialer:
             ) from e
 
     async def dial(
-        self, language: str, sample_rate: int
+        self,
+        language: str,
+        sample_rate: int,
+        punctuation_mode: str | None = None,
     ) -> aiohttp.ClientWebSocketResponse:
         """
         Open a WebSocket configured for one session.
@@ -661,6 +664,23 @@ class VoxistDialer:
                 f"{token_url}{separator}lang={safe_language}"
                 f"&sample_rate={safe_rate}"
             )
+            # The gateway reads punctuation_mode from the connect URL
+            # alongside lang and sample_rate. Verified live against
+            # api-asr.voxist.com: with 'Dictated' the same audio comes back
+            # without automatic commas or sentence periods, which is the point
+            # - a dictation user speaks their punctuation.
+            #
+            # Sent via the URL rather than a {"config": {...}} message on
+            # purpose. That message can also carry sample_rate, and the
+            # gateway BILLS on the last rate it was told
+            # (durationSecs = bytes / (rate * 2)), so a config message that
+            # echoed the caller's 48000 while the wire carries 16kHz would
+            # under-report usage threefold. The URL path cannot make that
+            # mistake.
+            if punctuation_mode:
+                ws_url += (
+                    f"&punctuation_mode={sanitize_url_param(punctuation_mode)}"
+                )
 
             if self._session.closed:
                 # Same shutdown race as in the token exchange: surface a

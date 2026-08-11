@@ -136,6 +136,15 @@ class _SessionOutcome:
 
             Defaults to False so a caller that omits it gets the reading that
             does not silently excuse loss.
+        trailing_segment_unfinalized: The engine opened a numbered segment it
+            never finalized, so a trailing utterance is missing.
+
+            Measured, not guessed. The engine increments a `segment` field per
+            utterance (verified live: 12s of French produced segments 0/1/2),
+            which is the only evidence available - the protocol has no
+            end-of-stream marker and the engine does not close its socket. It
+            makes the difference between "a trailing transcript MAY have been
+            lost", which was all the gate could once say, and knowing.
         detail: Human-readable description of how the attempt ended, used
             verbatim in the log or error message the verdict produces.
     """
@@ -147,6 +156,7 @@ class _SessionOutcome:
     detail: str
     audio_was_dropped: bool = False
     engine_reported_empty: bool = False
+    trailing_segment_unfinalized: bool = False
 
 
 def _frame_seconds(frame: rtc.AudioFrame) -> float:
@@ -446,6 +456,11 @@ class VoxistSTTStream(RecognizeStream):
         # from _last_progress_at because liveness counts any transcript but
         # finalization only counts a final.
         self._last_final_at: float | None = None
+        # Highest engine segment number seen on a partial / on a final. Their
+        # difference is the only available evidence of a lost trailing
+        # utterance; see _note_segment.
+        self._open_segment: int | None = None
+        self._finalized_segment: int | None = None
         # Fallback origin for the stall detector's wall-clock floor while no
         # transcript has arrived yet. Reset per attempt, like the pair above.
         self._attempt_started_at = time.monotonic()
@@ -1046,6 +1061,7 @@ class VoxistSTTStream(RecognizeStream):
                 detail=detail,
                 audio_was_dropped=self._dropped_frames > 0,
                 engine_reported_empty=self._engine_reported_empty_this_attempt,
+                trailing_segment_unfinalized=self._trailing_segment_unfinalized,
             )
         return _SessionOutcome(
             delivered_final=self._final_delivered_in_session,
@@ -1062,6 +1078,7 @@ class VoxistSTTStream(RecognizeStream):
             # turn a dead attempt swallowed as "legitimately empty".
             audio_was_dropped=self._dropped_frames > 0,
             engine_reported_empty=False,
+            trailing_segment_unfinalized=self._trailing_segment_unfinalized,
         )
 
     def _finish_session(self, outcome: _SessionOutcome) -> None:
@@ -1130,7 +1147,24 @@ class VoxistSTTStream(RecognizeStream):
         """
         try:
             if outcome.delivered_final:
-                if not outcome.concluded:
+                # Two independent reasons the tail may be missing, and the
+                # segment evidence is what makes the second one knowable.
+                #
+                # `not concluded` is the old signal: the ending was imposed on
+                # us, so anything still in flight is gone. But an exchange CAN
+                # conclude - the engine acks Done, or answers and goes quiet -
+                # while having left a numbered segment unfinalized, and that
+                # case used to be reported as a clean success. Adding the ack
+                # fast path made it commoner, because concluding early is
+                # exactly what the fast path does.
+                if outcome.trailing_segment_unfinalized:
+                    logger.warning(
+                        f"Stream {self._session_id} completing with an "
+                        f"unfinalized engine segment: {outcome.detail} - the "
+                        "engine opened a segment it never finalized, so the "
+                        "trailing utterance IS missing from the transcript"
+                    )
+                elif not outcome.concluded:
                     logger.warning(
                         f"Stream {self._session_id} completing on the finals "
                         f"already delivered: {outcome.detail} - a trailing "
@@ -1518,6 +1552,57 @@ class VoxistSTTStream(RecognizeStream):
         means "run the session and find out", not "the input is consumed".
         """
         return self._probe_pending_input_only_sentinels() is not False
+
+    def _note_segment(self, msg_type: object, segment: object) -> None:
+        """
+        Track which engine segment is open and which has been finalized.
+
+        The engine numbers its segments and the number INCREMENTS per
+        finalized utterance - measured live on api-asr.voxist.com, where 12s
+        of French produced segments 0, 1, 2 with a final for each. That makes
+        "did the engine start a segment it never finalized?" a directly
+        observable fact, where before it was only guessable.
+
+        It is what closes a limitation this plugin carried as unfixable: the
+        completion gate could tell whether ANY final had been delivered but
+        not whether the LAST one had, so a session that lost its trailing
+        utterance reported success. There is no end-of-stream marker in the
+        protocol and the engine does not close its socket, so segment numbers
+        are the only signal available.
+
+        Non-integer or absent values are ignored rather than guessed: an
+        engine variant that omits the field simply leaves this blind, which
+        degrades to the previous behaviour instead of inventing loss.
+        """
+        if not isinstance(segment, int) or isinstance(segment, bool):
+            return
+        if msg_type == "partial":
+            self._open_segment = (
+                segment
+                if self._open_segment is None
+                else max(self._open_segment, segment)
+            )
+        else:
+            self._finalized_segment = (
+                segment
+                if self._finalized_segment is None
+                else max(self._finalized_segment, segment)
+            )
+
+    @property
+    def _trailing_segment_unfinalized(self) -> bool:
+        """
+        True when the engine opened a segment it never finalized.
+
+        Precise where the old "a trailing transcript MAY have been lost"
+        warning was a guess. Blind (False) when the engine never numbered a
+        partial, which is the honest reading: no evidence of loss.
+        """
+        if self._open_segment is None:
+            return False
+        if self._finalized_segment is None:
+            return True
+        return self._open_segment > self._finalized_segment
 
     def _note_engine_progress(self, *, is_final: bool) -> None:
         """
@@ -2008,6 +2093,7 @@ class VoxistSTTStream(RecognizeStream):
         # a transcript frame proves the thing the detector is watching for.
         if is_transcript:
             self._note_engine_progress(is_final=msg_type == "final")
+            self._note_segment(msg_type, data.get("segment"))
 
         # Detect start of speech. "text" is server-supplied: anything that
         # is not a string (absent, null, a number) counts as no text.

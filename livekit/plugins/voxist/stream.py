@@ -952,6 +952,18 @@ class VoxistSTTStream(RecognizeStream):
         keeps a crashed engine and a heartbeat death honest - and so is a
         frame that carried TEXT the caller never received.
 
+        KNOWN LIMITATION, stated rather than half-fixed: case 1 asks whether
+        ANY final was delivered, not whether the LAST one was. A session that
+        delivered segment 1's final and lost segment 4's is a success here, and
+        no fact available to this gate can tell the two apart - the protocol
+        carries no segment count, no sequence number and no end-of-stream
+        marker, and the engine the platform is moving to does not even close
+        the socket. What IS detectable is covered: an exchange that ended
+        without the engine answering "Done" has concluded=False, so case 1
+        warns that a trailing transcript may be missing. Closing the gap for
+        real needs new information on the wire (a final count, or an explicit
+        end-of-stream frame), not a cleverer reading of what we have.
+
         Raises:
             TranscriptLostError: Case 4. Non-retryable by construction.
             APIConnectionError: Case 6. Retried by the framework.

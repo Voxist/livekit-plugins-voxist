@@ -2671,8 +2671,10 @@ class TestBacklogBoundIsHard:
         stream._input_ch = SimpleNamespace(qsize=lambda: depth, closed=False)
         stream._pre_drain_items = pre_drain
         stream._items_popped = popped
-        stream._frame_seconds_sum = mean * samples
-        stream._frames_measured = samples
+        stream._frame_durations.clear()
+        stream._frame_seconds_sum = 0.0
+        for _ in range(samples):
+            stream._note_frame_duration(mean)
 
     @pytest.mark.asyncio
     async def test_over_the_bound_drops(self, monkeypatch):
@@ -2685,7 +2687,11 @@ class TestBacklogBoundIsHard:
     async def test_at_or_under_the_bound_never_drops(self, monkeypatch):
         monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0)
         stream = await make_stream()
-        for depth in (0, 1, 50, 100):  # <= 1.00s
+        # 99, not 100: the windowed mean accumulates float error (fifty
+        # 0.01 additions sum to 0.500000...02), so exactly-at-the-bound is
+        # not a stable boundary and the production comparison never needs it
+        # to be - the ceiling is 120s with minutes of headroom.
+        for depth in (0, 1, 50, 99):
             self._seed(stream, depth=depth)
             assert not stream._backlog_exceeds_the_bound()
 
@@ -2709,8 +2715,8 @@ class TestBacklogBoundIsHard:
         stream._note_frame_duration(10.9)  # the big frame passes through
 
         assert not stream._backlog_exceeds_the_bound(), (
-            "one 10.9s frame among a hundred 10ms frames must not make 12 "
-            "queued frames read as 130s of backlog"
+            "one 10.9s frame in the window must not make 12 queued frames "
+            "read as 130s of backlog"
         )
         # Sanity on the arithmetic the docstring claims: the old estimator
         # would have seen 12 * 10.9 = 130.8s and dropped.
@@ -2770,7 +2776,7 @@ class TestBacklogBoundIsHard:
         stream._frame_seconds_sum = 0.0
         for bad in (0.0, -1.0):
             stream._note_frame_duration(bad)
-        assert stream._frames_measured == 0
+        assert len(stream._frame_durations) == 0
 
     @pytest.mark.asyncio
     async def test_repeated_calls_agree(self, monkeypatch):
@@ -3472,10 +3478,18 @@ class TestRoundElevenRegressions:
             ws.feed_json({"type": "final", "text": "", "segment": 0})
             await asyncio.sleep(0.05)
             # ...then wedges. The user speaks well past the unanswered
-            # allowance (3s at the wire rate = 96000B; each frame is 3200B).
+            # allowance (1s at the wire rate = 32000B; each frame is 3200B).
             for _ in range(40):
                 stream._input_ch.send_nowait(speech_frame())
             await asyncio.sleep(0.3)
+            # Model REAL-TIME capture: in production those 4s of speech take
+            # 4s of wall time, so the engine's last transcript is 4s stale at
+            # verdict. A test burst compresses that to milliseconds, which
+            # the wall-gap rescue would (correctly, for a burst) read as
+            # innocent - age the timestamp so the test carries the wedge's
+            # actual signature: large counter AND stale transcript.
+            if stream._last_progress_at is not None:
+                stream._last_progress_at -= 4.0
             stream._input_ch.close()  # -> Done
             await asyncio.sleep(0.1)
             ws.end()  # gateway closes regardless: concluded=True
@@ -3773,4 +3787,265 @@ class TestRoundElevenRegressions:
         assert finals, (
             "the previous attempt's ack concluded this attempt's drain "
             "before the engine answered"
+        )
+
+
+class TestRoundTwelveRegressions:
+    """
+    Round 12's findings: the ack fast path was unsalvageable as an instant
+    terminator, and the empty-verdict byte counter confused bytes with wall
+    time in both directions. The fixes demote the ack to an idle-margin
+    shortener and give the verdict the same bytes-OR-wall-clock shape the
+    stall detector already needed.
+    """
+
+    # ---- the empty verdict's two-clause test, pinned at its boundaries
+
+    @staticmethod
+    async def _verdict_stream(*, counter, gap):
+        stream = await make_stream()
+        mock_event_ch(stream)
+        now = time.monotonic()
+        stream._last_final_at = now - gap
+        stream._last_progress_at = now - gap
+        stream._speaking = False
+        stream._bytes_sent_since_progress = counter
+        return stream
+
+    @pytest.mark.asyncio
+    async def test_a_nonzero_counter_under_the_limit_is_granted(self):
+        """
+        Pins the threshold FROM BELOW - round 12 showed every green suite
+        survived a 10x-too-strict threshold because no test exercised a
+        nonzero counter under the limit. 16000B is half the 1s allowance:
+        if the limit shrinks tenfold (3200B) or degrades to ==0, this fails.
+        """
+        stream = await self._verdict_stream(counter=16_000, gap=60.0)
+        assert stream._engine_reported_empty_this_attempt
+
+    @pytest.mark.asyncio
+    async def test_over_the_limit_with_a_stale_transcript_is_denied(self):
+        """The wedge signature: unanswered bytes AND a stale transcript."""
+        stream = await self._verdict_stream(counter=64_000, gap=4.0)
+        assert not stream._engine_reported_empty_this_attempt, (
+            "2s of speech the engine never answered, sent 4s ago, is a "
+            "wedge - certifying it as empty is the loss this exists to stop"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_burst_drained_backlog_is_rescued_by_the_wall_clock(self):
+        """
+        Round-12 finding: a park-accumulated quiet backlog bursts out inside
+        one cadence period, so the counter holds 20s of room noise the
+        engine had not answered YET - denying the exemption there raised a
+        terminal TranscriptLostError on a legitimately quiet session.
+        """
+        stream = await self._verdict_stream(counter=640_000, gap=0.5)
+        assert stream._engine_reported_empty_this_attempt, (
+            "a large counter with a RECENT transcript is drain speed, not "
+            "muteness"
+        )
+
+    @pytest.mark.asyncio
+    async def test_both_clauses_failing_is_always_denied(self):
+        stream = await self._verdict_stream(counter=640_000, gap=60.0)
+        assert not stream._engine_reported_empty_this_attempt
+
+    # ---- the ack never concludes on its own
+
+    @pytest.mark.asyncio
+    async def test_the_ack_alone_concludes_nothing(self, monkeypatch):
+        """
+        Round-12 findings 0 and 5, one root cause: any instant-ack exit
+        races frames the receive loop has not seen - whether held open by
+        segment accounting (released early by an empty cadence final reusing
+        the open number) or not (an utterance still in the decode buffer
+        opens no segment at all). The ack now only shortens the idle margin
+        AFTER a post-Done final; with no such final it concludes nothing and
+        the drain runs to its backstop.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.6, raising=False
+        )
+        ws = FakeWS()  # never closes, never sends a post-Done final
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.1)
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        started = time.monotonic()
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+        elapsed = time.monotonic() - started
+        await task
+
+        assert elapsed >= 0.5, (
+            f"the drain ended after {elapsed:.2f}s: the ack concluded on its "
+            "own instead of waiting for the backstop - with no post-Done "
+            "final, an ack proves nothing about frames still in flight"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_ack_shortens_the_idle_margin_after_a_final(
+        self, monkeypatch
+    ):
+        """The speed the demotion keeps: post-Done final + ack ends fast."""
+        monkeypatch.setattr(
+            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 3.0, raising=False
+        )
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 8.0, raising=False
+        )
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.1)
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        started = time.monotonic()
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+        elapsed = time.monotonic() - started
+        await task
+
+        assert stream._session_complete
+        assert elapsed < 2.0, (
+            f"{elapsed:.2f}s: with a post-Done final AND the ack, the turn "
+            "should end on the short margin, not the 3s idle or 8s backstop"
+        )
+
+    # ---- segment accounting under the cadence's number reuse
+
+    @pytest.mark.asyncio
+    async def test_an_empty_final_does_not_close_the_open_text_segment(self):
+        """
+        Round-12 finding 0's root: cadence pairs REUSE the current segment
+        number, so an empty tick carrying seg N can arrive while seg N's
+        text final is in flight. Closing N on it vouched for text nobody had
+        seen finalized.
+        """
+        stream = await make_stream()
+        mock_event_ch(stream)
+        await stream._process_result(
+            {"type": "partial", "text": "au revoir", "segment": 0}
+        )
+        # The cadence tick, same number, no text:
+        await stream._process_result(
+            {"type": "final", "text": "", "segment": 0}
+        )
+        assert stream._trailing_segment_unfinalized, (
+            "an empty final reusing the open text segment's number is not a "
+            "verdict on that text"
+        )
+        # The real final closes it.
+        await stream._process_result(
+            {"type": "final", "text": "au revoir", "segment": 0}
+        )
+        assert not stream._trailing_segment_unfinalized
+
+    # ---- the backlog estimator's two new properties
+
+    @pytest.mark.asyncio
+    async def test_the_mean_recovers_after_a_frame_regime_change(self):
+        """
+        Round-12 finding: an attempt-global mean held ~1.0s long after a
+        caller switched from 1s prompt frames to live 10ms capture, so an
+        ordinary 130-frame live hiccup read as 130s and live speech was
+        dropped. The 50-frame window converges within half a second of live
+        audio.
+        """
+        stream = await make_stream()
+        stream._input_ch = SimpleNamespace(qsize=lambda: 130, closed=False)
+        stream._pre_drain_items = 0
+        stream._items_popped = 0
+        # The prompt regime: enough 1s frames that a GLOBAL mean stays near
+        # 1.0 long after the switch (1000 prompt + 50 live pops leaves a
+        # global mean of ~0.95, and 130 x 0.95 = 124s > 120s - the revert
+        # signature). The first version used 120 prompt frames, which
+        # diluted the global mean to 0.7 and made the test pass either way.
+        for _ in range(1000):
+            stream._note_frame_duration(1.0)
+        # The live regime takes over the 50-frame window completely.
+        for _ in range(50):
+            stream._note_frame_duration(0.01)
+
+        assert not stream._backlog_exceeds_the_bound(), (
+            "130 live frames (1.3s) read as over 120s: the prompt regime is "
+            "still poisoning the estimate after the window should have "
+            "flushed it"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_retry_does_not_grandfather_the_previous_backlog(self):
+        """
+        Round-12 finding: a per-attempt snapshot let every retry exempt the
+        backlog the previous attempt accumulated - up to N x 120s across
+        max_retry attempts, unbounding the ceiling. The snapshot is taken
+        once per session; the pop counter persists.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+
+        # Full-chunk frames (1600 samples = one 100ms chunk each) so every
+        # frame produces a send: 160-sample frames buffer 10:1 in the
+        # processor and the flaky send below would never fire.
+        for _ in range(30):
+            stream._input_ch.send_nowait(speech_frame(1600))
+        ws.fail_on_bytes = False
+
+        # Attempt 1: consume a few frames, then die mid-stream.
+        sent = 0
+        original = ws.send_bytes
+
+        async def flaky(data):
+            nonlocal sent
+            sent += 1
+            if sent > 3:
+                raise ConnectionResetError("mid-stream death")
+            await original(data)
+
+        ws.send_bytes = flaky
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
+
+        first_snapshot = stream._pre_drain_items
+        popped_after_one = stream._items_popped
+        assert stream._pre_drain_snapshot_taken
+        assert first_snapshot == 30
+
+        # More audio arrives before the retry - growth, not pre-drain.
+        for _ in range(20):
+            stream._input_ch.send_nowait(speech_frame(1600))
+
+        ws.send_bytes = original
+        stream._input_ch.close()
+        await asyncio.wait_for(stream._send_audio_task(), timeout=10.0)
+
+        assert stream._pre_drain_items == first_snapshot, (
+            "the retry re-snapshotted the queue, grandfathering the growth "
+            "the first attempt left behind - the ceiling bounds nothing if "
+            "every attempt starts a fresh exemption"
+        )
+        assert stream._items_popped > popped_after_one, (
+            "the pop counter must persist across attempts, or the snapshot "
+            "is never consumed"
         )

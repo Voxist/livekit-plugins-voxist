@@ -577,12 +577,48 @@ class TestDrainStillReportsFactsNotVerdicts:
         _await_engine_finalization returns an outcome or None - it never sets
         _session_complete and never raises the terminal error itself.
         """
+        import ast
         import inspect
+        import textwrap
 
         src = inspect.getsource(VoxistSTTStream._await_engine_finalization)
-        assert "_session_complete" not in src
-        assert "TranscriptLostError" not in src
-        assert "_finish_session" not in src
+        tree = ast.parse(textwrap.dedent(src))
+
+        # Parsed, not grepped. The substring version failed the moment a
+        # COMMENT in this function mentioned TranscriptLostError to explain
+        # which defect an ordering fix prevented - a test that forbids naming
+        # a thing is not a test that forbids doing it, and it pushed back
+        # against documenting the reason.
+        assigned = {
+            t.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            for t in node.targets
+            if isinstance(t, ast.Attribute)
+        }
+        assert "_session_complete" not in assigned, (
+            "the drain must not decide completion"
+        )
+
+        raised = {
+            node.exc.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Raise)
+            and isinstance(node.exc, ast.Call)
+            and isinstance(node.exc.func, ast.Name)
+        }
+        assert "TranscriptLostError" not in raised, (
+            "the terminal error has exactly one raise site, and it is the gate"
+        )
+
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert "_finish_session" not in called, (
+            "the drain reports facts; the gate renders the verdict"
+        )
 
     @pytest.mark.asyncio
     async def test_server_close_during_the_drain_still_surfaces_its_error(self):

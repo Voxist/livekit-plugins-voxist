@@ -1,8 +1,10 @@
 """Unit tests for VoxistSTTStream: one socket per stream, framework-owned retries."""
 
 import asyncio
+import contextlib
 import json
 import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -14,7 +16,11 @@ from livekit.agents.stt import SpeechEventType
 from livekit.agents.types import APIConnectOptions
 
 from livekit import rtc
-from livekit.plugins.voxist.audio_processor import MAX_FRAME_SIZE_BYTES
+from livekit.plugins.voxist.audio_processor import (
+    MAX_FRAME_SIZE_BYTES,
+    MIN_FRAME_SIZE_BYTES,
+    AudioProcessor,
+)
 from livekit.plugins.voxist.exceptions import ConnectionError as VoxistConnectionError
 from livekit.plugins.voxist.exceptions import TranscriptLostError
 from livekit.plugins.voxist.stream import VoxistSTTStream
@@ -390,16 +396,13 @@ class TestInputBacklogBound:
         # not-draining condition that a genuinely overwhelmed uplink has -
         # otherwise this test measures producer burstiness, which is exactly
         # what _uplink_is_falling_behind now refuses to punish.
-        real_qsize = stream._input_ch.qsize
-        monkeypatch.setattr(
-            stream._input_ch, "qsize", lambda: max(real_qsize(), 999), raising=False
-        )
+        stream._input_ch = _OverloadedChannel(stream._input_ch, 999)
 
         await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
 
-        # Every frame after the first observation is dropped: the first pass
-        # over the cap cannot know the direction yet.
-        assert stream.dropped_frames == total - 1
+        # Every frame is dropped: the predicate is stateless, so there is no
+        # first-observation grace pass to admit one.
+        assert stream.dropped_frames == total
         assert stream._done_sent, "the session must still end with Done"
         assert ws.send_str.await_args.args[0] == "Done"
 
@@ -534,9 +537,7 @@ class TestInputBacklogBound:
         # steady so this test still exercises the drop path instead of
         # quietly becoming a no-drop test - see _uplink_is_falling_behind,
         # which deliberately no longer punishes a bursty producer.
-        monkeypatch.setattr(
-            stream._input_ch, "qsize", lambda: 999, raising=False
-        )
+        stream._input_ch = _OverloadedChannel(stream._input_ch, 999)
 
         loop = asyncio.get_running_loop()
         loop_time_before = loop.time()
@@ -545,7 +546,7 @@ class TestInputBacklogBound:
             await asyncio.wait_for(stream._send_audio_task(), timeout=10.0)
 
             drops = [r for r in caplog.records if "dropping audio" in r.message]
-            assert stream.dropped_frames == 200 - 1
+            assert stream.dropped_frames == 200
             assert len(drops) == 1
 
             # The limiter genuinely tracks elapsed time rather than just
@@ -1356,9 +1357,7 @@ class TestConsumedAudioPredicate:
         # the reported depth steady so this test still exercises a drop rather
         # than silently becoming a no-drop test (see
         # _uplink_is_falling_behind).
-        monkeypatch.setattr(
-            stream._input_ch, "qsize", lambda: 5, raising=False
-        )
+        stream._input_ch = _OverloadedChannel(stream._input_ch, 5)
 
         await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
 
@@ -2596,60 +2595,172 @@ class TestStallDetectorFalsePositives:
             stream._check_server_liveness()
 
 
-class TestBacklogDropsOnlyWhenNotDraining:
+class _OverloadedChannel:
     """
-    The cap bounds a slow CONSUMER; it must not punish a bursty PRODUCER.
+    A real channel that reports a pinned depth and an OPEN producer.
 
-    push_frame() is synchronous and never yields, so the repo's own
-    documented `for f in frames: s.push_frame(f)` puts a whole file in the
-    channel before the send loop runs once. Dropping on depth alone discarded
-    ~83% of it while every send completed instantly.
+    Drops now require the backlog to be over the cap AND the channel still
+    open (see _uplink_is_falling_behind), but a test must close the channel to
+    make the send loop terminate. This delegates iteration to the real channel
+    - so the loop still ends - while reporting the overload conditions, which
+    keeps these tests exercising the drop path instead of quietly becoming
+    no-drop tests.
+    """
+
+    def __init__(self, real, depth):
+        self._real = real
+        self._depth = depth
+
+    def qsize(self):
+        return self._depth
+
+    @property
+    def closed(self):
+        return False
+
+    def __aiter__(self):
+        return self._real.__aiter__()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestBacklogBoundIsHard:
+    """
+    The cap must bound a slow CONSUMER without punishing a bursty PRODUCER.
+
+    Two previous versions each failed at one end. Dropping on depth alone
+    discarded ~83% of a batch caller's file. Trying to infer "draining" from
+    successive depths removed the bound entirely - the loop pops before the
+    check and rarely yields, so the depth always fell by one and the predicate
+    read its own drop as draining, letting the channel grow without limit.
+
+    The discriminator is whether the producer can still add anything, which
+    the channel already knows: `closed`.
     """
 
     @staticmethod
-    def _with_depths(stream, depths):
-        it = iter(depths)
-        stream._input_ch = SimpleNamespace(qsize=lambda: next(it), closed=False)
-        return [stream._uplink_is_falling_behind() for _ in depths]
+    def _chan(depth, *, closed):
+        return SimpleNamespace(qsize=lambda: depth, closed=closed)
 
     @pytest.mark.asyncio
-    async def test_draining_burst_keeps_every_frame(self):
+    async def test_closed_channel_never_drops_however_deep(self):
+        """The batch case: end_input() has run, so this is a finite tail."""
         stream = await make_stream()
         cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
-        # A stopped producer: the loop removes one frame per iteration, so the
-        # backlog only shrinks. Nothing may be dropped, however deep it got.
-        verdicts = self._with_depths(
-            stream, [cap * 6, cap * 6 - 1, cap * 4, cap * 2, cap + 1, cap - 1]
+        for depth in (cap + 1, cap * 6, cap * 100):
+            stream._input_ch = self._chan(depth, closed=True)
+            assert not stream._uplink_is_falling_behind(), (
+                f"depth {depth} on a closed channel is a file to transcribe, "
+                "not evidence of overload"
+            )
+
+    @pytest.mark.asyncio
+    async def test_open_channel_over_cap_drops_every_time(self):
+        """The overload case: a live producer is outpacing the uplink."""
+        stream = await make_stream()
+        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
+        # Every call must drop, including repeats at a FALLING depth - the
+        # bug was reading a falling depth as recovery.
+        for depth in (cap + 1, cap + 500, cap + 499, cap + 498, cap + 1):
+            stream._input_ch = self._chan(depth, closed=False)
+            assert stream._uplink_is_falling_behind(), (
+                f"depth {depth} over the cap on an open channel must drop"
+            )
+
+    @pytest.mark.asyncio
+    async def test_at_or_under_the_cap_never_drops(self):
+        stream = await make_stream()
+        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
+        for closed in (True, False):
+            for depth in (0, 1, cap - 1, cap):
+                stream._input_ch = self._chan(depth, closed=closed)
+                assert not stream._uplink_is_falling_behind()
+
+    @pytest.mark.asyncio
+    async def test_the_predicate_holds_no_state(self):
+        """
+        Calling it twice, or never, cannot corrupt a running total.
+
+        The direction version kept a high-water mark and was correct only if
+        called exactly once per frame - a coupling nothing enforced.
+        """
+        stream = await make_stream()
+        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
+        stream._input_ch = self._chan(cap + 10, closed=False)
+        assert [stream._uplink_is_falling_behind() for _ in range(5)] == [
+            True
+        ] * 5
+
+    @pytest.mark.asyncio
+    async def test_depth_stays_bounded_against_a_producer_beating_the_uplink(
+        self, monkeypatch
+    ):
+        """
+        End-to-end, with a real slow socket - the test that was missing.
+
+        The unit tests above check the predicate; only this one checks the
+        PROPERTY the cap exists for. The predicate version passed its own unit
+        tests while the real send loop let the channel grow to 9928 frames,
+        because the unit tests fed it a scripted depth sequence that a live
+        loop never produces.
+        """
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 50)
+
+        class SlowWS(FakeWS):
+            async def send_bytes(self, data):
+                await asyncio.sleep(0.01)  # uplink far slower than realtime
+                await super().send_bytes(data)
+
+        ws = SlowWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        peak = 0
+        stop = asyncio.Event()
+
+        async def producer():
+            nonlocal peak
+            for _ in range(1200):
+                if stop.is_set():
+                    return
+                stream._input_ch.send_nowait(speech_frame(160))
+                peak = max(peak, stream._input_ch.qsize())
+                await asyncio.sleep(0.0005)  # ~20x realtime
+
+        async def finisher():
+            await asyncio.sleep(0.6)
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            await asyncio.sleep(0.6)
+            stream._input_ch.close()
+            await asyncio.sleep(0.3)
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        prod = asyncio.create_task(producer())
+        fin = asyncio.create_task(finisher())
+        try:
+            # The backlog bound is the premise; whether this particular
+            # scripted session also ends cleanly is not. Swallow the outcome so
+            # the assertions below are what fails, rather than a cascade from
+            # the socket closing while an unbounded backlog was still draining.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(stream._run(), timeout=20.0)
+        finally:
+            stop.set()
+            for t in (prod, fin):
+                t.cancel()
+
+        assert peak <= VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES * 3, (
+            f"backlog reached {peak} frames against a cap of "
+            f"{VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES}: the bound is not "
+            "holding, so a long call would grow the channel until OOM"
         )
-        assert verdicts == [False] * 6, (
-            "a draining backlog is a bursty producer, not a slow uplink"
+        assert stream.dropped_frames > 0, (
+            "an overwhelmed uplink must actually drop, or the test proves "
+            "nothing about the bound"
         )
-
-    @pytest.mark.asyncio
-    async def test_growing_backlog_still_drops(self):
-        stream = await make_stream()
-        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
-        verdicts = self._with_depths(stream, [cap + 100, cap + 200, cap + 300])
-        # First observation cannot know the direction yet; after that, growth
-        # over the cap is a genuinely overwhelmed uplink.
-        assert verdicts == [False, True, True]
-
-    @pytest.mark.asyncio
-    async def test_steady_over_cap_backlog_drops(self):
-        """At the cap this is ~10s of latency: too stale to be worth sending."""
-        stream = await make_stream()
-        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
-        assert self._with_depths(stream, [cap * 2] * 3) == [False, True, True]
-
-    @pytest.mark.asyncio
-    async def test_dropping_the_backlog_below_the_cap_rearms_cleanly(self):
-        """A later burst must be judged on its own, not a stale high-water."""
-        stream = await make_stream()
-        cap = VoxistSTTStream.MAX_INPUT_BACKLOG_FRAMES
-        verdicts = self._with_depths(
-            stream, [cap + 500, cap - 1, cap + 500, cap + 400]
-        )
-        assert verdicts == [False, False, False, False]
 
 
 class TestOversizedFrameIsSlicedNotRejected:
@@ -2661,14 +2772,59 @@ class TestOversizedFrameIsSlicedNotRejected:
     AudioResampler emitting a large frame.
     """
 
-    def test_slices_are_bounded_and_lossless(self):
-        original = bytes(MAX_FRAME_SIZE_BYTES * 2 + 100)
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            # A tail the processor would SILENTLY DISCARD as "too small".
+            # The first version of this test used exactly 100 and asserted
+            # losslessness only over the joined slices - which is trivially
+            # true of any partition - so it demonstrated the discarded case
+            # while proving nothing about it.
+            2,
+            100,
+            MIN_FRAME_SIZE_BYTES - 2,
+            MIN_FRAME_SIZE_BYTES,
+            MIN_FRAME_SIZE_BYTES + 2,
+            MAX_FRAME_SIZE_BYTES // 2,
+            0,
+        ],
+    )
+    def test_every_slice_survives_the_processor(self, extra):
+        original = bytes(MAX_FRAME_SIZE_BYTES * 2 + extra)
         pieces = list(VoxistSTTStream._iter_frame_slices(original))
 
-        assert len(pieces) == 3
         assert all(len(p) <= MAX_FRAME_SIZE_BYTES for p in pieces)
         assert b"".join(pieces) == original, "slicing must not lose a sample"
         assert all(len(p) % 2 == 0 for p in pieces), "Int16 alignment"
+        # The real bar: the processor must ACCEPT every piece. It rejects
+        # anything under MIN_FRAME_SIZE_BYTES outright, so a short tail is
+        # discarded and the joined-bytes assertion above never notices.
+        assert all(len(p) >= MIN_FRAME_SIZE_BYTES for p in pieces), (
+            f"a slice below {MIN_FRAME_SIZE_BYTES}B is dropped by "
+            "_validate_frame, so its audio never reaches the engine"
+        )
+
+    def test_a_sliced_frame_reaches_the_processor_whole(self):
+        """End-to-end through the processor, not just over the partition."""
+        samples = MAX_FRAME_SIZE_BYTES + 50  # tail of 100 bytes as Int16
+        audio = np.random.default_rng(3).integers(
+            -20000, 20000, samples, dtype=np.int16
+        )
+        raw = audio.tobytes()
+        assert len(raw) % MAX_FRAME_SIZE_BYTES < MIN_FRAME_SIZE_BYTES
+
+        p = AudioProcessor(sample_rate=16000)
+        accepted = 0
+        for piece in VoxistSTTStream._iter_frame_slices(raw):
+            before = p._available_samples()
+            chunks = p.process_audio_frame(piece)
+            consumed = sum(c.size for c in chunks) or 0
+            if chunks or p._available_samples() != before or consumed:
+                accepted += len(piece)
+
+        assert accepted == len(raw), (
+            f"{len(raw) - accepted}B of the frame was rejected outright"
+        )
 
     def test_ordinary_frame_is_yielded_untouched(self):
         frame = bytes(3200)
@@ -2757,3 +2913,187 @@ class TestDrainWaitsForAFinalNotAnyTranscript:
             "that was still coming"
         )
         assert finals[-1].alternatives[0].text == "bonjour"
+
+
+class TestRoundNineRegressions:
+    """
+    The six defects round 9 found in round 8's own fixes.
+
+    Every one is a case where a guard added to prevent a false positive
+    created a false NEGATIVE - a session that failed silently, or a wedge that
+    was never policed. They are grouped here because they share that shape.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_mid_session_wedge_after_a_transcript_is_still_caught(
+        self, monkeypatch
+    ):
+        """
+        Permanently disarming the detector on the first transcript left the
+        agent deaf for whole calls AND reported success.
+
+        The engine answers once, then wedges. The old code returned on the
+        first line of _check_server_liveness forever after, and the gate then
+        took case 1 (delivered_final was set by that early final) and logged a
+        WARNING while completing the stream successfully.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "STALL_DETECTION_SECONDS", 0.2, raising=False
+        )
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        stopped = asyncio.Event()
+
+        async def pump():
+            # The engine answers early, then goes mute while audio flows.
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            for _ in range(400):
+                if stopped.is_set():
+                    return
+                stream._input_ch.send_nowait(speech_frame(320))
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(pump())
+        try:
+            with pytest.raises(APIConnectionError, match="no response"):
+                await asyncio.wait_for(stream._run(), timeout=5.0)
+        finally:
+            stopped.set()
+            task.cancel()
+        assert not stream._session_complete, (
+            "a wedged engine must not yield a completed session"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_mid_session_empty_final_is_not_a_verdict_on_the_session(
+        self,
+    ):
+        """
+        One empty final certified an entire attempt as "engine found nothing".
+
+        The engine endpoints silence (rule1, 0.9s), so the opening second of
+        every call produces exactly such a frame. Crediting it meant an engine
+        that emitted one empty final and then wedged reported SUCCESS over
+        minutes of lost speech.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+
+        # Opening silence, finalized as empty - before Done.
+        await stream._process_result({"type": "final", "text": ""})
+        assert not stream._engine_reported_empty_this_attempt, (
+            "a mid-session empty final is a verdict on ONE segment, never on "
+            "the session"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_empty_partial_is_never_a_verdict(self):
+        """A partial is not a finalization, even after Done."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+
+        stream._done_sent = True
+        stream._done_sent_at = time.monotonic()
+        await stream._process_result({"type": "partial", "text": ""})
+
+        assert not stream._engine_reported_empty_this_attempt, (
+            "an engine that opened a segment and died has rendered no verdict"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_post_done_empty_final_IS_a_verdict(self):
+        """The other half: the legitimate empty result must still be one."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._ws = ws
+
+        stream._done_sent = True
+        stream._done_sent_at = time.monotonic()
+        await asyncio.sleep(0.01)
+        await stream._process_result({"type": "final", "text": ""})
+
+        assert stream._engine_reported_empty_this_attempt
+
+    @pytest.mark.asyncio
+    async def test_the_wall_clock_floor_does_not_count_dial_latency(self):
+        """
+        _attempt_started_at was stamped before the dial, so a rate-limiter
+        park of up to a full window counted as engine muteness and the
+        detector fired on the first burst of audio after a throttled dial.
+        """
+        ws = FakeWS()
+
+        async def slow_dial(_language):
+            await asyncio.sleep(0.3)  # stands in for a limiter park
+            return ws
+
+        stream = await make_stream(dial=AsyncMock(side_effect=slow_dial))
+        mock_event_ch(stream)
+
+        before = time.monotonic()
+
+        async def scenario():
+            await asyncio.sleep(0.4)
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        stream._input_ch.send_nowait(speech_frame())
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+
+        # The origin must post-date the dial, not the call to _run.
+        assert stream._attempt_started_at >= before + 0.25, (
+            "the stall clock started before the socket existed, so dial "
+            "latency is charged to the engine"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_late_post_done_final_concludes_instead_of_raising(
+        self, monkeypatch
+    ):
+        """
+        A final arriving inside the last POST_FINAL_IDLE_SECONDS of the drain
+        bound was reported as "sent no transcript" - factually false - and the
+        gate then raised the fatal TranscriptLostError on a session the engine
+        had actually finalized.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.5, raising=False
+        )
+        monkeypatch.setattr(
+            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 0.4, raising=False
+        )
+        ws = FakeWS()  # Kroko: never closes
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # Done
+            # Answer late: inside the drain bound, but with less than the
+            # idle margin left before it expires.
+            await asyncio.sleep(0.45)
+            ws.feed_json({"type": "final", "text": ""})
+
+        task = asyncio.create_task(scenario())
+        try:
+            await asyncio.wait_for(stream._run(), timeout=5.0)
+        finally:
+            task.cancel()
+
+        assert stream._session_complete, (
+            "the engine finalized the session; the drain must not call that "
+            "a lost transcript"
+        )

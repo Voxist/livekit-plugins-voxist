@@ -21,7 +21,6 @@ import json
 import ssl
 import threading
 import time
-import weakref
 from base64 import urlsafe_b64decode
 from binascii import Error as BinasciiError
 from collections import deque
@@ -47,6 +46,33 @@ DIAL_TIMEOUT_SECONDS = 10.0
 MAX_DIALS_PER_WINDOW = 30
 DIAL_RATE_LIMIT_WINDOW_SECONDS = 60.0
 
+# Floor on how long a throttled caller sleeps between re-checks. The computed
+# wait is the exact moment the earliest charged attempt ages out, so a caller
+# that wakes a hair early (monotonic granularity) would otherwise recompute a
+# microsecond-long wait and spin. Doubles as the tolerance on the caller's
+# wait bound, so a slot that is microseconds beyond it is still taken.
+_SLOT_POLL_FLOOR_SECONDS = 0.005
+
+# How long a limiter must sit with an empty window before the process-wide
+# registry reclaims its entry (on top of the window itself). Purely a
+# memory bound: by the time it applies, the limiter's window is already empty,
+# so dropping it cannot hand anyone a budget they had not already earned back.
+_DIAL_LIMITER_IDLE_GRACE_SECONDS = 60.0
+
+
+class _DialRateLimitExhausted(Exception):
+    """
+    Internal signal: no dial slot came free inside the caller's wait bound.
+
+    Never escapes VoxistDialer - _charge_dial_attempt maps it to our
+    retryable ConnectionError. It exists only so the limiter can report how
+    long the caller was parked without importing the plugin's exceptions.
+    """
+
+    def __init__(self, waited: float) -> None:
+        super().__init__(f"no dial slot came free within {waited:.1f}s")
+        self.waited = waited
+
 
 class _DialRateLimiter:
     """
@@ -55,23 +81,45 @@ class _DialRateLimiter:
     Why a limiter exists at all: without the pool, every stream dials
     independently under livekit's per-stream retry, with no coordination. A
     gateway outage with N concurrent streams therefore produces N x
-    max_retry dials (plus one HTTPS token exchange per 401-rejected cached
-    token) in a few seconds - against a gateway that may rate-limit or ban
-    the key, turning a transient outage into a much longer one.
+    max_retry dials in a few seconds, each one an HTTPS token exchange (a JWT
+    signing plus a user lookup, on an endpoint the server marks
+    @SkipThrottle() so nothing upstream bounds it) followed by a WebSocket
+    upgrade against a proxy pod that admits WS_HARD_LIMIT (default 40)
+    concurrent sockets and closes the surplus with 1013 "retry in a few
+    seconds" (simple-websocket-proxy.gateway.ts:1038). The gateway implements
+    no per-key rate limit or ban of its own, so nothing but this class stops a
+    herd from piling onto a pod that is already telling us to back off.
 
     Why PROCESS-WIDE (see _limiter_for) rather than per dialer instance: the
-    resource being protected is the gateway's own rate-limit/ban state for
-    one API key, and that budget does not grow just because a process
-    happens to host several VoxistSTT instances. A per-dialer limit would
-    silently multiply by the instance count, which is exactly the herd this
-    is meant to prevent. The cost, stated plainly: a process running many
-    plugins against the same gateway shares one budget, so a mass restart
-    can hit the limit - and then fails as a retryable ConnectionError that
-    livekit re-attempts later, which is the intended behaviour.
+    resource being protected is one pod's admission budget for one API key,
+    and that budget does not grow just because a process happens to host
+    several VoxistSTT instances. A per-dialer limit would silently multiply by
+    the instance count, which is exactly the herd this is meant to prevent.
 
-    Thread-safe (a plain threading.Lock, never held across an await) because
-    one gateway's limiter can legitimately be shared by dialers living on
-    different event loops in different threads.
+    Why an exhausted window WAITS rather than refusing - the defect this
+    replaced: acquire() used to be a synchronous try_acquire() that returned
+    False, and _charge_dial_attempt turned that into a ConnectionError. That
+    made our own throttle spend livekit's finite retry budget. livekit's
+    RecognizeStream._main_task allows conn_options.max_retry + 1 attempts
+    (4 by default) at ~retry_interval (default 2s) apart, and only ever resets
+    _num_retries when a FINAL_TRANSCRIPT arrives (stt.py:531-533) - which,
+    during an outage, never happens. So all four attempts landed inside the
+    same 60s window, every one of them refused by us rather than by the
+    gateway, and the stream died permanently with "failed to recognize speech
+    after 3 attempts" even though the gateway recovered seconds later. The
+    deleted connection pool got this right: it slept out the window
+    (max 5 concurrent reconnects) and reconnected. Waiting restores that.
+
+    The wait is bounded by the CALLER (acquire(max_wait=...)), not by the
+    limiter, because the tolerance for being parked belongs to the caller;
+    VoxistDialer defaults it to the window, the largest value the wait can
+    ever need (see VoxistDialer.__init__).
+
+    Thread-safe, and the threading.Lock is taken only for bookkeeping inside
+    the synchronous helpers - never held across the await in acquire(), which
+    would stall every event loop sharing this limiter. One gateway's limiter
+    can legitimately be shared by dialers living on different event loops in
+    different threads.
     """
 
     def __init__(self, *, max_dials: int, window: float) -> None:
@@ -79,7 +127,16 @@ class _DialRateLimiter:
         self._window = window
         self._attempts: deque[float] = deque()
         self._lock = threading.Lock()
-        self._last_warned_at: float | None = None
+        # Most recent charge - or construction, for a limiter nobody has
+        # dialled through yet - used by is_idle() for registry eviction.
+        # Seeded from the clock rather than left as a "never charged" sentinel
+        # so a freshly minted limiter is never swept out from under the dialer
+        # that just resolved it: two dialers must not end up charging two
+        # different limiters for one credential.
+        self._last_activity_at = time.monotonic()
+        # Per-kind timestamps for the once-per-window log throttle; a herd
+        # would otherwise log once per throttled dial.
+        self._warned_at: dict[str, float] = {}
 
     @property
     def max_dials(self) -> int:
@@ -89,50 +146,169 @@ class _DialRateLimiter:
     def window(self) -> float:
         return self._window
 
-    def try_acquire(self, now: float) -> bool:
-        """Charge one dial attempt, or return False when the window is full."""
+    @property
+    def charged_attempts(self) -> int:
+        """Charges currently on record (without pruning). Diagnostics only."""
+        with self._lock:
+            return len(self._attempts)
+
+    def reserve(self, now: float) -> float:
+        """
+        Charge one dial attempt and return 0.0, or return the seconds until
+        the earliest charged attempt ages out of the window.
+
+        Synchronous and non-blocking on purpose: the lock is taken for the
+        bookkeeping alone and is released before acquire() awaits.
+        """
         with self._lock:
             cutoff = now - self._window
             while self._attempts and self._attempts[0] <= cutoff:
                 self._attempts.popleft()
 
-            if len(self._attempts) >= self._max_dials:
-                # Throttled to one line per window: a herd would otherwise
-                # log once per rejected dial.
-                if (
-                    self._last_warned_at is None
-                    or now - self._last_warned_at >= self._window
-                ):
-                    self._last_warned_at = now
-                    logger.warning(
-                        f"Dial rate limit reached: {self._max_dials} dial "
-                        f"attempts in {self._window:.0f}s; further dials fail "
-                        "fast (retryable) until the window clears"
-                    )
-                return False
+            if len(self._attempts) < self._max_dials:
+                self._attempts.append(now)
+                self._last_activity_at = now
+                return 0.0
 
-            self._attempts.append(now)
+            # The earliest recorded attempt is the earliest moment a slot can
+            # possibly free, so this is a floor on the wait - never a guess.
+            return max(self._attempts[0] + self._window - now, 0.0)
+
+    def is_idle(self, now: float, grace: float) -> bool:
+        """
+        True when the window holds no live attempt AND the last activity
+        (charge, or construction) is older than window + grace, so the entry
+        is safe to reclaim.
+        """
+        with self._lock:
+            cutoff = now - self._window
+            while self._attempts and self._attempts[0] <= cutoff:
+                self._attempts.popleft()
+            if self._attempts:
+                return False
+            return now - self._last_activity_at >= self._window + grace
+
+    def _claim_warning_slot(self, now: float, kind: str) -> bool:
+        with self._lock:
+            last = self._warned_at.get(kind)
+            if last is not None and now - last < self._window:
+                return False
+            self._warned_at[kind] = now
             return True
+
+    async def acquire(self, *, max_wait: float) -> None:
+        """
+        Charge one dial attempt, waiting for a slot when the window is full.
+
+        Cancellation-correct: the charge is appended only on the iteration
+        that returns, so a caller cancelled while parked leaves no phantom
+        attempt behind, and the lock is always released by reserve() before
+        the sleep, so a cancellation can never strand it.
+
+        Note for tests: this reads the clock it sleeps against, so a frozen
+        clock (a FakeClock injected as connection.time) would make the wait
+        loop unable to make progress. Drive this with the real clock and a
+        small window instead.
+
+        Raises:
+            _DialRateLimitExhausted: no slot came free within max_wait.
+        """
+        started_at = time.monotonic()
+        while True:
+            now = time.monotonic()
+            wait_for = self.reserve(now)
+            if wait_for == 0.0:
+                return
+
+            waited = now - started_at
+            remaining = max_wait - waited
+            # The bound is honoured to within the poll floor: an event loop
+            # timer may fire a hair early (loop clock resolution), and giving
+            # up on a slot that is microseconds away would be absurd.
+            if wait_for > remaining + _SLOT_POLL_FLOOR_SECONDS:
+                # The earliest slot is beyond what this caller will tolerate,
+                # and reserve() reports the exact moment it frees - so no
+                # amount of further sleeping changes that. A caller whose
+                # bound is the full window (VoxistDialer's default) can never
+                # reach this branch on the first pass, because a slot always
+                # frees strictly within one window; it is reached only when
+                # competing waiters keep taking the slot first.
+                if self._claim_warning_slot(now, "exhausted"):
+                    logger.warning(
+                        f"Dial rate limit: {self._max_dials} dial attempts in "
+                        f"{self._window:.3g}s and no slot came free within the "
+                        f"{max_wait:.3g}s wait bound; dials now fail "
+                        "(retryable) until the window clears"
+                    )
+                raise _DialRateLimitExhausted(waited)
+
+            if self._claim_warning_slot(now, "waiting"):
+                logger.warning(
+                    f"Dial rate limit reached: {self._max_dials} dial attempts "
+                    f"in {self._window:.3g}s; dials now WAIT up to "
+                    f"{max_wait:.3g}s for the window to slide rather than "
+                    "failing and spending livekit's retry budget"
+                )
+
+            # The lock is NOT held here (reserve() released it): sleeping
+            # under a threading.Lock would block every event loop that shares
+            # this limiter, and a threading.Lock held across an await cannot
+            # be released by the cancellation that interrupts it.
+            await asyncio.sleep(max(wait_for, _SLOT_POLL_FLOOR_SECONDS))
 
 
 # Process-wide registry, keyed by gateway URL + a fingerprint of the API key
-# (never the key itself). Values are weak: the limiter lives exactly as long
-# as some VoxistDialer holds it, so the registry cannot grow without bound
-# and a fully torn-down deployment leaves no state behind.
-_dial_limiters: weakref.WeakValueDictionary[str, _DialRateLimiter] = (
-    weakref.WeakValueDictionary()
-)
+# (never the key itself).
+#
+# Strong references, and the defect that forced them: this used to be a
+# weakref.WeakValueDictionary whose only strong reference was
+# VoxistDialer._rate_limiter. The "process-wide" budget therefore reset to a
+# full window the moment the last dialer for a credential was collected -
+# defeating the anti-herd protection in precisely the pattern it exists for.
+# The common LiveKit agent shape builds one VoxistSTT per job and awaits
+# aclose() in a finally, so during a gateway outage each job burned its dials,
+# its teardown let the limiter be collected, and the next job started with an
+# empty deque; the gateway saw the unbounded herd the class was written to
+# prevent.
+#
+# Registry growth is bounded instead by idle eviction (see _limiter_for): an
+# entry whose window has been empty for window + _DIAL_LIMITER_IDLE_GRACE
+# seconds is dropped, so a process cycling through many distinct credentials
+# retains only the recently-active ones, while a credential that dialled
+# seconds ago keeps its charges no matter how many dialers came and went.
+_dial_limiters: dict[str, _DialRateLimiter] = {}
 _dial_limiters_lock = threading.Lock()
 
 
 def _limiter_for(
     *, base_url: str, api_key: str, max_dials: int, window: float
 ) -> _DialRateLimiter:
+    """Resolve the one canonical limiter for a credential, sweeping idle ones.
+
+    Called on every charge (VoxistDialer._rate_limiter is a property, not a
+    cached attribute) so there is exactly one live limiter per credential at
+    any moment: a cached reference could outlive an eviction and charge a
+    limiter nobody else can see, splitting one credential's budget in two.
+
+    Lock ordering is registry lock -> limiter lock (is_idle takes the
+    limiter's), and nothing ever goes the other way: a limiter never touches
+    the registry, and acquire()'s wait happens after this function has
+    returned and released the registry lock.
+    """
     key = (
         f"{base_url}|{hashlib.sha256(api_key.encode()).hexdigest()[:16]}"
         f"|{max_dials}/{window}"
     )
+    now = time.monotonic()
     with _dial_limiters_lock:
+        stale = [
+            k
+            for k, limiter in _dial_limiters.items()
+            if limiter.is_idle(now, _DIAL_LIMITER_IDLE_GRACE_SECONDS)
+        ]
+        for k in stale:
+            del _dial_limiters[k]
+
         limiter = _dial_limiters.get(key)
         if limiter is None:
             limiter = _DialRateLimiter(max_dials=max_dials, window=window)
@@ -169,6 +345,7 @@ class VoxistDialer:
         connection_timeout: float = DIAL_TIMEOUT_SECONDS,
         max_dials_per_window: int = MAX_DIALS_PER_WINDOW,
         dial_rate_limit_window: float = DIAL_RATE_LIMIT_WINDOW_SECONDS,
+        max_dial_rate_limit_wait: float | None = None,
     ) -> None:
         self._session = session
         self._base_url = base_url
@@ -177,14 +354,25 @@ class VoxistDialer:
         self._heartbeat_interval = heartbeat_interval
         self._connection_timeout = connection_timeout
 
-        # Shared with every other dialer aimed at the same gateway with the
-        # same credential (see _DialRateLimiter for the scope rationale).
-        # Strong reference: the limiter's lifetime is this dialer's.
-        self._rate_limiter = _limiter_for(
-            base_url=base_url,
-            api_key=api_key,
-            max_dials=max_dials_per_window,
-            window=dial_rate_limit_window,
+        # Parameters of the limiter shared with every other dialer aimed at the
+        # same gateway with the same credential (see _DialRateLimiter for the
+        # scope rationale). Deliberately NOT a cached limiter reference - see
+        # the _rate_limiter property.
+        self._max_dials_per_window = max_dials_per_window
+        self._dial_rate_limit_window = dial_rate_limit_window
+
+        # How long a dial will wait for a free slot before failing retryably.
+        # Defaults to the window because that is the largest wait the limiter
+        # can ever ask for (a slot frees at most `window` after it was
+        # charged), so it is the smallest bound that still guarantees a caller
+        # which is merely EARLY - rather than starved by other waiters - gets
+        # its slot instead of dying. Anything shorter reintroduces the defect
+        # documented on _DialRateLimiter: our own throttle killing a stream
+        # that the gateway would have served moments later.
+        self._max_dial_rate_limit_wait = (
+            dial_rate_limit_window
+            if max_dial_rate_limit_wait is None
+            else max_dial_rate_limit_wait
         )
 
         # Certificate verification is never disabled. An explicit context is
@@ -196,6 +384,27 @@ class VoxistDialer:
         self._token_url: str | None = None
         self._token_expires_at = 0.0
         self._token_lock = asyncio.Lock()
+
+    @property
+    def _rate_limiter(self) -> _DialRateLimiter:
+        """
+        The canonical limiter for this dialer's credential, resolved on every
+        use rather than cached at construction.
+
+        Why not a cached attribute: the registry evicts limiters whose window
+        has been idle (see _limiter_for), and a cached strong reference would
+        let this dialer go on charging an EVICTED limiter while a freshly built
+        dialer for the same credential charges its replacement - two live
+        budgets for one credential, which is the very doubling the
+        process-wide scope exists to prevent. Resolving per use costs one dict
+        lookup per dial, which is nothing next to an HTTPS round-trip.
+        """
+        return _limiter_for(
+            base_url=self._base_url,
+            api_key=self._api_key,
+            max_dials=self._max_dials_per_window,
+            window=self._dial_rate_limit_window,
+        )
 
     def _ssl_param(self) -> ssl.SSLContext | bool:
         return self._ssl_context if self._ssl_context is not None else True
@@ -385,30 +594,43 @@ class VoxistDialer:
                 self._token_url = None
                 self._token_expires_at = 0.0
 
-    def _charge_dial_attempt(self) -> None:
+    async def _charge_dial_attempt(self) -> None:
         """
-        Charge one dial attempt against the shared window, or fail retryably.
+        Charge one dial attempt against the shared window, WAITING for a free
+        slot when it is full and failing retryably only if none comes.
 
         Called once per gateway dial ATTEMPT - before the token exchange of
         the first attempt, and again before the one post-401 redial - so the
         extra HTTPS token exchange a rejected cached token triggers is
-        bounded by the same budget as the sockets themselves.
+        bounded by the same budget as the sockets themselves. That is two
+        charges for one dial() call on the stale-token path, and it is not a
+        double-charge: each covers a distinct token exchange plus a distinct
+        WebSocket upgrade actually put on the wire. The ordinary path charges
+        exactly once, so the effective ceiling is the configured one.
+
+        Why waiting rather than the refusal this replaced: see the defect
+        recorded on _DialRateLimiter. Delaying a dial costs the stream time;
+        refusing one costs it an irreplaceable livekit retry.
 
         Raises:
-            ConnectionError: The window is full. Deliberately our retryable
-                mapping: the stream turns it into APIConnectionError, so
-                livekit re-attempts later on its own backoff instead of the
-                caller blocking here (no sleeps on this path).
+            ConnectionError: No slot came free inside the wait bound. Our
+                retryable mapping: the stream turns it into
+                APIConnectionError, so livekit re-attempts later on its own
+                backoff.
         """
-        if not self._rate_limiter.try_acquire(time.monotonic()):
+        limiter = self._rate_limiter
+        try:
+            await limiter.acquire(max_wait=self._max_dial_rate_limit_wait)
+        except _DialRateLimitExhausted as e:
             raise ConnectionError(
                 "Dial rate limit reached for this gateway: "
-                f"{self._rate_limiter.max_dials} dial attempts per "
-                f"{self._rate_limiter.window:.0f}s (shared process-wide per "
-                "gateway credential). Refusing to dial so the gateway is not "
-                "hammered; this is retryable and will clear as the window "
-                "slides."
-            )
+                f"{limiter.max_dials} dial attempts per "
+                f"{limiter.window:.3g}s (shared process-wide per gateway "
+                f"credential). Waited {e.waited:.2f}s of the "
+                f"{self._max_dial_rate_limit_wait:.3g}s bound for a free slot "
+                "and gave up rather than hammering the gateway; this is "
+                "retryable and will clear as the window slides."
+            ) from e
 
     async def dial(
         self, language: str, sample_rate: int
@@ -427,7 +649,7 @@ class VoxistDialer:
                 shared dial rate limit is exhausted (see
                 _charge_dial_attempt).
         """
-        self._charge_dial_attempt()
+        await self._charge_dial_attempt()
         token_url = await self._get_token_url()
         refetched_token = False
 
@@ -480,7 +702,7 @@ class VoxistDialer:
                 # raises AuthenticationError directly.
                 if not refetched_token:
                     refetched_token = True
-                    self._charge_dial_attempt()
+                    await self._charge_dial_attempt()
                     await self._invalidate_token(token_url)
                     token_url = await self._get_token_url()
                     logger.info(

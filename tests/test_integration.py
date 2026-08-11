@@ -600,20 +600,36 @@ class TestServerStallDetection:
 @pytest.mark.integration
 class TestSessionEndingWithoutTranscript:
     """
-    A gateway whose engine crashed closes the socket promptly after "Done"
-    without ever sending a transcript. From the plugin's side that is
-    indistinguishable from a heartbeat death: the receive iterator simply
-    ends. It must never be reported as a clean, successful session.
+    A session can end with no transcript for two completely different
+    reasons, and the plugin must not confuse them:
+
+    - the ENGINE processed the audio and had nothing to say (a participant on
+      an open mic: room noise, coughing, another language). It says so with
+      {"type": "final", "text": ""}. That is a legitimately empty session.
+    - the engine never answered at all - it crashed, or the socket died on a
+      missed heartbeat, which from the plugin's side is indistinguishable: the
+      receive iterator simply ends. That is transcript loss and must never be
+      reported as a clean, successful session.
+
+    This class asserted the FIRST case was fatal for three rounds. Its test
+    was named "prompt_close_with_no_transcript_is_not_success" and its comment
+    claimed transcription_text="" made the mock send nothing back - but
+    MockVoxistServer.finalize_segment() sends {"type": "final", "text": ""}
+    unconditionally when speech_bytes > 0, so the fixture was modelling the
+    silent participant, not a crashed engine, and the test pinned the defect
+    as intended behaviour. The genuine no-answer case has no mock mode here
+    and is covered where it can be scripted frame by frame:
+    tests/test_stream.py::TestCompletionGate and
+    tests/test_completion_gate.py.
     """
 
     @pytest.mark.asyncio
-    async def test_prompt_close_with_no_transcript_is_not_success(
+    async def test_empty_final_after_done_is_an_empty_session_not_a_loss(
         self, generate_test_audio
     ):
-        from livekit.plugins.voxist.exceptions import TranscriptLostError
-
-        # transcription_text="" models the crashed engine: the gateway
-        # forwards Done, nothing comes back, and it closes the client socket.
+        # transcription_text="" models the engine that processed the audio and
+        # found nothing intelligible: on Done it finalizes with empty text,
+        # then the gateway closes the client socket.
         server = MockVoxistServer(
             valid_api_key="test", transcription_text="", send_interim=False
         )
@@ -636,17 +652,19 @@ class TestSessionEndingWithoutTranscript:
             stream.end_input()
 
             events = []
-            with pytest.raises(TranscriptLostError):
-                async for event in stream:
-                    events.append(event)
+            async for event in stream:
+                events.append(event)
 
             assert server.done_received_count == 1, (
                 "precondition: the session really did reach end of input"
             )
+            assert server.finals_sent == 1, (
+                "precondition: the engine really did answer, with empty text"
+            )
             assert not [
                 e for e in events
                 if e.type == SpeechEventType.FINAL_TRANSCRIPT
-            ], "precondition: nothing was delivered"
+            ], "precondition: there was nothing to deliver"
             await stt.aclose()
         finally:
             await server.stop()

@@ -490,23 +490,71 @@ class TestInputBacklogBound:
         monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_FRAMES", 5)
         monkeypatch.setattr(VoxistSTTStream, "DROP_LOG_INTERVAL_SECONDS", 3600.0)
 
-        # Fresh-host clock: small monotonic values must not suppress the
-        # first report (0.0 was once used as a sentinel and did exactly that)
-        clock = iter([1.0 + i * 0.001 for i in range(5000)])
+        # Patch the *name* `time` inside the plugin's own module namespace -
+        # NOT `time.monotonic` on the real stdlib module. `stream.py` does
+        # `import time` and calls `time.monotonic()`, so rebinding the
+        # module-level `time` reference that production code sees leaves the
+        # actual `time` module - and therefore the asyncio event loop's
+        # clock, which is `BaseEventLoop.time() == time.monotonic()` on that
+        # very same real module - completely untouched. A previous version
+        # of this test patched `livekit.plugins.voxist.stream.time.monotonic`
+        # by dotted string, which resolves attribute-by-attribute to the
+        # real stdlib module and hijacked the event loop's own clock along
+        # with it, making the whole test's pass/fail depend on how many
+        # times the loop happened to read the clock.
+        import time as real_time_module
+
+        from livekit.plugins.voxist import stream as stream_module
+
+        real_monotonic = real_time_module.monotonic
+
+        # Inexhaustible by construction: a mutable counter held in a
+        # closure, never a finite iterator that could raise StopIteration
+        # into whatever calls it.
+        clock_state = {"value": 1.0}
+
+        def fake_monotonic() -> float:
+            # Fresh-host clock: small monotonic values must not suppress
+            # the first report (0.0 was once used as a sentinel and did
+            # exactly that).
+            value = clock_state["value"]
+            clock_state["value"] += 0.001
+            return value
+
         monkeypatch.setattr(
-            "livekit.plugins.voxist.stream.time.monotonic", lambda: next(clock)
+            stream_module, "time", SimpleNamespace(monotonic=fake_monotonic)
         )
 
         for _ in range(200):
             stream._input_ch.send_nowait(frame())
         stream._input_ch.close()
 
+        loop = asyncio.get_running_loop()
+        loop_time_before = loop.time()
+
         with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
             await asyncio.wait_for(stream._send_audio_task(), timeout=10.0)
 
-        drops = [r for r in caplog.records if "dropping audio" in r.message]
-        assert stream.dropped_frames == 200 - 5 - 1
-        assert len(drops) == 1
+            drops = [r for r in caplog.records if "dropping audio" in r.message]
+            assert stream.dropped_frames == 200 - 5 - 1
+            assert len(drops) == 1
+
+            # The limiter genuinely tracks elapsed time rather than just
+            # "log the first drop and never again": once
+            # DROP_LOG_INTERVAL_SECONDS has passed on the fake clock, the
+            # next drop must be reported too.
+            clock_state["value"] += VoxistSTTStream.DROP_LOG_INTERVAL_SECONDS + 1
+            stream._note_dropped_frame()
+
+        drops_after = [r for r in caplog.records if "dropping audio" in r.message]
+        assert len(drops_after) == 2
+
+        # Prove the event loop's own clock kept advancing on the real
+        # monotonic clock throughout, unaffected by the patched seam, and
+        # that the real stdlib `time.monotonic` was never mutated.
+        await asyncio.sleep(0.01)
+        assert loop.time() > loop_time_before
+        assert real_time_module.monotonic is real_monotonic
 
 
 class TestRunOutcome:

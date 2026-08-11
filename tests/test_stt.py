@@ -2269,3 +2269,31 @@ class TestProbeTransportAbortIsReportedHonestly:
         assert not any("already released" in m for m in real), real
         assert any("aborted the probe transport" in m for m in real), real
         assert aborted == [True]
+
+
+class TestPunctuationModeIsValidatedAtTheBoundary:
+    """
+    The gateway matches the EXACT string 'Dictated' (under its V2 flag);
+    anything else is silently ignored server-side and the caller gets full
+    automatic punctuation with nothing in any log. A dictation product
+    misconfigured that way ships wrong transcripts quietly, so the mistake
+    must fail at construction, where it is cheap.
+    """
+
+    def test_the_exact_value_is_accepted(self):
+        stt = VoxistSTT(api_key="k", punctuation_mode="Dictated")
+        assert stt._punctuation_mode == "Dictated"
+
+    def test_none_is_the_default_and_accepted(self):
+        assert VoxistSTT(api_key="k")._punctuation_mode is None
+        assert (
+            VoxistSTT(api_key="k", punctuation_mode=None)._punctuation_mode
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "bad", ["dictated", "DICTATED", "Dictated ", " Dictated", "dictation"]
+    )
+    def test_lookalikes_fail_loudly(self, bad):
+        with pytest.raises(ConfigurationError, match="punctuation_mode"):
+            VoxistSTT(api_key="k", punctuation_mode=bad)

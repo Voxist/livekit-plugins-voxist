@@ -278,6 +278,22 @@ class VoxistSTT(STT):
         # retry (conn_options.max_retry) and liveness by aiohttp's heartbeat.
         self._ssl_context = ssl_context
         self._api_key_header = api_key_header
+        # Validated here, at the public boundary, because the gateway
+        # matches the EXACT string 'Dictated' (and only under its V2 feature
+        # flag): any other value - "dictated", "DICTATED", a stray space - is
+        # silently ignored server-side, and the caller gets full automatic
+        # punctuation with nothing in any log to say their setting did
+        # nothing. A dictation product misconfigured that way ships wrong
+        # transcripts quietly; a ConfigurationError at construction is the
+        # only place the mistake is cheap.
+        if punctuation_mode is not None and punctuation_mode != "Dictated":
+            raise ConfigurationError(
+                f"punctuation_mode={punctuation_mode!r} is not recognised. "
+                "The gateway accepts exactly 'Dictated' (case-sensitive), "
+                "which disables automatic punctuation so the speaker's own "
+                "spoken punctuation is used; omit the parameter (None) to "
+                "keep automatic punctuation."
+            )
         self._punctuation_mode = punctuation_mode
         self._heartbeat_interval = heartbeat_interval
         self._connection_timeout = connection_timeout

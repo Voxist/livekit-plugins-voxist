@@ -331,6 +331,15 @@ class VoxistSTTStream(RecognizeStream):
     # than the detector saves.
     STALL_DETECTION_SECONDS = 30.0
 
+    # For the empty-result exemption: how much caller audio the engine may
+    # have left unanswered at session end while still being believed "it
+    # processed everything and found nothing". Calibrated against the
+    # measured cadence (a transcript roughly every 0.67s even on silence):
+    # 3s is more than four cadence periods of slack for a loaded pod, and a
+    # fraction of any real wedge, where the counter holds the whole
+    # post-wedge stretch of speech. See _engine_reported_empty_this_attempt.
+    EMPTY_VERDICT_MAX_UNANSWERED_SECONDS = 3.0
+
     # Bound on ws.close() during teardown. aiohttp waits up to its ws_close
     # default of 10s for the peer's close ACK - dead air a wedged server
     # does not deserve, right after the 5s drain bound was tightened for the
@@ -456,11 +465,20 @@ class VoxistSTTStream(RecognizeStream):
         # from _last_progress_at because liveness counts any transcript but
         # finalization only counts a final.
         self._last_final_at: float | None = None
-        # Highest engine segment number seen on a partial / on a final. Their
-        # difference is the only available evidence of a lost trailing
-        # utterance; see _note_segment.
+        # Highest engine segment number seen on a TEXT-bearing partial / on
+        # any final. Their difference is the only available evidence of a
+        # lost trailing utterance; see _note_segment. Reset in _run's
+        # per-attempt block - genuinely there, this comment once claimed a
+        # reset that did not exist.
         self._open_segment: int | None = None
         self._finalized_segment: int | None = None
+        # Backlog-bound state, owned by the send task and re-initialized at
+        # the top of _send_audio_task each attempt; declared here so the
+        # object is never without them.
+        self._pre_drain_items = 0
+        self._items_popped = 0
+        self._frame_seconds_sum = 0.0
+        self._frames_measured = 0
         # Fallback origin for the stall detector's wall-clock floor while no
         # transcript has arrived yet. Reset per attempt, like the pair above.
         self._attempt_started_at = time.monotonic()
@@ -548,6 +566,14 @@ class VoxistSTTStream(RecognizeStream):
         self._bytes_sent_since_progress = 0
         self._last_progress_at = None
         self._last_final_at = None
+        # The engine restarts segment numbering at 0 on a NEW socket, so
+        # stale maxima from a dead attempt defeat the trailing-loss detector
+        # in both directions: a high stale _finalized_segment swallows a real
+        # loss, a high stale _open_segment invents one. Round 11 found these
+        # two missing from this block while the declaration comment claimed
+        # they were here.
+        self._open_segment = None
+        self._finalized_segment = None
         # NOT stamped here: see the assignment after the dial in _run_attempt.
         self._attempt_started_at = time.monotonic()
 
@@ -865,18 +891,30 @@ class VoxistSTTStream(RecognizeStream):
             # Read once per pass: the receive task can update it between the
             # two tests below, and None means "no transcript on this socket
             # yet" (the per-attempt reset in _run).
-            # The engine's own acknowledgement, when it sends one, is a
-            # POSITIVE terminator: it has flushed and finished, so there is
-            # nothing left to wait for. Measured live on lang=fr it lands
-            # ~0.12s after Done, which replaces up to 5s of dead air at the
-            # end of every turn on an engine that never closes the socket.
+            # The engine's own acknowledgement is a fast path, and it is
+            # SUBORDINATE to segment accounting: it concludes the turn only
+            # when no text-bearing segment is still open. The ack is a
+            # receipt for the Done COMMAND, not a statement that decoding
+            # finished - the API's own reference client skips it and waits
+            # out an idle window instead - so on a loaded pod it could land
+            # ahead of the trailing final. Requiring the open-segment check
+            # makes the fast path safe REGARDLESS of that ordering, which no
+            # probe can guarantee across engine variants: if text is still
+            # unfinalized, the drain falls through to the idle margin and
+            # backstop below and waits for the final like any other turn.
             #
-            # Kept as a fast path, not the only path: the API's reference
-            # client treats "Done!" as a frame to skip rather than a
-            # terminator, so it may not be universal across engine variants.
-            # An engine that does not ack still ends the turn through the idle
-            # margin below, and a silent one through the backstop.
-            if self._engine_acked_done:
+            # The check does not cost the fast path its speed in the common
+            # case, because empty punctuation partials no longer open
+            # segments (see _note_segment) - only genuinely in-flight text
+            # holds the turn open. Measured live on lang=fr the ack lands
+            # ~0.12s after Done, right behind the last final, replacing up to
+            # 5s of dead air per turn on an engine that never closes the
+            # socket. An engine that does not ack at all still ends through
+            # the idle margin, and a silent one through the backstop.
+            if (
+                self._engine_acked_done
+                and not self._trailing_segment_unfinalized
+            ):
                 return self._outcome(
                     concluded=True,
                     detail=(
@@ -1002,13 +1040,31 @@ class VoxistSTTStream(RecognizeStream):
         on task interleaving, making both a false success and a false fatal
         reachable on ordinary engine behaviour.
 
-        What carries the weight instead is `concluded`, which the caller passes
-        to _outcome and which means the exchange ended the way the protocol
-        says - the server closed after Done, or the engine answered and went
-        quiet. A wedged engine cannot produce that: it never closes and never
-        answers, so the drain times out, concluded is False, and the exemption
-        is unavailable. That is what stops one stray empty frame certifying a
-        session, and it does not require ordering two clocks.
+        What carries the weight instead is a MEASURED engine property: a
+        healthy engine emits a transcript frame roughly every 0.67s
+        continuously, even on input carrying no speech (probed live - 37
+        frames across 24s of digital zero, comfort noise, and a tone alike).
+        So _bytes_sent_since_progress, the counter the stall detector already
+        maintains, is a direct test of "was the engine still answering when
+        the session ended": a healthy engine never lets it exceed about one
+        second's worth, while an engine that wedged shows the entire
+        post-wedge stretch. The third condition below requires it under
+        EMPTY_VERDICT_MAX_UNANSWERED_SECONDS.
+
+        This replaced `concluded` alone as the discriminator, which was too
+        loose: the same 0.67s cadence sets _last_final_at within the first
+        second of EVERY session via an empty final for the leading silence,
+        so an engine that wedged right after it - while the user spoke for
+        minutes - still produced concluded=True (the gateway closes after
+        Done regardless) and the exemption certified the loss as a clean
+        empty session. And it replaced a `_last_final_at >= _done_sent_at`
+        ordering check before that, which was too STRICT (an engine that
+        finalized the trailing silence before end_input made a quiet
+        participant fatal) and UNSOUND (two unsynchronized monotonic reads in
+        different tasks, so the verdict turned on task interleaving). The
+        byte counter has neither problem: it is written only by the send task
+        and read only after both tasks have ended, and a quiet participant
+        passes because the engine keeps punctuating.
 
         Remaining ambiguity, unresolved on purpose: a frame whose "text" is
         malformed rather than absent (renamed field, null, numeric) reads as
@@ -1016,7 +1072,14 @@ class VoxistSTTStream(RecognizeStream):
         from "we could not read what it said". Detecting protocol drift
         belongs in frame validation, not here.
         """
-        return self._last_final_at is not None and not self._speaking
+        if self._last_final_at is None or self._speaking:
+            return False
+        unanswered_limit = int(
+            self.EMPTY_VERDICT_MAX_UNANSWERED_SECONDS
+            * self.WIRE_SAMPLE_RATE
+            * 2  # Int16
+        )
+        return self._bytes_sent_since_progress <= unanswered_limit
 
     def _outcome(self, *, concluded: bool, detail: str) -> _SessionOutcome:
         """
@@ -1284,8 +1347,17 @@ class VoxistSTTStream(RecognizeStream):
         sentinels are always honoured in sequence.
         """
         frame_count = 0
+        # Snapshot what was queued before draining became possible, so the
+        # backlog bound judges only growth from here on; see
+        # _backlog_exceeds_the_bound. Counted down by pops of ANY item -
+        # sentinels included, since the snapshot includes them.
+        self._pre_drain_items = self._input_ch.qsize()
+        self._items_popped = 0
+        self._frame_seconds_sum = 0.0
+        self._frames_measured = 0
 
         async for data in self._input_ch:
+            self._items_popped += 1
             frame_count += 1
             if frame_count % 100 == 0:
                 logger.debug(
@@ -1334,7 +1406,8 @@ class VoxistSTTStream(RecognizeStream):
                 if self._carries_signal(data.data):
                     self._audio_consumed = True
                     self._real_audio_this_attempt = True
-                if self._backlog_exceeds_the_bound(_frame_seconds(data)):
+                self._note_frame_duration(_frame_seconds(data))
+                if self._backlog_exceeds_the_bound():
                     self._note_dropped_frame()
                     continue
 
@@ -1508,33 +1581,63 @@ class VoxistSTTStream(RecognizeStream):
             yield frame_bytes[start:end]
             start = end
 
-    def _backlog_exceeds_the_bound(self, frame_seconds: float) -> bool:
+    def _note_frame_duration(self, frame_seconds: float) -> None:
+        """Feed one popped frame's duration into the running mean."""
+        if frame_seconds <= 0:
+            return
+        self._frame_seconds_sum += frame_seconds
+        self._frames_measured += 1
+
+    def _backlog_exceeds_the_bound(self) -> bool:
         """
-        True when the unsent backlog is past MAX_INPUT_BACKLOG_SECONDS.
+        True when the unsent backlog GROWN SINCE DRAINING BEGAN is past
+        MAX_INPUT_BACKLOG_SECONDS.
 
-        Stateless, O(1), and it infers nothing about the producer - see that
-        constant for why three attempts at inference all failed.
+        O(1) on the hot path and it infers nothing about the producer - see
+        the constant for why three attempts at intent inference all failed.
+        Two refinements over the first ceiling, each fixing a measured false
+        positive:
 
-        The backlog's duration is estimated as depth x the duration of the
-        frame in hand. Frames from one source are uniform in practice (a
-        capture pipeline does not vary its frame size mid-stream), so this is
-        exact in the normal case and an estimate only if a caller mixes sizes.
-        Summing the real queue would be O(depth) on the per-frame hot path and
-        would need to reach into livekit's private deque, which this plugin
-        already treats as unavailable by default.
+        1. The estimate uses the RUNNING MEAN frame duration of this attempt,
+           not the frame in hand. Estimating from the current frame made the
+           error unbounded in the lossy direction: one ~11s frame (the size
+           _iter_frame_slices exists for) put frame_seconds at ~10.9, so the
+           bound tripped at depth 12 - a depth any live pipeline reaches
+           during an ordinary scheduling hiccup - and discarded the large
+           frame when the true backlog was a couple of seconds. The mean of a
+           10ms stream barely moves when one large frame passes through, and
+           the queue's composition is best estimated by the distribution of
+           what has actually been popped from it.
 
-        Args:
-            frame_seconds: Duration of the frame currently being handled.
-                Non-positive (an empty or malformed frame) disables the check
-                for that frame rather than guessing.
+        2. Frames that were ALREADY QUEUED when the send loop started are
+           excluded (the _pre_drain_items snapshot, consumed by counting
+           pops). Audio that accumulated while nothing could drain - above
+           all the dial parked in the rate limiter for up to a full window,
+           twice on the stale-token path - is not evidence of overload, and
+           counting it turned a throttled dial into the send loop discarding
+           the start of the caller's speech. The exclusion cannot unbound
+           memory: what queued pre-drain was already allocated by
+           push_frame(), is bounded by park-plus-dial time, and dropping it
+           would reclaim a queue slot, not the allocation. The ceiling's real
+           job - stopping unbounded GROWTH against a slow uplink - applies to
+           exactly the frames this counts.
+
+        Blind (never drops) until at least one frame duration has been
+        measured: with nothing to estimate from, guessing would drop audio.
 
         Returns:
             True if this frame should be dropped to bound the backlog.
         """
-        if frame_seconds <= 0:
+        if self._frames_measured == 0:
             return False
-        backlog_seconds = self._input_ch.qsize() * frame_seconds
-        return backlog_seconds > self.MAX_INPUT_BACKLOG_SECONDS
+        remaining_pre_drain = max(
+            0, self._pre_drain_items - self._items_popped
+        )
+        subject_frames = self._input_ch.qsize() - remaining_pre_drain
+        if subject_frames <= 0:
+            return False
+        mean = self._frame_seconds_sum / self._frames_measured
+        return subject_frames * mean > self.MAX_INPUT_BACKLOG_SECONDS
 
     def _pending_input_only_sentinels(self) -> bool:
         """
@@ -1553,22 +1656,35 @@ class VoxistSTTStream(RecognizeStream):
         """
         return self._probe_pending_input_only_sentinels() is not False
 
-    def _note_segment(self, msg_type: object, segment: object) -> None:
+    def _note_segment(
+        self, msg_type: object, segment: object, *, has_text: bool
+    ) -> None:
         """
-        Track which engine segment is open and which has been finalized.
+        Track which engine segment holds undelivered TEXT, and which has been
+        finalized.
 
         The engine numbers its segments and the number INCREMENTS per
         finalized utterance - measured live on api-asr.voxist.com, where 12s
         of French produced segments 0, 1, 2 with a final for each. That makes
-        "did the engine start a segment it never finalized?" a directly
-        observable fact, where before it was only guessable.
+        "did the engine transcribe something it never finalized?" a directly
+        observable fact, where before it was only guessable. It closes a
+        limitation this plugin carried as unfixable: the completion gate could
+        tell whether ANY final had been delivered but not whether the LAST one
+        had, so a session that lost its trailing utterance reported success.
 
-        It is what closes a limitation this plugin carried as unfixable: the
-        completion gate could tell whether ANY final had been delivered but
-        not whether the LAST one had, so a session that lost its trailing
-        utterance reported success. There is no end-of-stream marker in the
-        protocol and the engine does not close its socket, so segment numbers
-        are the only signal available.
+        A partial opens a segment ONLY when it carries text, and that gate is
+        load-bearing, not cosmetic. The same live measurement shows the engine
+        emits an EMPTY partial/final pair roughly every 0.67s continuously -
+        even on pure silence - reusing the current segment number. Counting
+        those opened a "segment" every cadence tick, so any session that ended
+        between a partial and its final (which the Done-ack fast path makes
+        the ordinary case) warned that a trailing utterance IS missing when
+        nothing was ever there. Text is the difference between "the engine was
+        transcribing something" and "the engine was punctuating silence"; only
+        the former can be lost.
+
+        A FINAL closes its segment regardless of text: the engine rendered a
+        verdict on it, empty or not.
 
         Non-integer or absent values are ignored rather than guessed: an
         engine variant that omits the field simply leaves this blind, which
@@ -1577,6 +1693,8 @@ class VoxistSTTStream(RecognizeStream):
         if not isinstance(segment, int) or isinstance(segment, bool):
             return
         if msg_type == "partial":
+            if not has_text:
+                return
             self._open_segment = (
                 segment
                 if self._open_segment is None
@@ -1592,11 +1710,20 @@ class VoxistSTTStream(RecognizeStream):
     @property
     def _trailing_segment_unfinalized(self) -> bool:
         """
-        True when the engine opened a segment it never finalized.
+        True when the engine transcribed TEXT into a segment it never
+        finalized.
 
         Precise where the old "a trailing transcript MAY have been lost"
-        warning was a guess. Blind (False) when the engine never numbered a
-        partial, which is the honest reading: no evidence of loss.
+        warning was a guess - and honest where the first version of this was
+        not: it opened segments on empty partials too, so the warning fired on
+        the engine's ordinary silence-punctuation cadence. Blind (False) when
+        the engine never numbered a text-bearing partial, which is the honest
+        reading: no evidence of loss.
+
+        Coherence with the empty-result exemption is by construction, not by
+        coordination: a text partial also latches _speaking, and the exemption
+        requires `not _speaking`, so no session can take both the "engine
+        found nothing" path and this "text went unfinalized" warning.
         """
         if self._open_segment is None:
             return False
@@ -2028,10 +2155,27 @@ class VoxistSTTStream(RecognizeStream):
                 # is a far better end-of-turn signal than the timers the drain
                 # otherwise has to fall back on.
                 if msg.data.startswith("Done"):
-                    self._engine_acked_done = True
-                    logger.debug(
-                        f"Stream {self._session_id} engine acked Done"
-                    )
+                    # Latched ONLY once our own "Done" has been written. The
+                    # first version latched unconditionally, which meant any
+                    # Done-prefixed control frame the engine or gateway
+                    # emitted MID-session disarmed the entire post-Done drain
+                    # for the attempt: when the real Done went out later, the
+                    # drain's first pass returned concluded=True and every
+                    # trailing final was dropped. No race in this read:
+                    # _done_sent is set by the send task before the frame
+                    # this acks can come back over the network, and both
+                    # tasks share one event loop.
+                    if self._done_sent:
+                        self._engine_acked_done = True
+                        logger.debug(
+                            f"Stream {self._session_id} engine acked Done"
+                        )
+                    else:
+                        logger.debug(
+                            f"Stream {self._session_id} ignoring a "
+                            f"Done-prefixed frame before Done was sent: "
+                            f"{msg.data[:40]!r}"
+                        )
                     continue
                 try:
                     data = json.loads(msg.data)
@@ -2094,23 +2238,27 @@ class VoxistSTTStream(RecognizeStream):
         msg_type = data.get("type")
         is_transcript = msg_type in ("partial", "final")
 
+        # "text" is server-supplied: anything that is not a string (absent,
+        # null, a number) counts as no text. Extracted before the accounting
+        # below because segment tracking needs to know whether the frame
+        # carried content, not merely that it arrived.
+        raw_text = data.get("text")
+        text = raw_text.strip() if isinstance(raw_text, str) else ""
+
         # Liveness accounting happens here, after classification, because only
         # a transcript frame proves the thing the detector is watching for.
         if is_transcript:
             self._note_engine_progress(is_final=msg_type == "final")
-            self._note_segment(msg_type, data.get("segment"))
+            self._note_segment(
+                msg_type, data.get("segment"), has_text=bool(text)
+            )
 
-        # Detect start of speech. "text" is server-supplied: anything that
-        # is not a string (absent, null, a number) counts as no text.
-        #
-        # Gated on is_transcript for the same reason the budget above is: a
-        # "text" key is a SHAPE, not a meaning. The gateway's redirect frame
-        # carries a target that can land in "text", and an error frame can
-        # too; latching on either opened a speech turn no transcript would
-        # ever close, leaving the caller waiting for an END_OF_SPEECH that
-        # only arrives at session teardown.
-        raw_text = data.get("text")
-        text = raw_text.strip() if isinstance(raw_text, str) else ""
+        # Detect start of speech - gated on is_transcript for the same reason
+        # the budget above is: a "text" key is a SHAPE, not a meaning. The
+        # gateway's redirect frame carries a target that can land in "text",
+        # and an error frame can too; latching on either opened a speech turn
+        # no transcript would ever close, leaving the caller waiting for an
+        # END_OF_SPEECH that only arrives at session teardown.
         if is_transcript and not self._speaking and text:
             self._speaking = True
             logger.debug(f"Stream {self._session_id} speech started")

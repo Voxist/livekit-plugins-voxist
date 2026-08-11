@@ -402,9 +402,11 @@ class TestInputBacklogBound:
 
         await asyncio.wait_for(stream._send_audio_task(), timeout=5.0)
 
-        # Every frame is dropped: the predicate is stateless, so there is no
-        # first-observation grace pass to admit one.
-        assert stream.dropped_frames == total
+        # With the depth pinned at 999, the pre-drain snapshot is 999 and
+        # never fully drains, so the growth subject to the bound is exactly
+        # the number of pops so far: the first 10 frames (0.1s bound / 10ms
+        # frames) are sent, the remaining 30 dropped.
+        assert stream.dropped_frames == total - 10
         assert stream._done_sent, "the session must still end with Done"
         assert ws.send_str.await_args.args[0] == "Done"
 
@@ -552,7 +554,9 @@ class TestInputBacklogBound:
             await asyncio.wait_for(stream._send_audio_task(), timeout=10.0)
 
             drops = [r for r in caplog.records if "dropping audio" in r.message]
-            assert stream.dropped_frames == 200
+            # Pinned depth again: subject = pops, 0.05s bound / 10ms
+            # frames = first 5 sent, 195 dropped.
+            assert stream.dropped_frames == 200 - 5
             assert len(drops) == 1
 
             # The limiter genuinely tracks elapsed time rather than just
@@ -2647,14 +2651,14 @@ class _OverloadedChannel:
 
 class TestBacklogBoundIsHard:
     """
-    A generous absolute ceiling, and nothing else.
+    A generous absolute ceiling on backlog GROWTH, and nothing else.
 
-    Three previous versions tried to tell "a burst that will drain" from "a
-    producer outpacing the uplink" - by depth, then by direction, then by
-    `closed` - and each was correct for one case and wrong for the other,
-    because that intent is not observable from this side of the channel. This
-    version infers nothing, so the tests here pin the ABSENCE of inference as
-    much as the bound itself.
+    Three versions tried to tell "a burst that will drain" from "a producer
+    outpacing the uplink" - by depth, by direction, by `closed` - and each
+    was right for one case and wrong for the other, because that intent is
+    not observable from this side of the channel. The current version infers
+    nothing; its two refinements (running-mean estimate, pre-drain
+    exclusion) each fix a measured false positive and are pinned here.
     """
 
     @staticmethod
@@ -2662,114 +2666,131 @@ class TestBacklogBoundIsHard:
         return SimpleNamespace(qsize=lambda: depth, closed=False)
 
     @staticmethod
-    def _frames_for(seconds, frame_seconds=0.01):
-        return int(seconds / frame_seconds)
+    def _seed(stream, *, depth, mean=0.01, samples=100, pre_drain=0, popped=0):
+        """Put the stream in a known accounting state, no send loop needed."""
+        stream._input_ch = SimpleNamespace(qsize=lambda: depth, closed=False)
+        stream._pre_drain_items = pre_drain
+        stream._items_popped = popped
+        stream._frame_seconds_sum = mean * samples
+        stream._frames_measured = samples
 
     @pytest.mark.asyncio
     async def test_over_the_bound_drops(self, monkeypatch):
-        monkeypatch.setattr(
-            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
-        )
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0)
         stream = await make_stream()
-        stream._input_ch = self._chan(101)  # 1.01s of 10ms frames
-        assert stream._backlog_exceeds_the_bound(0.01)
+        self._seed(stream, depth=101)  # 1.01s of 10ms frames, all growth
+        assert stream._backlog_exceeds_the_bound()
 
     @pytest.mark.asyncio
     async def test_at_or_under_the_bound_never_drops(self, monkeypatch):
-        monkeypatch.setattr(
-            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
-        )
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0)
         stream = await make_stream()
         for depth in (0, 1, 50, 100):  # <= 1.00s
-            stream._input_ch = self._chan(depth)
-            assert not stream._backlog_exceeds_the_bound(0.01)
+            self._seed(stream, depth=depth)
+            assert not stream._backlog_exceeds_the_bound()
 
     @pytest.mark.asyncio
-    async def test_the_channel_being_closed_makes_no_difference(
+    async def test_one_large_frame_does_not_forge_a_huge_backlog(
         self, monkeypatch
     ):
         """
-        THE regression. Keying the drop on `closed` discarded a batch caller's
-        file for any ASYNC producer - the channel is only closed in the same
-        task step for a synchronous push loop - and it also dropped the
-        backlog that accumulates while the dialer is parked in the rate
-        limiter, which the same commit had just argued was legitimate.
+        THE mixed-size regression. Estimating from the frame IN HAND made the
+        error unbounded in the lossy direction: one ~11s frame (the size
+        _iter_frame_slices exists for) tripped the bound at depth 12 - a
+        depth any live pipeline hits during a scheduling hiccup - and the
+        frame was discarded when the true backlog was a couple of seconds.
+        The running mean of a 10ms stream barely notices one large frame.
         """
         monkeypatch.setattr(
-            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
+            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 120.0
         )
         stream = await make_stream()
-        for closed in (True, False):
-            for depth, expected in ((50, False), (500, True)):
-                stream._input_ch = SimpleNamespace(
-                    qsize=lambda d=depth: d, closed=closed
-                )
-                assert stream._backlog_exceeds_the_bound(0.01) is expected, (
-                    "the verdict must depend on the bound alone, never on "
-                    f"channel state (closed={closed}, depth={depth})"
-                )
+        self._seed(stream, depth=12, mean=0.01, samples=100)
+        stream._note_frame_duration(10.9)  # the big frame passes through
+
+        assert not stream._backlog_exceeds_the_bound(), (
+            "one 10.9s frame among a hundred 10ms frames must not make 12 "
+            "queued frames read as 130s of backlog"
+        )
+        # Sanity on the arithmetic the docstring claims: the old estimator
+        # would have seen 12 * 10.9 = 130.8s and dropped.
+        assert 12 * 10.9 > 120.0
 
     @pytest.mark.asyncio
-    async def test_an_unmeasurable_frame_disables_the_check(self):
-        """Guessing a duration would drop audio on a malformed frame."""
+    async def test_pre_drain_backlog_is_not_growth(self, monkeypatch):
+        """
+        THE rate-limiter-park regression. Audio queued while nothing could
+        drain - a dial parked in the limiter for up to a full window, twice
+        on the stale-token path - is not evidence of overload, and counting
+        it made the send loop discard the start of the caller's speech after
+        a throttled dial.
+        """
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 0.5)
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        # 200 frames of 100ms = 20s of audio, 40x the bound, ALL queued
+        # before the send loop exists - exactly what a 20s park produces.
+        for _ in range(200):
+            stream._input_ch.send_nowait(speech_frame())
+
+        async def scenario():
+            await asyncio.sleep(0.3)
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            await asyncio.sleep(0.1)
+            stream._input_ch.close()
+            await asyncio.sleep(0.1)
+            ws.feed_json({"type": "final", "text": "bonjour"})
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=15.0)
+        await task
+
+        assert stream.dropped_frames == 0, (
+            f"{stream.dropped_frames} frames of park-accumulated audio were "
+            "discarded as if the uplink were overloaded"
+        )
+
+    @pytest.mark.asyncio
+    async def test_blind_until_a_duration_has_been_measured(self):
+        """With nothing to estimate from, guessing would drop audio."""
         stream = await make_stream()
-        stream._input_ch = self._chan(10**6)
+        self._seed(stream, depth=10**6, samples=0)
+        stream._frame_seconds_sum = 0.0
+        assert not stream._backlog_exceeds_the_bound()
+
+    @pytest.mark.asyncio
+    async def test_invalid_durations_are_not_measured(self):
+        stream = await make_stream()
+        self._seed(stream, depth=10, samples=0)
+        stream._frame_seconds_sum = 0.0
         for bad in (0.0, -1.0):
-            assert not stream._backlog_exceeds_the_bound(bad)
+            stream._note_frame_duration(bad)
+        assert stream._frames_measured == 0
 
     @pytest.mark.asyncio
-    async def test_the_predicate_holds_no_state(self, monkeypatch):
-        """
-        The direction version kept a high-water mark and was correct only if
-        called exactly once per frame - a coupling nothing enforced.
-        """
-        monkeypatch.setattr(
-            VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0
-        )
+    async def test_repeated_calls_agree(self, monkeypatch):
+        """The predicate reads its state; it must not consume it."""
+        monkeypatch.setattr(VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 1.0)
         stream = await make_stream()
-        stream._input_ch = self._chan(500)
-        assert [stream._backlog_exceeds_the_bound(0.01) for _ in range(5)] == [
+        self._seed(stream, depth=500)
+        assert [stream._backlog_exceeds_the_bound() for _ in range(5)] == [
             True
         ] * 5
-
-    @pytest.mark.asyncio
-    async def test_an_async_batch_burst_is_kept_whole(self):
-        """
-        A file-sized backlog on a still-OPEN channel must not be dropped.
-
-        This is the state the `closed` version got wrong: it only spared a
-        backlog once end_input had run, so an async producer - a file read in
-        chunks, or any burst the send loop starts draining before the caller
-        finishes - had its audio discarded down to the cap even though the
-        backlog was finite and draining.
-
-        Asserted against the REAL channel in exactly that state (deep, open)
-        rather than through a timed session: the timing version raced the drain
-        and proved nothing on either side of the fix.
-        """
-        stream = await make_stream()
-
-        for _ in range(1500):  # 15s of 10ms frames
-            stream._input_ch.send_nowait(speech_frame(160))
-
-        assert stream._input_ch.qsize() > 1000, "past the old frame cap"
-        assert not stream._input_ch.closed, "the async-producer state"
-
-        assert not stream._backlog_exceeds_the_bound(0.01), (
-            "15s of queued audio is far under the 120s ceiling; an open "
-            "channel is not evidence of overload"
-        )
 
     @pytest.mark.asyncio
     async def test_depth_stays_bounded_against_a_producer_beating_the_uplink(
         self, monkeypatch
     ):
         """
-        End-to-end with a real slow socket - the property the bound exists for.
-
-        The direction version passed its own unit tests while the real send
-        loop let the channel grow to 9928 frames, because those tests fed it a
-        scripted depth sequence a live loop never produces.
+        End-to-end with a real slow socket - the property the bound exists
+        for. The direction version passed its own unit tests while the real
+        send loop let the channel grow to 9928 frames, because those tests
+        fed it a scripted depth sequence a live loop never produces.
         """
         monkeypatch.setattr(
             VoxistSTTStream, "MAX_INPUT_BACKLOG_SECONDS", 0.5
@@ -2810,9 +2831,8 @@ class TestBacklogBoundIsHard:
         prod = asyncio.create_task(producer())
         fin = asyncio.create_task(finisher())
         # The bound is the premise, not whether this scripted session also
-        # ends cleanly - so a cascade from the socket closing mid-drain must
-        # not mask the assertions. Narrowed to the plugin's own errors, NOT
-        # bare Exception: suppressing everything also swallowed the wait_for
+        # ends cleanly. Narrowed to the plugin's own errors, NOT bare
+        # Exception: suppressing everything also swallowed the wait_for
         # TimeoutError, so a DEADLOCKED send loop passed this test.
         try:
             with contextlib.suppress(APIConnectionError, TranscriptLostError):
@@ -3123,6 +3143,11 @@ class TestRoundNineRegressions:
         mock_event_ch(stream)
 
         async def scenario():
+            # Pushed AFTER the send loop is running: audio queued before the
+            # loop starts is pre-drain and correctly exempt from the bound,
+            # so a pre-filled channel would (rightly) drop nothing and this
+            # test would lose its premise.
+            await asyncio.sleep(0.05)
             for _ in range(40):
                 stream._input_ch.send_nowait(speech_frame())
             await asyncio.sleep(0.05)
@@ -3245,6 +3270,7 @@ class TestEngineDoneAck:
         mock_event_ch(stream)
         stream._ws = ws
 
+        stream._done_sent = True  # the ack only counts once Done went out
         ws.incoming.put_nowait(
             SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
         )
@@ -3409,4 +3435,342 @@ class TestSegmentLifecycle:
         ), (
             "an exchange that concluded with a segment still open must say so; "
             f"got {[r.message for r in caplog.records]}"
+        )
+
+
+class TestRoundElevenRegressions:
+    """
+    The round-11 findings, each pinned by the scenario that was broken.
+
+    The shared theme: the completion question ("did the engine finish, and
+    deliver everything?") was answered by single weak signals - a timestamp
+    ordering, `concluded` alone, an unconditional ack. These pin the two
+    measured facts that replaced them: the engine's 0.67s punctuation
+    cadence (via the byte counter) and text-gated segment accounting.
+    """
+
+    # ---- Move 2: the empty verdict needs the engine answering to the end
+
+    @pytest.mark.asyncio
+    async def test_a_wedge_after_the_leading_silence_is_not_an_empty_session(
+        self,
+    ):
+        """
+        Round-11 finding 0, the reopened empty-success hole. The engine
+        finalizes the leading silence (setting _last_final_at within the
+        first second of EVERY session), then wedges while the user speaks.
+        The gateway still closes after Done, so `concluded` alone certified
+        the loss as a clean empty session.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            await asyncio.sleep(0.05)
+            # The engine punctuates the leading silence...
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            # ...then wedges. The user speaks well past the unanswered
+            # allowance (3s at the wire rate = 96000B; each frame is 3200B).
+            for _ in range(40):
+                stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.3)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.1)
+            ws.end()  # gateway closes regardless: concluded=True
+
+        task = asyncio.create_task(scenario())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=15.0)
+        finally:
+            task.cancel()
+        assert not stream._session_complete, (
+            "an engine that stopped answering must not certify the speech "
+            "it never heard as an empty session"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_quiet_participant_still_earns_the_empty_verdict(self):
+        """
+        The counter must not reintroduce the round-9 failure: a healthy
+        engine keeps punctuating (measured every ~0.67s), so the counter
+        stays near zero however long the user is quiet.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            # Quiet audio flows; the engine punctuates it continuously.
+            for i in range(12):
+                stream._input_ch.send_nowait(speech_frame())
+                if i % 3 == 2:
+                    await asyncio.sleep(0.03)
+                    ws.feed_json({"type": "final", "text": ""})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": ""})
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=15.0)
+        await task
+        assert stream._session_complete
+
+    # ---- Move 1: only TEXT opens a segment
+
+    @pytest.mark.asyncio
+    async def test_the_punctuation_cadence_never_claims_a_lost_utterance(
+        self, caplog
+    ):
+        """
+        Round-11 finding 7. The engine emits an EMPTY partial/final pair
+        every ~0.67s on silence, reusing the segment number - and a session
+        concluding between such a partial and its final claimed a trailing
+        utterance IS missing when nothing was ever there.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "partial", "text": "bonjour", "segment": 0})
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            await asyncio.sleep(0.05)
+            # The cadence opens the NEXT tick with an empty partial...
+            ws.feed_json({"type": "partial", "text": "", "segment": 1})
+            await asyncio.sleep(0.05)
+            # ...and the session concludes before its (empty) final.
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task
+
+        assert stream._session_complete
+        assert not any(
+            "unfinalized engine segment" in r.message for r in caplog.records
+        ), (
+            "an empty punctuation partial is not an utterance; warning on it "
+            "cries wolf on every session that concludes mid-cadence"
+        )
+
+    # ---- Move 3: the ack is gated and subordinate to segment accounting
+
+    @pytest.mark.asyncio
+    async def test_a_pre_done_done_frame_does_not_disarm_the_drain(self):
+        """
+        Round-11 finding 2. A Done-prefixed frame arriving MID-session used
+        to latch the ack permanently, so the real Done later found the drain
+        pre-disarmed and every trailing final was dropped.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            # Mid-session control frame, long before Done.
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done-ish")
+            )
+            await asyncio.sleep(0.05)
+            assert not stream._engine_acked_done, (
+                "a Done-prefixed frame before Done was written must not latch"
+            )
+            stream._input_ch.close()  # NOW Done goes out
+            await asyncio.sleep(0.2)
+            # The trailing final that the stale latch used to drop:
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task
+
+        finals = [
+            c.args[0]
+            for c in stream._event_ch.send_nowait.call_args_list
+            if c.args[0].type == SpeechEventType.FINAL_TRANSCRIPT
+        ]
+        assert finals and finals[-1].alternatives[0].text == "bonjour", (
+            "the trailing final was dropped: the pre-Done frame disarmed "
+            "the drain"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_ack_waits_for_an_open_text_segment(self, monkeypatch):
+        """
+        Round-11 finding 1. The ack is a receipt for the Done command, not
+        proof decoding finished; if it lands ahead of the trailing final the
+        fast path used to end the turn and drop that final. With text-gated
+        segments the fast path holds whenever transcribed text is still
+        unfinalized, whatever order the ack arrives in.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 3.0, raising=False
+        )
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            # Text is in flight when the session ends...
+            ws.feed_json({"type": "partial", "text": "au revoir", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.1)
+            # ...the ack arrives AHEAD of the final...
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+            await asyncio.sleep(0.3)
+            # ...and the final lands after it.
+            ws.feed_json({"type": "final", "text": "au revoir", "segment": 0})
+
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task
+
+        finals = [
+            c.args[0]
+            for c in stream._event_ch.send_nowait.call_args_list
+            if c.args[0].type == SpeechEventType.FINAL_TRANSCRIPT
+        ]
+        assert finals and finals[-1].alternatives[0].text == "au revoir", (
+            "the ack ended the turn ahead of the final it acknowledges"
+        )
+
+    # ---- Findings 3 and 9: the per-attempt resets, behaviourally
+
+    @pytest.mark.asyncio
+    async def test_stale_segment_maxima_do_not_invent_a_loss(self, caplog):
+        """
+        Fails if the segment reset is deleted from _run's per-attempt block:
+        the stale _open_segment from a dead attempt then reads as an
+        unfinalized utterance in an attempt that finalized everything.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        # State a dead attempt left behind (engine numbering restarts at 0
+        # on the new socket, so these can never be caught up).
+        stream._open_segment = 5
+        stream._finalized_segment = 2
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "partial", "text": "bonjour", "segment": 0})
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task
+
+        assert not any(
+            "unfinalized engine segment" in r.message for r in caplog.records
+        ), "a dead attempt's segment numbers invented a loss in this one"
+
+    @pytest.mark.asyncio
+    async def test_stale_segment_maxima_do_not_swallow_a_loss(self, caplog):
+        """The other direction: stale _finalized_segment hides a real one."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._open_segment = 7
+        stream._finalized_segment = 7  # dead attempt finalized everything
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            # This attempt delivers one final, then transcribes text it
+            # never finalizes.
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "partial", "text": "au rev", "segment": 1})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            await asyncio.wait_for(stream._run(), timeout=15.0)
+        await task
+
+        assert any(
+            "unfinalized engine segment" in r.message for r in caplog.records
+        ), (
+            "segment 1's text was never finalized, but the dead attempt's "
+            "stale maximum (7 >= 7) swallowed the loss"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_stale_ack_does_not_conclude_the_next_attempt(
+        self, monkeypatch
+    ):
+        """
+        Round-11 finding 9, mutation-verified there: deleting the ack's
+        per-attempt reset left 580/580 green. This fails without it - the
+        stale latch concludes the retry's drain on its first pass, before
+        the new socket's engine has answered, and its final is dropped.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 0.2, raising=False
+        )
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 3.0, raising=False
+        )
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        stream._engine_acked_done = True  # what a dead attempt leaves behind
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            # The engine answers AFTER a delay: a fresh drain waits for it,
+            # a stale-latched one concluded at time zero and dropped it.
+            await asyncio.sleep(0.4)
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task
+
+        finals = [
+            c.args[0]
+            for c in stream._event_ch.send_nowait.call_args_list
+            if c.args[0].type == SpeechEventType.FINAL_TRANSCRIPT
+        ]
+        assert finals, (
+            "the previous attempt's ack concluded this attempt's drain "
+            "before the engine answered"
         )

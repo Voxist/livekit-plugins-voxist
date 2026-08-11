@@ -1341,10 +1341,17 @@ class TestConsumedAudioPredicate:
 
 class TestSentinelPredicateFailsSafe:
     """
-    The predicate reads livekit's private Chan._queue. If that attribute
-    ever moves, the fallback decides what a rename costs - and the previous
-    fallback (qsize()==0) was the pre-fix buggy check itself, so a livekit
-    rename would silently resurrect total-transcript-loss-as-success.
+    The probe reads livekit's private Chan._queue. If that attribute ever
+    moves, what the plugin does next decides what a rename costs - and the
+    original fallback (qsize()==0) was the pre-fix buggy check itself, so a
+    livekit rename would silently resurrect total-transcript-loss-as-success.
+
+    The probe is tri-state for that reason: True/False when it could look,
+    None when it could not, because the safe answer differs per caller. The
+    send loop still collapses None to True (a merged segment is the cheap
+    mistake), while the shortcuts in _run_attempt refuse to fire on None -
+    both of them decide a session's fate WITHOUT attempting the exchange, and
+    an unverified probe is not grounds for that.
     """
 
     @pytest.mark.asyncio
@@ -1367,16 +1374,48 @@ class TestSentinelPredicateFailsSafe:
         )
 
     @pytest.mark.asyncio
-    async def test_unreadable_queue_prefers_an_honest_error_to_a_fake_success(
-        self,
-    ):
+    async def test_unreadable_queue_runs_the_session_instead_of_guessing(self):
         """
-        With the channel uninspectable, a retry whose audio is gone must
-        reach the honest TranscriptLostError - never dial, ship a bare Done
-        and report success. The safe direction is stated in the helper and
-        pinned here.
+        With the channel uninspectable, the attempt must be RUN, and the
+        verdict must come from what happened on the socket.
+
+        This test previously asserted the opposite - never dial, raise
+        TranscriptLostError - under the name
+        "prefers_an_honest_error_to_a_fake_success". That name encodes a false
+        dichotomy: an error inferred from a probe that failed is not honest
+        either. It abandons whatever audio the channel still holds (the
+        unreadable probe is exactly the case where we do NOT know that it
+        holds none) and it fabricates a terminal verdict for an exchange that
+        was never attempted. Dialing costs one socket and possibly a
+        zero-duration billing event; it cannot lose audio and cannot invent an
+        outcome.
+
+        Here the channel really does hold nothing but the trailing sentinel,
+        so the session ships a bare Done, the engine answers nothing, and the
+        gate raises - the same end state as before, but earned.
         """
-        dial = AsyncMock(side_effect=AssertionError("must not dial"))
+        class RenamedQueueChan:
+            """
+            The rename, modelled faithfully: livekit's channel still WORKS -
+            it iterates, closes and reports qsize() as always - but the deque
+            our probe reaches for is no longer called _queue. Deleting the
+            real attribute instead breaks livekit's own iteration, which tests
+            a channel that could never exist.
+            """
+
+            def __init__(self, chan):
+                self._chan = chan
+
+            def __getattr__(self, name):
+                if name == "_queue":
+                    raise AttributeError(name)
+                return getattr(self._chan, name)
+
+            def __aiter__(self):
+                return self._chan.__aiter__()
+
+        ws = FakeWS()
+        dial = AsyncMock(return_value=ws)
         stream = await make_stream(dial=dial)
         mock_event_ch(stream)
 
@@ -1384,11 +1423,22 @@ class TestSentinelPredicateFailsSafe:
         # input closed - and now uninspectable.
         stream.end_input()
         stream._audio_consumed = True
-        del stream._input_ch._queue
+        stream._input_ch = RenamedQueueChan(stream._input_ch)
 
+        async def scenario():
+            await asyncio.sleep(0.05)
+            ws.end()  # the server closes after Done, having sent nothing
+
+        task = asyncio.create_task(scenario())
         with pytest.raises(TranscriptLostError):
             await asyncio.wait_for(stream._run(), timeout=5.0)
-        dial.assert_not_awaited()
+        await task
+
+        assert dial.await_count == 1, (
+            "an unverified probe must not decide the session's fate without "
+            "attempting the exchange"
+        )
+        assert ws.sent_text == ["Done"], "the session really was attempted"
         assert not stream._session_complete
 
 

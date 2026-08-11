@@ -3308,46 +3308,44 @@ class TestEngineDoneAck:
         assert stream._last_final_at is None
 
     @pytest.mark.asyncio
-    async def test_the_ack_ends_the_turn_without_waiting_out_the_idle_margin(
-        self, monkeypatch
-    ):
+    async def test_the_ack_does_not_shorten_the_idle_margin(self, monkeypatch):
         """
-        The point of the fast path: on an engine that never closes the socket
-        (lang=fr in production), the turn used to cost the full idle margin -
-        or the 5s backstop - of dead air after the engine had already
-        finished.
+        The margin is UNIFORM. A shortened acked margin (0.2s) was tried and
+        re-opened the two-final tail drop: the ack is a trivial echo that can
+        land ahead of decode on a loaded pod, and 0.2s of quiet between two
+        flush finals separated by decode time is not enough. The 0.5s
+        calibration exists for exactly that inter-final gap, ack or no ack.
         """
         monkeypatch.setattr(
-            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 3.0, raising=False
+            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 1.0, raising=False
         )
-        monkeypatch.setattr(
-            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 10.0, raising=False
-        )
-        ws = FakeWS()  # never closes, as the real gateway does not
+        ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
+
+        final_at = {}
 
         async def scenario():
             stream._input_ch.send_nowait(speech_frame())
             await asyncio.sleep(0.05)
             stream._input_ch.close()  # -> Done
             await asyncio.sleep(0.1)
-            ws.feed_json({"type": "final", "text": "bonjour"})
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
             ws.incoming.put_nowait(
                 SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
             )
+            final_at["t"] = time.monotonic()
 
         task = asyncio.create_task(scenario())
-        started = time.monotonic()
         await asyncio.wait_for(stream._run(), timeout=10.0)
-        elapsed = time.monotonic() - started
+        ended = time.monotonic()
         await task
 
         assert stream._session_complete
-        assert elapsed < 2.0, (
-            f"the turn took {elapsed:.2f}s: the engine had already acked, so "
-            "neither the idle margin nor the backstop should have been waited "
-            "out"
+        assert ended - final_at["t"] >= 0.8, (
+            f"the drain ended {ended - final_at['t']:.2f}s after the final: "
+            "the ack shortened the idle margin again, and a second flush "
+            "final separated by decode time would have been dropped"
         )
 
 
@@ -3459,7 +3457,7 @@ class TestRoundElevenRegressions:
 
     @pytest.mark.asyncio
     async def test_a_wedge_after_the_leading_silence_is_not_an_empty_session(
-        self,
+        self, caplog
     ):
         """
         Round-11 finding 0, the reopened empty-success hole. The engine
@@ -3495,15 +3493,51 @@ class TestRoundElevenRegressions:
             ws.end()  # gateway closes regardless: concluded=True
 
         task = asyncio.create_task(scenario())
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            await asyncio.wait_for(stream._run(), timeout=15.0)
+        await task
+
+        # 4s of unanswered tail sits in the AMBIGUOUS band: a loaded pod's
+        # stretched cadence produces the identical signature, so a terminal
+        # error here killed healthy quiet sessions (round 13). The session
+        # completes - but it must NOT be certified as a clean empty, and the
+        # warning must name the unanswered window.
+        assert stream._session_complete
+        assert any(
+            "had not answered the last" in r.message for r in caplog.records
+        ), "the possible-loss warning is the whole point of the middle verdict"
+        assert not any(
+            "empty session, not a lost one" in r.message
+            for r in caplog.records
+        ), "an unanswered 4s tail must never be CERTIFIED empty"
+
+    @pytest.mark.asyncio
+    async def test_a_wedge_past_the_fatal_band_still_raises(self):
+        """Above WEDGE_FATAL_UNANSWERED_SECONDS no pod load explains it."""
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            for _ in range(120):  # 12s of speech bytes: past the band
+                stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.3)
+            if stream._last_progress_at is not None:
+                stream._last_progress_at -= 15.0  # real-time capture
+            stream._input_ch.close()
+            await asyncio.sleep(0.1)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
         try:
             with pytest.raises(TranscriptLostError):
                 await asyncio.wait_for(stream._run(), timeout=15.0)
         finally:
             task.cancel()
-        assert not stream._session_complete, (
-            "an engine that stopped answering must not certify the speech "
-            "it never heard as an empty session"
-        )
+        assert not stream._session_complete
 
     @pytest.mark.asyncio
     async def test_a_quiet_participant_still_earns_the_empty_verdict(self):
@@ -3865,7 +3899,7 @@ class TestRoundTwelveRegressions:
         the drain runs to its backstop.
         """
         monkeypatch.setattr(
-            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.6, raising=False
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 1.5, raising=False
         )
         ws = FakeWS()  # never closes, never sends a post-Done final
         stream = await make_stream(dial=AsyncMock(return_value=ws))
@@ -3888,47 +3922,58 @@ class TestRoundTwelveRegressions:
         elapsed = time.monotonic() - started
         await task
 
-        assert elapsed >= 0.5, (
+        # A full second of margin against the 1.5s backstop: round 13
+        # showed a 0.1s margin lets a reverted instant-ack exit slip past on
+        # a loaded CI box (its ~0.3s nominal exit plus scheduling delays).
+        assert elapsed >= 1.0, (
             f"the drain ended after {elapsed:.2f}s: the ack concluded on its "
             "own instead of waiting for the backstop - with no post-Done "
             "final, an ack proves nothing about frames still in flight"
         )
+        # The acked backstop CLASSIFIES the ending as concluded (round-13
+        # finding 0), so the session completes - what the ack may never do
+        # is end the drain early.
+        assert stream._session_complete
 
     @pytest.mark.asyncio
-    async def test_the_ack_shortens_the_idle_margin_after_a_final(
-        self, monkeypatch
-    ):
-        """The speed the demotion keeps: post-Done final + ack ends fast."""
+    async def test_an_acked_backstop_concludes_the_exchange(self, monkeypatch):
+        """
+        Round-13 finding 0. An engine that finalized the trailing silence
+        BEFORE end_input has nothing to send after Done - it just acks. The
+        backstop used to report that as concluded=False, and the gate then
+        raised a terminal TranscriptLostError on a healthy quiet participant
+        whose socket never closes. An acked backstop is not the instant-ack
+        exit two earlier findings killed: nothing is in flight after a full
+        drain window of quiet.
+        """
         monkeypatch.setattr(
-            VoxistSTTStream, "POST_FINAL_IDLE_SECONDS", 3.0, raising=False
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.5, raising=False
         )
-        monkeypatch.setattr(
-            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 8.0, raising=False
-        )
-        ws = FakeWS()
+        ws = FakeWS()  # Kroko: never closes
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
 
         async def scenario():
             stream._input_ch.send_nowait(speech_frame())
             await asyncio.sleep(0.05)
+            # The engine finalizes the trailing silence BEFORE Done...
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
             stream._input_ch.close()  # -> Done
             await asyncio.sleep(0.1)
-            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            # ...and afterwards sends ONLY the ack. No post-Done final.
             ws.incoming.put_nowait(
                 SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
             )
 
         task = asyncio.create_task(scenario())
-        started = time.monotonic()
         await asyncio.wait_for(stream._run(), timeout=10.0)
-        elapsed = time.monotonic() - started
         await task
 
-        assert stream._session_complete
-        assert elapsed < 2.0, (
-            f"{elapsed:.2f}s: with a post-Done final AND the ack, the turn "
-            "should end on the short margin, not the 3s idle or 8s backstop"
+        assert stream._session_complete, (
+            "a quiet participant on a never-closing socket whose engine "
+            "finalized before Done and acked must complete, not die with a "
+            "terminal TranscriptLostError"
         )
 
     # ---- segment accounting under the cadence's number reuse
@@ -4048,4 +4093,103 @@ class TestRoundTwelveRegressions:
         assert stream._items_popped > popped_after_one, (
             "the pop counter must persist across attempts, or the snapshot "
             "is never consumed"
+        )
+
+
+class TestRoundThirteenRegressions:
+    """
+    Round 13's findings, each pinned by the mechanism that replaced the
+    defective one: the burst rescue is rate-shaped, post-Done finals are
+    counted rather than timestamp-compared, and empty finals touch no
+    segment state at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_realtime_rate_bytes_are_not_a_burst(self):
+        """
+        Round-13 finding 1. A bare recent-transcript rescue (gap <= 2.5s)
+        also rescued a wedge whose server closed promptly, certifying up to
+        2.5s of eaten speech as clean. A burst's signature is RATE: 2s of
+        speech across a ~2.2s gap is live capture the engine never answered.
+        """
+        stream = await make_stream()
+        mock_event_ch(stream)
+        now = time.monotonic()
+        stream._last_final_at = now - 2.2
+        stream._last_progress_at = now - 2.2
+        stream._speaking = False
+        stream._bytes_sent_since_progress = 64_000  # 2s at the wire rate
+
+        assert not stream._engine_reported_empty_this_attempt, (
+            "real-time-rate unanswered bytes are a wedge's live capture, "
+            "however recent the last transcript - rescuing them certified "
+            "eaten speech as a clean empty session"
+        )
+        # The genuine burst shape still passes: the same gap, 20s of bytes.
+        stream._bytes_sent_since_progress = 640_000
+        assert stream._engine_reported_empty_this_attempt
+
+    @pytest.mark.asyncio
+    async def test_post_done_finals_are_counted_not_timestamp_compared(
+        self, monkeypatch
+    ):
+        """
+        Round-13 finding 5. On a coarse monotonic clock (~15.6ms ticks on
+        Windows before 3.13) a pre-Done and post-Done final stamped in the
+        same tick compare equal, so timestamp-inequality detection never saw
+        the post-Done final and a healthy session ran the full backstop.
+        A counter cannot alias, whatever the clock does.
+        """
+        from livekit.plugins.voxist import stream as stream_module
+
+        stream = await make_stream()
+        mock_event_ch(stream)
+
+        frozen = time.monotonic()
+        monkeypatch.setattr(
+            stream_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: frozen),
+        )
+
+        # Two finals inside the SAME clock tick.
+        stream._note_engine_progress(is_final=True)
+        before = stream._finals_count_this_attempt
+        timestamp_before = stream._last_final_at
+        stream._note_engine_progress(is_final=True)
+
+        assert stream._last_final_at == timestamp_before, (
+            "the premise needs both finals stamped identically"
+        )
+        assert stream._finals_count_this_attempt == before + 1, (
+            "the counter must distinguish what the timestamps cannot"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_higher_numbered_empty_final_closes_nothing(self):
+        """
+        Round-13 finding 2. The same-number-only guard was defeated by
+        max(): a HIGHER-numbered empty cadence final (the engine having
+        moved on) raised _finalized_segment past the open text segment and
+        silenced the trailing-loss warning for text nobody saw finalized.
+        Empty finals now touch neither maximum.
+        """
+        stream = await make_stream()
+        mock_event_ch(stream)
+        # Text opens segment 0; its (malformed-text) final reads as empty
+        # and is rightly refused...
+        await stream._process_result(
+            {"type": "partial", "text": "au revoir", "segment": 0}
+        )
+        await stream._process_result(
+            {"type": "final", "text": "", "segment": 0}
+        )
+        # ...and the engine's NEXT cadence pair carries the incremented
+        # number. This must not close segment 0 either.
+        await stream._process_result(
+            {"type": "final", "text": "", "segment": 1}
+        )
+        assert stream._trailing_segment_unfinalized, (
+            "a higher-numbered empty final vouched for text the plugin "
+            "never saw finalized"
         )

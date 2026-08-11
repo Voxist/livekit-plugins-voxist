@@ -31,7 +31,13 @@ from .stream import VoxistSTTStream
 
 class InitializationState(Enum):
     """
-    Tracks the state of background initialization task.
+    The readiness verdict, as reported by VoxistSTT.initialization_state.
+
+    COMPLETED means READY, by the single definition documented in VoxistSTT
+    (above VoxistSTT._reachability_proven) - not merely "the background
+    warm-up task finished". A finished token warm-up whose reachability proof
+    has not run yet reads as PENDING, because the remaining phase is
+    created-but-not-started.
 
     State transitions:
         PENDING -> RUNNING -> COMPLETED (success)
@@ -41,7 +47,8 @@ class InitializationState(Enum):
 
     FAILED is NOT terminal for transient causes: see
     VoxistSTT.wait_for_initialization and VoxistSTT._failure_is_permanent.
-    A rejected credential is the exception - it stays FAILED.
+    Two cases are terminal - a rejected credential, and a plugin closed with
+    aclose().
 
     Use VoxistSTT.initialization_state property to check current state.
     """
@@ -68,17 +75,24 @@ class VoxistSTT(STT):
 
     Task Lifecycle (QUAL-002):
         Construction starts a background warm-up that pre-fetches the
-        WebSocket token (the one slow step of the first dial). The explicit
-        readiness paths additionally prove WebSocket reachability with one
-        short-lived dial, unless validate_websocket=False.
-        Use these properties and methods to manage the initialization lifecycle:
+        WebSocket token (the one slow step of the first dial). The token
+        exchange is plain HTTPS, so it is NOT a readiness proof: readiness
+        additionally requires one short-lived WebSocket dial whose application
+        layer is watched (unless validate_websocket=False), and
+        wait_for_initialization() is the only call that performs it.
 
-        - initialization_state: Current state (NOT_STARTED, PENDING, RUNNING,
-          COMPLETED, FAILED)
-        - initialization_error: Exception if initialization failed
-        - is_ready: True if initialization completed successfully
-        - wait_for_initialization(): Await initialization completion with timeout
-        - check_initialization(): Raise InitializationError if failed
+        Every member below is a projection of ONE definition of "ready",
+        documented in full above _reachability_proven. They cannot disagree:
+
+        - initialization_state: The verdict as an InitializationState.
+          COMPLETED means ready and nothing weaker.
+        - initialization_error: The cause behind a non-ready verdict.
+        - is_ready: initialization_state == COMPLETED.
+        - wait_for_initialization(): Does the work that can establish
+          readiness (token warm-up + reachability proof), then returns the
+          verdict.
+        - check_initialization(): Raises InitializationError unless ready -
+          including when readiness has merely never been verified.
 
         State transitions:
             PENDING -> RUNNING -> COMPLETED (success path)
@@ -87,7 +101,7 @@ class VoxistSTT(STT):
             FAILED -> NOT_STARTED (transient failure, cooldown elapsed:
                 the next wait_for_initialization() re-attempts, so one
                 transport blip does not brick the instance. A rejected
-                credential stays FAILED.)
+                credential stays FAILED, and so does aclose().)
 
     Example:
         # Minimal usage
@@ -324,6 +338,14 @@ class VoxistSTT(STT):
     # do not let a peer that stalls its close handshake hold readiness open.
     READINESS_CLOSE_TIMEOUT_SECONDS = 1.0
 
+    # How long the probe watches a freshly upgraded socket before accepting it
+    # as proof (see _confirm_probe_reached_the_application). It is NOT a wait
+    # for something to arrive - the gateway sends no greeting frame, so on a
+    # healthy deployment nothing ever will. It is a window in which a rejection
+    # the peer has ALREADY decided to send (a 1008 close right after the
+    # upgrade) can still reach us, so it only has to cover a round trip.
+    READINESS_APPLICATION_GRACE_SECONDS = 0.5
+
     @staticmethod
     def _now() -> float:
         """Monotonic clock seam for the readiness cooldown (tests override it
@@ -336,7 +358,27 @@ class VoxistSTT(STT):
 
         The timestamp is what makes FAILED non-terminal for transient causes:
         see _may_retry_failed_readiness.
+
+        A PERMANENT classification is never downgraded by a later, weaker
+        report ([F3b]). Two readiness callers racing (a health endpoint and
+        `async with`) both record an outcome, and the LAST write used to win
+        unconditionally: caller A recorded the AuthenticationError the gateway
+        answered with, then caller B - which never dialed at all, it only
+        replayed A's failure through the cooldown branch - overwrote it with a
+        transient-looking ConnectionError. _failure_is_permanent then read the
+        revoked credential as a blip and re-probed it every cooldown window,
+        forever, which is precisely how a rejected key gets banned.
         """
+        if (
+            self._init_state == InitializationState.FAILED
+            and self._failure_is_permanent(self._init_error)
+            and not self._failure_is_permanent(exc)
+        ):
+            logger.debug(
+                f"Keeping the settled readiness failure {self._init_error!r} "
+                f"rather than downgrading it to {exc!r}"
+            )
+            return
         self._init_error = exc
         self._init_state = InitializationState.FAILED
         self._init_failed_at = self._now()
@@ -357,11 +399,31 @@ class VoxistSTT(STT):
           unexpected error): the deployment may well be reachable a moment
           later. Blocking readiness forever on one blip bricked the plugin
           even though stream() would have dialed and transcribed fine.
+
+        The whole __cause__ CHAIN is inspected, not just the outermost type
+        ([F3b]). This used to be a bare isinstance() on the exception handed
+        in, so any code path that re-wrapped a rejected credential -
+        `raise ConnectionError(...) from AuthenticationError(...)` - silently
+        reclassified it as transient and re-probed a revoked key on a 30s
+        cadence for the rest of the process's life. Classification must
+        survive wrapping, because a wrapper says nothing about whether the
+        underlying answer can change.
         """
-        return isinstance(exc, AuthenticationError)
+        seen: set[int] = set()
+        current: BaseException | None = exc
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, AuthenticationError):
+                return True
+            current = current.__cause__
+        return False
 
     def _may_retry_failed_readiness(self) -> bool:
         """True when a FAILED state is stale enough to re-attempt."""
+        if self._closed:
+            # aclose() is settled, not stale: stream() can never succeed
+            # again, so there is nothing a re-probe could discover.
+            return False
         if self._failure_is_permanent(self._init_error):
             return False
         if self._init_failed_at is None:
@@ -371,6 +433,108 @@ class VoxistSTT(STT):
             return False
         elapsed = self._now() - self._init_failed_at
         return elapsed >= self.READINESS_RETRY_COOLDOWN_SECONDS
+
+    # ------------------------------------------------------------------
+    # THE readiness definition. Read this before touching anything below.
+    # ------------------------------------------------------------------
+    #
+    # The whole readiness surface - is_ready, initialization_state,
+    # initialization_error, check_initialization() and
+    # wait_for_initialization() - derives its answer from _readiness_state()
+    # and adds NOTHING of its own. That is deliberate and it is the fix for a
+    # whole family of defects: each accessor used to compute its own verdict
+    # from a slightly different subset of the internal flags, so they
+    # disagreed. is_ready consulted _ws_validated but not _closed, so a
+    # plugin torn down by aclose() still reported healthy while stream()
+    # raised RuntimeError. initialization_state reported COMPLETED as soon as
+    # the HTTPS token exchange succeeded, so a deployment whose WebSocket path
+    # is blocked read as healthy and check_initialization() - documented as
+    # "use this before operations that require successful initialization" -
+    # stayed silent. Adding one more guard per accessor is what produced that
+    # mess; there is one predicate now, and every accessor is a projection of
+    # it.
+    #
+    # READY means, and only means:
+    #
+    #     THIS PLUGIN HAS OBSERVED - AND HAS NOT SINCE INVALIDATED - EVERY
+    #     FACT ITS CONFIGURED READINESS CONTRACT REQUIRES BEFORE A NEW STREAM
+    #     CAN REACH THE ASR APPLICATION.
+    #
+    # All three of these must hold. Nothing else counts, in either direction:
+    #
+    #   1. THE PLUGIN IS STILL USABLE. aclose() has not run. A closed plugin
+    #      cannot dial (_ensure_dialer refuses) and stream() raises outright,
+    #      so "ready" would be a lie no matter what was verified earlier. This
+    #      is also permanent: _may_retry_failed_readiness refuses to re-probe
+    #      a closed plugin.
+    #
+    #   2. NO READINESS FAILURE IS ON RECORD. _init_state is not FAILED. A
+    #      transient failure clears itself through wait_for_initialization()
+    #      once the cooldown elapses; a rejected credential never does (see
+    #      _failure_is_permanent).
+    #
+    #   3. THE CONFIGURED REACHABILITY PROOF EXISTS (_reachability_proven):
+    #      - validate_websocket=True (the default): a probe has dialed a real
+    #        WebSocket AND watched the application layer survive a grace
+    #        window (_validate_websocket_path). A 101 handshake alone is NOT
+    #        this proof - see _confirm_probe_reached_the_application.
+    #      - validate_websocket=False: the token exchange succeeded. The
+    #        caller has explicitly asked for the weaker, HTTPS-only contract.
+    #
+    # DELIBERATELY NOT part of the definition, and why:
+    #
+    #   - THAT THE NEXT DIAL WILL SUCCEED. Readiness is past tense: it reports
+    #      what was observed, never a prediction. The gateway can die one
+    #      millisecond after the probe. Callers get failover from stream()
+    #      failing, not from readiness promising.
+    #   - A SUCCESSFUL STREAM DIAL. _dial deliberately does not credit
+    #     readiness: it only observes the 101 upgrade, which is exactly the
+    #     evidence point 3 rejects. A consequence, stated plainly: a
+    #     deployment that only ever calls stream() never runs the probe, so
+    #     is_ready stays False for it. Awaiting wait_for_initialization() once
+    #     is the supported way to get a readiness signal, and it is cheap
+    #     after the first call.
+    #   - THE DIAL RATE LIMITER'S REMAINING BUDGET (connection.py). A full
+    #     window makes the probe fail as a retryable ConnectionError, which is
+    #     recorded as a transient failure and re-attempted after the cooldown.
+    #     Readiness never inspects the limiter directly, so it stays correct
+    #     whatever the limiter's policy is.
+    #   - WHETHER THE ENGINE WILL PRODUCE TRANSCRIPTS. That is a per-session
+    #     property (see TranscriptLostError), not a deployment property, and
+    #     no startup probe can establish it.
+
+    def _reachability_proven(self) -> bool:
+        """Point 3 of the readiness definition: does the configured proof
+        exist? Nothing else - no state, no _closed, no failure."""
+        if self._validate_websocket:
+            return self._ws_validated
+        # Token-only contract: either the warm-up completed, or a dial already
+        # fetched and cached a token on demand.
+        return (
+            self._init_state == InitializationState.COMPLETED
+            or (self._dialer is not None and self._dialer._token_url is not None)
+        )
+
+    def _readiness_state(self) -> InitializationState:
+        """
+        The one readiness verdict, expressed as an InitializationState.
+
+        COMPLETED is returned if and ONLY if the plugin is ready by the
+        definition above. In particular, a finished token warm-up whose
+        reachability proof has not run yet reads as PENDING, not COMPLETED:
+        the remaining phase is created-but-not-started, which is exactly what
+        PENDING means, and reporting COMPLETED there is what let a blocked
+        WebSocket path pass for a healthy deployment.
+        """
+        if self._closed:
+            return InitializationState.FAILED
+        if self._init_state == InitializationState.FAILED:
+            return InitializationState.FAILED
+        if self._reachability_proven():
+            return InitializationState.COMPLETED
+        if self._init_state == InitializationState.COMPLETED:
+            return InitializationState.PENDING
+        return self._init_state
 
     @staticmethod
     def _retrieve_init_exception(task: asyncio.Task) -> None:
@@ -578,13 +742,18 @@ class VoxistSTT(STT):
         """
         dialer = await self._ensure_dialer()
         # Always 16kHz on the wire; the stream resamples its input.
-        ws = await dialer.dial(language, 16000)
-        # A real stream dial is also a successful reachability proof. This
-        # keeps is_ready useful for applications that use the stream directly
-        # instead of calling wait_for_initialization() first.
-        if self._validate_websocket:
-            self._ws_validated = True
-        return ws
+        #
+        # This dial does NOT credit readiness, even though it used to
+        # ("keeps is_ready useful for applications that use the stream
+        # directly"). All it observes is the 101 upgrade, and a gateway that
+        # rejects at the APPLICATION layer - a 1008 close right after the
+        # upgrade, the documented shape for a refused app credential or an
+        # exhausted balance - answers 101 first. Crediting readiness here
+        # therefore made is_ready True on a deployment where every stream
+        # dies immediately after connecting. Readiness has one source of
+        # proof, the probe, which actually watches for that close; see the
+        # readiness definition above _reachability_proven.
+        return await dialer.dial(language, 16000)
 
     async def _initialize_pool(self) -> None:
         """
@@ -595,9 +764,8 @@ class VoxistSTT(STT):
         the existing test suite patches and calls it by this name.
 
         The token exchange is the one slow step of the first dial (an HTTPS
-        round-trip). Pre-fetching it keeps the InitializationState API
-        meaningful: COMPLETED means the first stream dials without it, and
-        FAILED surfaces a bad key at startup instead of on first use.
+        round-trip). Pre-fetching it means the first stream dials without it,
+        and a rejected key surfaces at startup instead of on first use.
 
         Deliberately token-only: this task runs fire-and-forget on EVERY
         construction, and each WebSocket dial opens a real ASR engine
@@ -607,9 +775,21 @@ class VoxistSTT(STT):
         on the explicit readiness paths (wait_for_initialization /
         __aenter__), where a caller has actually asked for the guarantee.
 
-        State transitions (QUAL-002):
+        The COMPLETED this method sets is therefore the WARM-UP PHASE's own
+        state, NOT a readiness verdict, and _init_state is not what any public
+        accessor reports: the readiness verdict is computed by
+        _readiness_state() from the full definition, and a completed
+        token-only warm-up under the default contract reads as PENDING there.
+        The distinction is load-bearing. This method opens no socket, so on a
+        deployment whose WebSocket path is blocked it succeeds - and while
+        initialization_state returned _init_state raw, that deployment
+        reported COMPLETED with initialization_error None and
+        check_initialization() silent, i.e. "healthy" for a plugin whose every
+        stream() dies on the dial.
+
+        Warm-up phase transitions (QUAL-002):
             PENDING -> RUNNING (start)
-            RUNNING -> COMPLETED (success)
+            RUNNING -> COMPLETED (token cached)
             RUNNING -> FAILED (error)
         """
         self._init_state = InitializationState.RUNNING
@@ -671,9 +851,14 @@ class VoxistSTT(STT):
         keeps a transient blip from bricking the plugin cannot itself become
         a dial loop.
 
-        Raises whatever the dial raises (mapped ConnectionError /
-        AuthenticationError, or asyncio.TimeoutError from the bound), or a
-        ConnectionError replaying the last failure while the cooldown holds;
+        What counts as proof: a 101 upgrade is NOT enough, and treating it as
+        enough is why this had to be reworked. The probe must also watch the
+        application layer accept the session - see
+        _confirm_probe_reached_the_application.
+
+        Raises whatever the dial or the application-layer check raises (mapped
+        ConnectionError / AuthenticationError, or asyncio.TimeoutError from the
+        bound), or REPLAYS the last failure unchanged while the cooldown holds;
         the caller records it as an initialization failure.
         """
         if self._ws_validated or not self._validate_websocket:
@@ -684,15 +869,28 @@ class VoxistSTT(STT):
             # probe (or failed it) while we waited here.
             if self._ws_validated:
                 return
-            if self._probe_failed_at is not None:
+            probe_error = self._probe_error
+            if probe_error is not None and self._probe_failed_at is not None:
                 elapsed = self._now() - self._probe_failed_at
                 if elapsed < self.READINESS_RETRY_COOLDOWN_SECONDS:
-                    raise VoxistConnectionError(
-                        "WebSocket reachability probe failed "
+                    # The recorded failure is replayed AS ITSELF ([F3a]). It
+                    # used to be re-raised as a fresh VoxistConnectionError
+                    # wrapping the real cause, and that lost the only thing
+                    # the caller needs from it: its classification. A second
+                    # readiness caller arriving here after the first recorded
+                    # an AuthenticationError handed
+                    # wait_for_initialization a transient-looking
+                    # ConnectionError, whose _record_init_failure landed last
+                    # and downgraded the sticky rejected credential into
+                    # something re-probed every cooldown window forever.
+                    # Raising the original object cannot lose that, whatever
+                    # any classifier does with wrappers.
+                    logger.debug(
+                        "Replaying the readiness probe failure recorded "
                         f"{elapsed:.1f}s ago; not re-probing for another "
-                        f"{self.READINESS_RETRY_COOLDOWN_SECONDS - elapsed:.1f}s "
-                        f"(last failure: {self._probe_error!r})"
-                    ) from self._probe_error
+                        f"{self.READINESS_RETRY_COOLDOWN_SECONDS - elapsed:.1f}s"
+                    )
+                    raise probe_error
 
             dialer = await self._ensure_dialer()
             language = self._config["language"]
@@ -709,9 +907,141 @@ class VoxistSTT(STT):
                 self._probe_failed_at = self._now()
                 self._probe_error = e
                 raise
+
+            # Still inside the probe budget: an application-layer rejection is
+            # a probe FAILURE and must share the same cooldown window as a
+            # failed dial, or a refused credential would be re-probed by every
+            # readiness call.
+            try:
+                await self._confirm_probe_reached_the_application(ws)
+            except asyncio.CancelledError:
+                # The socket is ours and must not leak, but awaiting a clean
+                # close on a cancelled task raises again immediately - abort
+                # the transport synchronously instead.
+                self._abort_probe_transport(ws)
+                raise
+            except Exception as e:
+                self._probe_failed_at = self._now()
+                self._probe_error = e
+                await self._close_probe_socket(ws)
+                raise
+
             self._ws_validated = True
             self._probe_failed_at = None
             self._probe_error = None
+
+        await self._close_probe_socket(ws)
+
+    async def _confirm_probe_reached_the_application(
+        self, ws: aiohttp.ClientWebSocketResponse
+    ) -> None:
+        """
+        Confirm the peer accepted the session, not merely the handshake.
+
+        Why this exists: aiohttp's ws_connect returns as soon as the 101
+        arrives, so a gateway that upgrades and THEN refuses at the
+        application layer - close code 1008, the documented answer for an
+        invalid or expired app-level credential and for an exhausted wallet
+        balance (see InsufficientBalanceError) - satisfied the old probe
+        completely. Readiness reported True, __aenter__ succeeded, and every
+        real stream then died with "server closed the connection before end of
+        input" after burning the whole retry budget. The handshake and the
+        session are two different questions and only the second one matters.
+
+        Why NEGATIVE evidence, on a timer: the gateway sends no greeting frame
+        (verified in simple-websocket-proxy.gateway.ts, and the mock server's
+        handler documents the same contract), so on a healthy deployment there
+        is nothing to wait FOR - and no close to wait for either, since the
+        Kroko engine that already serves production Swedish does not close the
+        socket after Done. A probe that waited for any positive signal would
+        therefore hang on a perfectly good deployment. What CAN be observed is
+        a rejection the peer has already decided to send: the close travels
+        right behind the 101, so a short grace window catches it. Surviving
+        the window is the healthy answer.
+
+        Any frame that does arrive is also proof - the gateway's
+        {"type": "redirect"} is the realistic case - because it means the
+        application layer, not just the HTTP upgrade, is talking to us.
+
+        Raises:
+            AuthenticationError: closed with 1008 - the credential or the
+                account was refused. Permanent by classification, so readiness
+                stays failed instead of re-probing a refused key.
+            ConnectionError: closed with any other code, or the socket errored.
+        """
+        try:
+            msg = await asyncio.wait_for(
+                ws.receive(),
+                timeout=self.READINESS_APPLICATION_GRACE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # Survived the window in silence: exactly what a healthy gateway
+            # does, since it has nothing to say until audio arrives.
+            return
+
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            raise VoxistConnectionError(
+                "The readiness probe socket errored immediately after the "
+                f"WebSocket upgrade: {msg.data!r}"
+            )
+
+        if msg.type not in (
+            aiohttp.WSMsgType.CLOSE,
+            aiohttp.WSMsgType.CLOSING,
+            aiohttp.WSMsgType.CLOSED,
+        ):
+            # A real frame: the application layer answered.
+            return
+
+        code = msg.data if isinstance(msg.data, int) else ws.close_code
+        reason = msg.extra if isinstance(msg.extra, str) else ""
+        if code == 1008:
+            # 1008 is the gateway's application-layer refusal, and both of its
+            # documented meanings - a rejected/expired app credential and an
+            # exhausted balance - are answers no re-probe can change. Mapping
+            # it to AuthenticationError makes it permanent for this instance
+            # (see _failure_is_permanent), which is the same contract a
+            # rejected API key gets: fix the account, build a new plugin.
+            raise AuthenticationError(
+                "The gateway accepted the WebSocket upgrade and then closed "
+                f"it with 1008 ({reason!r}): the credential or the account "
+                "was refused at the application layer - an invalid or expired "
+                "app credential, or an exhausted wallet balance. Every stream "
+                "would fail the same way, and re-probing cannot change it."
+            )
+        raise VoxistConnectionError(
+            "The gateway closed the readiness probe immediately after the "
+            f"WebSocket upgrade (close code {code}, reason {reason!r}): the "
+            "handshake succeeded but the session did not."
+        )
+
+    @staticmethod
+    def _abort_probe_transport(ws: aiohttp.ClientWebSocketResponse) -> None:
+        """Drop the probe socket's transport without awaiting anything.
+
+        Used where a clean close is impossible or already gave up: the socket
+        is short-lived and about to be discarded either way, and leaking it
+        would leak a server-side engine session with it.
+        """
+        response = getattr(ws, "_response", None)
+        connection = getattr(response, "connection", None)
+        transport = getattr(connection, "transport", None)
+        if transport is not None:
+            try:
+                transport.abort()
+            except (AttributeError, RuntimeError):
+                pass
+
+    async def _close_probe_socket(
+        self, ws: aiohttp.ClientWebSocketResponse
+    ) -> None:
+        """Close the probe socket without ever letting it affect the verdict.
+
+        The verdict was decided before this runs - by the dial and the
+        application-layer check - so nothing here may change it: a peer that
+        stalls its close handshake must not hold readiness open, and a hiccup
+        while closing must not turn a proven deployment into a failed one.
+        """
         try:
             await asyncio.wait_for(
                 ws.close(), timeout=self.READINESS_CLOSE_TIMEOUT_SECONDS
@@ -719,24 +1049,12 @@ class VoxistSTT(STT):
         except asyncio.CancelledError:
             raise
         except asyncio.TimeoutError:
-            # The peer accepted the probe, so readiness is already proven; a
-            # stalled close must not keep the caller waiting. Abort the
-            # underlying transport as the final cleanup step.
-            response = getattr(ws, "_response", None)
-            connection = getattr(response, "connection", None)
-            transport = getattr(connection, "transport", None)
-            if transport is not None:
-                try:
-                    transport.abort()
-                except (AttributeError, RuntimeError):
-                    pass
+            self._abort_probe_transport(ws)
             logger.warning(
                 "WebSocket readiness probe close timed out; aborted the "
                 "probe transport"
             )
         except Exception as e:
-            # Reachability is proven by the successful dial; a hiccup while
-            # closing the probe socket must not fail readiness.
             logger.debug(f"Closing the warm-up WebSocket failed: {e!r}")
 
     def stream(
@@ -849,7 +1167,25 @@ class VoxistSTT(STT):
         logger.info("Closing VoxistSTT plugin")
         # From here on, _ensure_dialer refuses to build a new session, so a
         # stream retry racing this shutdown dies as a mapped ConnectionError.
+        # _closed is also point 1 of the readiness definition, so this single
+        # assignment is what makes is_ready / initialization_state /
+        # check_initialization() all report a closed plugin as not ready. They
+        # used to consult only _init_state and _ws_validated, neither of which
+        # aclose() touches, so a torn-down plugin kept reporting itself healthy
+        # to readiness endpoints and supervisors while every stream() call
+        # raised RuntimeError at the caller's site.
         self._closed = True
+
+        # Readiness reports a cause, so give the deliberate shutdown one.
+        # A cause already on record explains the plugin's state better than
+        # "closed" does, so it is preserved. This is NOT routed through
+        # _record_init_failure: that stamps a retry timestamp, and a closed
+        # plugin must never look re-probable (see _may_retry_failed_readiness).
+        if self._init_error is None:
+            self._init_error = InitializationError(
+                "VoxistSTT was closed with aclose(); a closed plugin cannot "
+                "dial again - create a new instance"
+            )
 
         # Cancel pending initialization task if running (QUAL-HIGH:
         # asr-all-cga). The task may live on a dead or foreign loop (the
@@ -911,7 +1247,14 @@ class VoxistSTT(STT):
 
     @property
     def initialization_error(self) -> Exception | None:
-        """Return any error that occurred during initialization."""
+        """
+        The cause behind the current readiness verdict, or None when ready.
+
+        Projection of the one readiness definition (see above
+        _reachability_proven): it reports the recorded cause, which aclose()
+        also sets so a closed plugin explains itself rather than reporting a
+        bare None.
+        """
         return self._init_error
 
     @property
@@ -919,60 +1262,59 @@ class VoxistSTT(STT):
         """
         Return current initialization state (QUAL-002).
 
-        Returns:
-            InitializationState enum value:
+        Projection of the one readiness definition (see above
+        _reachability_proven) - NOT the raw state of the background warm-up
+        task. COMPLETED therefore means "ready", and only that:
+
             - NOT_STARTED: No event loop was available, init on demand
-            - PENDING: Task created but not yet started
-            - RUNNING: Initialization in progress
-            - COMPLETED: Successfully initialized
-            - FAILED: Initialization failed with error
+            - PENDING: Initialization is not finished. Either the warm-up task
+              has not started, or it has finished but the reachability proof
+              the configured contract requires has not run yet (the usual case
+              until something awaits wait_for_initialization()).
+            - RUNNING: The warm-up is in progress
+            - COMPLETED: Ready, by the full definition
+            - FAILED: A readiness failure is on record, or aclose() has run
+
+        Reporting the warm-up's raw state here is what let a deployment whose
+        WebSocket path is blocked read as COMPLETED: the token exchange is
+        plain HTTPS and succeeds there, so a health check on this property
+        called the plugin healthy while every stream() died on the dial.
         """
-        return self._init_state
+        return self._readiness_state()
 
     @property
     def is_ready(self) -> bool:
         """
-        Check if plugin is ready for use (QUAL-002).
+        Whether the plugin is ready for use (QUAL-002).
 
-        Returns True if:
-        - Background initialization completed successfully, OR
-        - Pool is initialized (via on-demand or context manager)
+        Projection of the one readiness definition (see above
+        _reachability_proven): True if and only if that definition holds. It
+        is not an independent opinion, and it must never become one - it used
+        to be, and consequently answered a different question from
+        initialization_state, most visibly after aclose(), which it ignored
+        entirely while stream() raised RuntimeError.
 
-        Returns False whenever initialization FAILED - including a failed
-        WebSocket reachability probe (see _validate_websocket_path), even
-        though the token itself was fetched: a deployment whose WS path is
-        blocked is not ready, whatever its HTTPS endpoint says.
-
-        FAILED reads as False even once the retry cooldown has elapsed: this
-        property is synchronous, so it cannot re-probe, and claiming
-        readiness it has not verified is exactly the lie [2] removed. A
+        Synchronous, so it can never re-probe: it reports the last VERIFIED
+        outcome, and both "failed" and "not verified yet" read as False. A
         transient failure becomes ready again on the next
         `await wait_for_initialization()`, which does re-probe.
 
         Returns:
             True if ready, False otherwise
         """
-        if self._init_state == InitializationState.FAILED:
-            return False
-        if self._validate_websocket:
-            # Token exchange is HTTPS-only. With the default readiness
-            # contract, a cached token is not enough: require either the
-            # explicit probe or a successful real stream dial.
-            return self._ws_validated
-        if self._init_state == InitializationState.COMPLETED:
-            return True
-        # In token-only mode, a token fetched on demand is sufficient.
-        return self._dialer is not None and self._dialer._token_url is not None
+        return self._readiness_state() == InitializationState.COMPLETED
 
     async def wait_for_initialization(self, timeout: float = 30.0) -> bool:
         """
         Wait for background initialization to complete (QUAL-002).
 
-        Beyond awaiting the token warm-up, this is the path that proves the
-        deployment end to end: unless validate_websocket=False, the first
-        successful call also dials one short-lived WebSocket (see
-        _validate_websocket_path) so True means "a stream can actually
-        connect", not merely "the HTTPS token endpoint answered".
+        The ONLY path that can establish readiness, and therefore the one a
+        health check or supervisor must await: beyond the token warm-up, the
+        first successful call proves the deployment end to end by dialing one
+        short-lived WebSocket and watching the application layer accept it
+        (see _validate_websocket_path), unless validate_websocket=False. Its
+        return value is the one readiness verdict - it is exactly
+        `is_ready` re-read after doing the work that could change it.
 
         FAILED is not terminal for transient causes ([2]). A single blip in
         the one-shot WS probe used to brick the plugin forever: this method
@@ -1001,6 +1343,13 @@ class VoxistSTT(STT):
             else:
                 logger.error(f"Init failed: {stt.initialization_error}")
         """
+        if self._closed:
+            # Point 1 of the readiness definition, checked before any work:
+            # nothing this method could do would make a closed plugin ready,
+            # and _ensure_dialer refuses anyway - so fail here rather than
+            # recording a fresh "cannot dial" failure per call.
+            return False
+
         if self._init_state == InitializationState.FAILED:
             if not self._may_retry_failed_readiness():
                 return False
@@ -1077,13 +1426,32 @@ class VoxistSTT(STT):
                 "WebSocket path does not)"
             )
             return False
-        return True
+        # is_ready, not a bare True: the verdict this method returns is read
+        # off the one predicate, so the two can never disagree.
+        return self.is_ready
 
     def check_initialization(self) -> None:
         """
-        Raise InitializationError if initialization failed (QUAL-002).
+        Raise InitializationError unless the plugin is READY (QUAL-002).
 
         Use this before operations that require successful initialization.
+
+        Projection of the one readiness definition (see above
+        _reachability_proven): it raises whenever that definition does not
+        hold, which - deliberately - includes the case where readiness has
+        simply never been verified. It used to raise only on a RECORDED
+        failure, and that made it useless for the job its own docstring
+        advertises: on a deployment whose WebSocket path is blocked, the HTTPS
+        token warm-up succeeds and records nothing, so this method stayed
+        silent and callers gating on it read the plugin as healthy while every
+        stream() died on the dial. Silence now means verified, and nothing
+        else.
+
+        The consequence, stated plainly: on a brand-new plugin this raises
+        until something has awaited wait_for_initialization() - the only call
+        that can verify readiness, and the one this method's own message points
+        at. Failing closed on unverified is the whole point; a caller who does
+        not want the guarantee should not be calling a checker.
 
         Synchronous, so it never re-probes: it reports the last VERIFIED
         outcome. A transient failure is recoverable - the message says so -
@@ -1091,12 +1459,23 @@ class VoxistSTT(STT):
         cooldown has elapsed. A rejected credential never clears.
 
         Raises:
-            InitializationError: If initialization failed
+            InitializationError: The plugin is not ready - it failed, it was
+                closed, or its readiness has not been verified yet.
 
         Example:
-            stt.check_initialization()  # Raises if failed
+            await stt.wait_for_initialization()
+            stt.check_initialization()  # Raises unless ready
             stream = stt.stream()
         """
+        if self.is_ready:
+            return
+
+        if self._closed:
+            raise InitializationError(
+                f"Plugin is not ready: {self._init_error}. A closed plugin "
+                "cannot become ready again - create a new instance."
+            ) from self._init_error
+
         if self._init_state == InitializationState.FAILED:
             if self._failure_is_permanent(self._init_error):
                 hint = (
@@ -1113,6 +1492,16 @@ class VoxistSTT(STT):
             raise InitializationError(
                 f"Plugin initialization failed: {self._init_error}. {hint}"
             ) from self._init_error
+
+        raise InitializationError(
+            "Plugin initialization is not verified "
+            f"(state: {self._readiness_state().value}). Nothing has failed, "
+            "but nothing has proved the deployment reachable either - the "
+            "token exchange is plain HTTPS and cannot. Await "
+            "wait_for_initialization() (it is cheap and cached after the "
+            "first call), or pass validate_websocket=False to accept the "
+            "token-only contract."
+        )
 
     async def __aenter__(self) -> VoxistSTT:
         """

@@ -717,9 +717,13 @@ class TestRingBufferOptimization:
             processor.process_audio_frame(frame)
         elapsed = time.perf_counter() - start
 
-        # Should process 100 x 100ms frames (10 seconds of audio) in < 50ms
-        # This is much faster than original concatenation approach
-        assert elapsed < 0.05, f"Processing too slow: {elapsed*1000:.2f}ms"
+        # 10 seconds of audio in well under a second. The bound is 10x
+        # looser than the nominal ~20ms so a loaded CI box cannot flake it
+        # (50ms absolute did, under consecutive full-suite runs), while an
+        # algorithmic regression to the original O(n^2) concatenation - the
+        # thing this test exists to catch - costs SECONDS at this volume and
+        # still goes red.
+        assert elapsed < 0.5, f"Processing too slow: {elapsed*1000:.2f}ms"
 
     def test_ring_buffer_wrap_around(self):
         """Test ring buffer correctly handles wrap-around."""

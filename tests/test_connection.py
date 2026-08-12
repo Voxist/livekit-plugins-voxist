@@ -1005,7 +1005,6 @@ class TestDialLimiterRegistryLifetime:
         dialer = make_dialer(
             first, max_dials_per_window=1, dial_rate_limit_window=0.6
         )
-        charged_at = time.perf_counter()
         assert await dialer.dial("fr", 16000) is ws
 
         # Job over: the only dialer for this credential goes away.
@@ -1047,26 +1046,30 @@ class TestDialLimiterRegistryLifetime:
             "credential - a drifted lookup key or a private instance gives "
             "every new job a fresh budget"
         )
-        remaining = 0.6 - (time.perf_counter() - charged_at)
-        started = time.perf_counter()
-        assert await successor.dial("fr", 16000) is ws
-        elapsed = time.perf_counter() - started
-        # charged_attempts is WINDOWED, not cumulative: by the time the
-        # successor's dial completes it has waited the first charge out of
-        # the sliding window, so the count reflects the successor's own
-        # charge (1), or both (2) if the wait was short. Zero means the
-        # successor never charged the shared limiter at all.
-        assert limiter.charged_attempts >= 1, (
-            "the successor's dial was not charged to the shared window"
+        # The charge witness is a SPY on the shared limiter's acquire - no
+        # clocks, no windows. Two prior witnesses were vacuous: a wall-clock
+        # lower bound was satisfied by teardown time alone, and a
+        # charged-attempts count was satisfied by the predecessor's un-aged
+        # charge in exactly the 0.5-0.6s band where the timing branch was
+        # skipped. A skipped-acquire regression passes both; it cannot pass
+        # a call spy on the object the identity assert just proved shared.
+        acquire_calls = []
+        original_acquire = limiter.acquire
+
+        async def spying_acquire(*a, **kw):
+            acquire_calls.append(True)
+            return await original_acquire(*a, **kw)
+
+        limiter.acquire = spying_acquire
+        try:
+            assert await successor.dial("fr", 16000) is ws
+        finally:
+            del limiter.acquire  # restore the class method
+
+        assert acquire_calls, (
+            "the successor's dial never consulted the shared limiter: every "
+            "new job gets a fresh budget"
         )
-        if remaining > 0.1:
-            # Only meaningful when the slot had genuinely not aged out yet;
-            # under heavy load the teardown alone can consume the window,
-            # and then there is legitimately nothing to wait for.
-            assert elapsed >= remaining - 0.05, (
-                f"the successor dialed in {elapsed:.3f}s with {remaining:.3f}s "
-                "of the shared window still unexpired"
-            )
 
     def test_a_charged_limiter_outlives_gc_but_an_idle_one_is_evicted(
         self, monkeypatch

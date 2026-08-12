@@ -4638,3 +4638,82 @@ class TestRoundSixteenRegressions:
             "unreadable text through the drain was read as quiet cadence "
             "and certified clean - protocol drift must fail loudly"
         )
+
+
+class TestRoundSeventeenRegressions:
+    """
+    Round 17's findings: the drift guard covered one drain exit out of
+    three, and drift evidence died with the attempt that saw it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_drifted_finals_are_never_certified_clean(self):
+        """
+        Round-17 finding 0. A drifted engine's non-string-text FINALS
+        conclude the drain through the answered paths - untouched by the
+        quiet check - and every verdict fact read clean: certified empty
+        over undeciphered speech, on every session once the drift ships.
+        Unreadable text now latches a session known-loss fact that bars
+        both quiet tiers.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.1)
+            # The engine "answers" - with text nobody can read.
+            ws.feed_json({"type": "final", "text": 123, "segment": 0})
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+
+        task = asyncio.create_task(scenario())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert not stream._session_complete, (
+            "a drifted final concluded the drain and was certified as a "
+            "clean empty session - undeciphered speech lost silently"
+        )
+
+    @pytest.mark.asyncio
+    async def test_drift_seen_by_a_dead_attempt_still_bars_the_verdict(self):
+        """
+        Round-17 finding 1. Drift partials seen mid-decode by attempt 1
+        latched nothing session-scoped, so the retry's clean ending
+        certified the loss. The unreadable-text fact is sticky now.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        # What attempt 1 leaves behind after seeing {"text": 123} partials:
+        stream._unreadable_text_seen_in_session = True
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert not stream._session_complete

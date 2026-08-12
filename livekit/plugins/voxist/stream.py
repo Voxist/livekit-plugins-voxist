@@ -508,6 +508,10 @@ class VoxistSTTStream(RecognizeStream):
         # empty session (A's delivery zeroed the undelivered-text bar, the
         # reset zeroed the segment bar).
         self._unfinalized_text_in_session = False
+        # A transcript's "text" was present but unreadable (non-string) at
+        # any point this session. Its content is lost by definition; see the
+        # latch in _process_result.
+        self._unreadable_text_seen_in_session = False
         self._interim_delivered_before_this_attempt = False
         self._final_received_this_attempt = False
         self._interim_received_this_attempt = False
@@ -1240,12 +1244,18 @@ class VoxistSTTStream(RecognizeStream):
                 ),
                 engine_answered=self._last_final_at is not None,
                 undelivered_text_seen=(
-                    # _speaking implies the session latch (one latch site
-                    # sets both), so the latch alone carries "seen"; minus
-                    # anything delivered, it is a known loss.
-                    self._text_seen_in_session
-                    and not self._final_delivered_in_session
-                    and not self._interim_delivered_in_session
+                    # Two known-loss routes. Readable text: seen minus
+                    # anything delivered (_speaking implies the session
+                    # latch, so the latch alone carries "seen"). Unreadable
+                    # text: lost by definition the moment it was seen -
+                    # delivery flags cannot excuse content nobody could
+                    # decode.
+                    (
+                        self._text_seen_in_session
+                        and not self._final_delivered_in_session
+                        and not self._interim_delivered_in_session
+                    )
+                    or self._unreadable_text_seen_in_session
                 ),
                 unanswered_tail_seconds=(
                     self._bytes_sent_since_progress
@@ -1372,8 +1382,10 @@ class VoxistSTTStream(RecognizeStream):
                     logger.warning(
                         f"Stream {self._session_id} completing with an "
                         f"unfinalized engine segment: {outcome.detail} - the "
-                        "engine opened a segment it never finalized, so the "
-                        "trailing utterance IS missing from the transcript"
+                        "engine transcribed an utterance it never finalized, "
+                        "so that utterance IS missing from the transcript "
+                        "(at the tail, or mid-session if a failed attempt "
+                        "left it behind)"
                     )
                 elif not outcome.concluded:
                     logger.warning(
@@ -2455,8 +2467,12 @@ class VoxistSTTStream(RecognizeStream):
         (it emits pub/sub redirect frames like {"type": "redirect", ...}, and
         valid JSON need not be an object at all). An unexpected frame must
         never crash the receive loop - non-dict frames are ignored at debug,
-        a non-string "text" (e.g. {"text": null}) is treated as absent, and
-        unknown "type" values take the warn path below.
+        and unknown "type" values take the warn path below. "text" handling
+        is three-way: a string is the transcript; an ABSENT or NULL text is
+        cadence emptiness; a PRESENT-but-non-string text (protocol drift) is
+        unreadable transcript content - it denies the drain's quiet check
+        and latches a session-scoped known-loss fact, because content nobody
+        can decode must fail loudly, never certify a clean empty session.
 
         Args:
             data: Parsed JSON message from Voxist (any JSON value)
@@ -2502,6 +2518,15 @@ class VoxistSTTStream(RecognizeStream):
         malformed_text = raw_text is not None and not isinstance(
             raw_text, str
         )
+        if is_transcript and malformed_text:
+            # SESSION-scoped and never reset: a transcript whose text the
+            # plugin cannot read is transcript content that will never reach
+            # the caller, whatever else happens - drift on FINALS concluded
+            # the drain through the answered paths (untouched by the quiet
+            # check) and was certified clean, and drift seen by a dead
+            # attempt left no evidence at all. This latch bars both quiet
+            # tiers via the known-loss fact below.
+            self._unreadable_text_seen_in_session = True
         if is_transcript and (text or malformed_text):
             # Any text-bearing transcript proves the engine is mid-speech
             # decode; the drain's quiet check keys on this, never on the

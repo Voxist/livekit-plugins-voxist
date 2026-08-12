@@ -54,3 +54,4 @@ Thumbs.db
 CLAUDE.md
 .playwright-mcp/
 examples/test_staging.py
+uv.lock

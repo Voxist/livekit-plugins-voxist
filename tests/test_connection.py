@@ -1030,20 +1030,43 @@ class TestDialLimiterRegistryLifetime:
             "the entry survived but its charge did not"
         )
 
-        # Next job, same credential: it may only complete once the shared
-        # window's slot has aged out - measured from the CHARGE, which is
-        # load-immune in the safe direction (delay anywhere in between only
-        # makes the total larger).
+        # Next job, same credential. The wait itself is witnessed by
+        # IDENTITY and by the CHARGE, never by wall clock: a timing lower
+        # bound measured from the first charge was vacuously satisfied
+        # whenever teardown+gc themselves exceeded it (the loaded-suite
+        # condition this test exists for), and it could not catch a
+        # successor that built a different lookup key or a private limiter -
+        # both leave the original entry intact while dialing on a fresh
+        # budget.
         second = FakeSession(responses=[token_response("t")], ws_results=[ws])
         successor = make_dialer(
             second, max_dials_per_window=1, dial_rate_limit_window=0.6
         )
-        assert await successor.dial("fr", 16000) is ws
-        total_since_charge = time.perf_counter() - charged_at
-        assert total_since_charge >= 0.55, (
-            f"the successor completed {total_since_charge:.3f}s after the "
-            "charge, inside the 0.6s window - it was given a fresh budget"
+        assert successor._rate_limiter is limiter, (
+            "the successor resolved a DIFFERENT limiter for the same "
+            "credential - a drifted lookup key or a private instance gives "
+            "every new job a fresh budget"
         )
+        remaining = 0.6 - (time.perf_counter() - charged_at)
+        started = time.perf_counter()
+        assert await successor.dial("fr", 16000) is ws
+        elapsed = time.perf_counter() - started
+        # charged_attempts is WINDOWED, not cumulative: by the time the
+        # successor's dial completes it has waited the first charge out of
+        # the sliding window, so the count reflects the successor's own
+        # charge (1), or both (2) if the wait was short. Zero means the
+        # successor never charged the shared limiter at all.
+        assert limiter.charged_attempts >= 1, (
+            "the successor's dial was not charged to the shared window"
+        )
+        if remaining > 0.1:
+            # Only meaningful when the slot had genuinely not aged out yet;
+            # under heavy load the teardown alone can consume the window,
+            # and then there is legitimately nothing to wait for.
+            assert elapsed >= remaining - 0.05, (
+                f"the successor dialed in {elapsed:.3f}s with {remaining:.3f}s "
+                "of the shared window still unexpired"
+            )
 
     def test_a_charged_limiter_outlives_gc_but_an_idle_one_is_evicted(
         self, monkeypatch

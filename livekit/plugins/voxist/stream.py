@@ -501,6 +501,13 @@ class VoxistSTTStream(RecognizeStream):
         # A transcript frame carried text at ANY point this session. Session
         # scope on purpose; see the latch in _process_result.
         self._text_seen_in_session = False
+        # A text-bearing segment was left unfinalized by SOME attempt this
+        # session. Latched at the per-attempt reset, because the reset
+        # destroys the per-attempt segment evidence - and destroying it let
+        # an A-delivered-B-lost retry certify B's known loss as a clean
+        # empty session (A's delivery zeroed the undelivered-text bar, the
+        # reset zeroed the segment bar).
+        self._unfinalized_text_in_session = False
         self._interim_delivered_before_this_attempt = False
         self._final_received_this_attempt = False
         self._interim_received_this_attempt = False
@@ -621,6 +628,11 @@ class VoxistSTTStream(RecognizeStream):
         self._last_final_at = None
         self._finals_count_this_attempt = 0
         self._last_text_transcript_at = None
+        # Before the segment evidence is destroyed for the new socket, any
+        # unfinalized TEXT it records becomes a sticky session fact - the
+        # evidence dies with the attempt, the loss does not.
+        if self._trailing_segment_unfinalized:
+            self._unfinalized_text_in_session = True
         # The engine restarts segment numbering at 0 on a NEW socket, so
         # stale maxima from a dead attempt defeat the trailing-loss detector
         # in both directions: a high stale _finalized_segment swallows a real
@@ -1222,7 +1234,10 @@ class VoxistSTTStream(RecognizeStream):
                 detail=detail,
                 audio_was_dropped=self._dropped_frames > 0,
                 engine_reported_empty=self._engine_reported_empty_this_attempt,
-                trailing_segment_unfinalized=self._trailing_segment_unfinalized,
+                trailing_segment_unfinalized=(
+                    self._trailing_segment_unfinalized
+                    or self._unfinalized_text_in_session
+                ),
                 engine_answered=self._last_final_at is not None,
                 undelivered_text_seen=(
                     # _speaking implies the session latch (one latch site
@@ -1252,7 +1267,10 @@ class VoxistSTTStream(RecognizeStream):
             # turn a dead attempt swallowed as "legitimately empty".
             audio_was_dropped=self._dropped_frames > 0,
             engine_reported_empty=False,
-            trailing_segment_unfinalized=self._trailing_segment_unfinalized,
+            trailing_segment_unfinalized=(
+                self._trailing_segment_unfinalized
+                or self._unfinalized_text_in_session
+            ),
         )
 
     def _finish_session(self, outcome: _SessionOutcome) -> None:
@@ -1275,7 +1293,10 @@ class VoxistSTTStream(RecognizeStream):
           3. nothing delivered, the exchange
              concluded AND the engine answered
              for this audio with nothing but
-             empty transcripts                  -> success, empty: the engine
+             empty transcripts, AND no text was
+             seen-and-lost this session, no
+             segment left unfinalized, nothing
+             dropped by us                       -> success, empty: the engine
                                                    processed the audio and
                                                    found nothing to
                                                    transcribe
@@ -1284,8 +1305,10 @@ class VoxistSTTStream(RecognizeStream):
              but its last stretch of audio
              (<= WEDGE_FATAL_UNANSWERED_SECONDS)
              went unanswered, and no text was
-             ever seen, no segment left open,
-             nothing dropped by us             -> success WITH a warning
+             seen-and-LOST this session
+             (delivered text does not bar), no
+             segment left open, nothing
+             dropped by us                     -> success WITH a warning
                                                    naming the unanswered
                                                    window: the ambiguous
                                                    middle, where a loaded
@@ -1378,6 +1401,7 @@ class VoxistSTTStream(RecognizeStream):
                 outcome.concluded
                 and outcome.engine_reported_empty
                 and not outcome.undelivered_text_seen
+                and not outcome.trailing_segment_unfinalized
                 and not outcome.audio_was_dropped
             ):
                 # The engine answered for this audio and its answer was
@@ -2468,7 +2492,17 @@ class VoxistSTTStream(RecognizeStream):
         # and an error frame can too; latching on either opened a speech turn
         # no transcript would ever close, leaving the caller waiting for an
         # END_OF_SPEECH that only arrives at session teardown.
-        if is_transcript and text:
+        # Present-but-unreadable text counts as text here. The quiet stamp
+        # exists so only the EMPTY cadence reads as quiet; a "text" field
+        # that is present but non-string is protocol drift the plugin cannot
+        # interpret, and treating it as emptiness let a drifted engine's
+        # traffic manufacture a clean-empty conclusion where the previous
+        # behaviour failed loudly. Only a genuinely empty text (absent,
+        # null, or "") is cadence.
+        malformed_text = raw_text is not None and not isinstance(
+            raw_text, str
+        )
+        if is_transcript and (text or malformed_text):
             # Any text-bearing transcript proves the engine is mid-speech
             # decode; the drain's quiet check keys on this, never on the
             # empty cadence.

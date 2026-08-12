@@ -2854,19 +2854,22 @@ class TestBacklogBoundIsHard:
             for t in (prod, fin):
                 t.cancel()
 
-        # x6, not x3: with batched pushes a single stretched send can admit
-        # two or three 30-frame batches before the drop loop engages. The
-        # regression this bound exists for is UNBOUNDED growth (measured
-        # peak 9928 against a nominal 50 in the round-9 version) - 300 vs
-        # 9928 is the discrimination that matters, not 150 vs 180.
-        assert peak <= cap_frames * 6, (
+        # x4: batch granularity can admit two or three 30-frame batches
+        # during one stretched send, but a bound that engages LATE (a
+        # 250-300 peak regression) must still go red - x6 would have let it
+        # pass. The drop-share witness below is the second jaw of the same
+        # clamp: a bound that drops only every other frame keeps the peak
+        # low but sheds far less.
+        assert peak <= cap_frames * 4, (
             f"backlog reached {peak} frames against a bound of ~{cap_frames}: "
             "the ceiling is not holding, so a long call would grow the "
             "channel until OOM"
         )
-        assert stream.dropped_frames > 0, (
-            "an overwhelmed uplink must actually drop, or the test proves "
-            "nothing about the bound"
+        assert stream.dropped_frames >= 700, (
+            f"only {stream.dropped_frames} of 1200 frames were dropped "
+            "against a 50-frame cap with a ~6x-overloaded uplink: the bound "
+            "is shedding a fraction of what it must, which a bare "
+            "dropped>0 guard could not see"
         )
 
 
@@ -3734,19 +3737,32 @@ class TestRoundElevenRegressions:
     # ---- Findings 3 and 9: the per-attempt resets, behaviourally
 
     @pytest.mark.asyncio
-    async def test_stale_segment_maxima_do_not_invent_a_loss(self, caplog):
+    async def test_a_dead_attempts_numbers_do_not_corrupt_the_next_attempts(
+        self, caplog
+    ):
         """
-        Fails if the segment reset is deleted from _run's per-attempt block:
-        the stale _open_segment from a dead attempt then reads as an
-        unfinalized utterance in an attempt that finalized everything.
+        Re-premised in round 16. This test originally asserted that a dead
+        attempt's segment maxima must produce NO warning ("invent a loss") -
+        but those maxima are EVIDENCE, not garbage: segments open only on
+        text partials and close only on text finals, so open > finalized at
+        attempt death means text genuinely went unfinalized, and round 16
+        made that fact sticky precisely because forgetting it let the
+        A-delivered-B-lost shape certify clean. The warning is now CORRECT.
+
+        What round 11 validly established survives as the assertion below:
+        the dead attempt's numbering must not corrupt the NEW attempt's own
+        per-attempt accounting - attempt 2 finalizes its segment 0 and its
+        per-attempt trailing check must read clean, whatever the session
+        remembers.
         """
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
-        # State a dead attempt left behind (engine numbering restarts at 0
-        # on the new socket, so these can never be caught up).
+        # A dead attempt's evidence: text was partial'd into segment 5 and
+        # never finalized (numbers only move on text - this is not garbage).
         stream._open_segment = 5
         stream._finalized_segment = 2
+        stream._text_seen_in_session = True
 
         async def scenario():
             stream._input_ch.send_nowait(speech_frame())
@@ -3761,13 +3777,32 @@ class TestRoundElevenRegressions:
             )
 
         task = asyncio.create_task(scenario())
-        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
-            await asyncio.wait_for(stream._run(), timeout=10.0)
-        await task
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="livekit.plugins.voxist"
+            ):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
-        assert not any(
+        assert stream._session_complete, "attempt 2 delivered its final"
+        # The isolation property round 11 was actually about: the new
+        # attempt's own accounting is clean (its segment 0 was finalized) -
+        # the dead attempt's 5-vs-2 did not leak into the per-attempt facts.
+        assert not stream._trailing_segment_unfinalized, (
+            "attempt 2 finalized everything it saw; a dead attempt's "
+            "numbers corrupted the per-attempt comparison"
+        )
+        # And the session-level warning for the dead attempt's genuinely
+        # unfinalized text is PRESENT - it is evidence, not an invention.
+        assert any(
             "unfinalized engine segment" in r.message for r in caplog.records
-        ), "a dead attempt's segment numbers invented a loss in this one"
+        ), (
+            "text the dead attempt saw and never saw finalized must be "
+            "surfaced, or A-delivered-B-lost certifies clean (round 16)"
+        )
 
     @pytest.mark.asyncio
     async def test_stale_segment_maxima_do_not_swallow_a_loss(self, caplog):
@@ -4443,7 +4478,7 @@ class TestRoundFifteenRegressions:
 
     @pytest.mark.asyncio
     async def test_empty_cadence_through_the_drain_is_still_quiet(
-        self, monkeypatch
+        self, monkeypatch, caplog
     ):
         """
         Round-15 finding 2. Keying the backstop's quiet check on ANY
@@ -4477,7 +4512,8 @@ class TestRoundFifteenRegressions:
 
         task = asyncio.create_task(scenario())
         try:
-            await asyncio.wait_for(stream._run(), timeout=10.0)
+            with caplog.at_level(logging.INFO, logger="livekit.plugins.voxist"):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -4487,4 +4523,118 @@ class TestRoundFifteenRegressions:
             "an empty cadence through the drain is a healthy quiet engine; "
             "reading it as 'still talking' sent a silent participant to the "
             "terminal raise"
+        )
+        # WHICH tier matters as much as completing: this is the clean-empty
+        # certificate, and landing in the warn-complete middle tier instead
+        # would log a possible-loss warning on every silent participant's
+        # turn - the misdiagnosis the INFO/WARNING split exists to prevent.
+        assert any(
+            "empty session, not a lost one" in r.message
+            for r in caplog.records
+        ), "the healthy quiet session must be CERTIFIED clean, not warned"
+        assert not any(
+            "had not answered the last" in r.message for r in caplog.records
+        )
+
+
+class TestRoundSixteenRegressions:
+    """
+    Round 16's findings: delivery anywhere in the session unbarred every
+    later loss, and protocol-drifted text manufactured a clean conclusion.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_delivered_then_lost_session_is_never_certified_clean(
+        self, caplog
+    ):
+        """
+        Round-16 finding 0, the A-delivered-B-lost shape. Attempt 1
+        delivered A's final, saw B's text partial, and died before B's
+        final; the retry's room noise ended cleanly. A's delivery zeroed
+        the undelivered-text bar and the per-attempt reset destroyed B's
+        segment evidence, so B's KNOWN loss took the clean-empty INFO.
+        The segment evidence is sticky across attempts now.
+        """
+        ws = FakeWS()
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+        # Attempt 1's end-state, exactly as it dies: A delivered, B's text
+        # partial seen, B's segment open and unfinalized.
+        stream._final_received = True
+        stream._text_seen_in_session = True
+        stream._open_segment = 1
+        stream._finalized_segment = 0
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        try:
+            with caplog.at_level(
+                logging.INFO, logger="livekit.plugins.voxist"
+            ):
+                with pytest.raises(TranscriptLostError):
+                    await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert not any(
+            "empty session, not a lost one" in r.message
+            for r in caplog.records
+        ), (
+            "B's loss was certified clean because A's delivery zeroed the "
+            "text bar and the reset destroyed the segment evidence"
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_text_partials_deny_the_quiet(self, monkeypatch):
+        """
+        Round-16 finding 1. Partials whose "text" is present but non-string
+        did not stamp the text timestamp, so a drifted engine's traffic read
+        as 'quiet by definition' and the acked backstop certified a clean
+        empty session where the previous behaviour failed loudly. Unreadable
+        text is text; only genuine emptiness is cadence.
+        """
+        monkeypatch.setattr(
+            VoxistSTTStream, "SESSION_DRAIN_TIMEOUT_SECONDS", 0.8, raising=False
+        )
+        ws = FakeWS()  # never closes
+        stream = await make_stream(dial=AsyncMock(return_value=ws))
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.05)
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
+            # Protocol drift: text present but non-string, forever.
+            while True:
+                ws.feed_json({"type": "partial", "text": 123})
+                await asyncio.sleep(0.1)
+
+        task = asyncio.create_task(scenario())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert not stream._session_complete, (
+            "unreadable text through the drain was read as quiet cadence "
+            "and certified clean - protocol drift must fail loudly"
         )

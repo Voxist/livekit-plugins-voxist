@@ -4688,32 +4688,110 @@ class TestRoundSeventeenRegressions:
     @pytest.mark.asyncio
     async def test_drift_seen_by_a_dead_attempt_still_bars_the_verdict(self):
         """
-        Round-17 finding 1. Drift partials seen mid-decode by attempt 1
-        latched nothing session-scoped, so the retry's clean ending
-        certified the loss. The unreadable-text fact is sticky now.
+        Round-17 finding 1, driven BEHAVIOURALLY across two real attempts -
+        and via a malformed PARTIAL, the one latch path no other test
+        exercises (round 18 mutation-verified that narrowing the latch to
+        finals left the whole suite green while this was a flag-poke).
+
+        Attempt 1 sees {"text": 123} partials mid-decode and dies on a
+        socket error; attempt 2 ends cleanly and quietly. The session must
+        still refuse the clean certificate.
+        """
+        ws1, ws2 = FakeWS(), FakeWS()
+        stream = await make_stream(dial=AsyncMock(side_effect=[ws1, ws2]))
+        mock_event_ch(stream)
+
+        async def attempt_one():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            # Drifted PARTIAL, mid-decode - then the socket dies, exactly as
+            # aiohttp reports it (an ERROR message from the iterator).
+            ws1.feed_json({"type": "partial", "text": 123, "segment": 0})
+            await asyncio.sleep(0.05)
+            ws1.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.ERROR, data=None)
+            )
+
+        task1 = asyncio.create_task(attempt_one())
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task1
+        assert stream._unreadable_text_seen_in_session, (
+            "the premise needs attempt 1's PARTIAL to have latched the "
+            "session fact"
+        )
+
+        async def attempt_two():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws2.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws2.end()
+
+        task2 = asyncio.create_task(attempt_two())
+        try:
+            with pytest.raises(TranscriptLostError):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task2.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task2
+
+        assert not stream._session_complete
+
+    @pytest.mark.asyncio
+    async def test_delivered_finals_do_not_silence_a_known_loss(self, caplog):
+        """
+        Round-18 finding 0. A delivered final for utterance A followed by
+        unreadable drift on utterance B landed in case 1 - which outranks
+        the quiet tiers - and its only warning conditions were the segment
+        fact (drift opens no segment) and not-concluded. B's KNOWN loss
+        completed in total silence behind A's clean success.
         """
         ws = FakeWS()
         stream = await make_stream(dial=AsyncMock(return_value=ws))
         mock_event_ch(stream)
-        # What attempt 1 leaves behind after seeing {"text": 123} partials:
-        stream._unreadable_text_seen_in_session = True
 
         async def scenario():
             stream._input_ch.send_nowait(speech_frame())
             await asyncio.sleep(0.05)
-            ws.feed_json({"type": "final", "text": "", "segment": 0})
+            # A delivers cleanly...
+            ws.feed_json({"type": "partial", "text": "bonjour", "segment": 0})
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
             await asyncio.sleep(0.05)
-            stream._input_ch.close()
+            # ...then the engine drifts on B.
+            ws.feed_json({"type": "partial", "text": 123, "segment": 1})
             await asyncio.sleep(0.05)
-            ws.end()
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.1)
+            ws.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            ws.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data="Done!")
+            )
 
         task = asyncio.create_task(scenario())
         try:
-            with pytest.raises(TranscriptLostError):
+            with caplog.at_level(
+                logging.WARNING, logger="livekit.plugins.voxist"
+            ):
                 await asyncio.wait_for(stream._run(), timeout=10.0)
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-        assert not stream._session_complete
+        assert stream._session_complete, "A's delivery keeps the session up"
+        assert any(
+            "KNOWN lost" in r.message for r in caplog.records
+        ), (
+            "B's unreadable drift completed in total silence behind A's "
+            "delivered final"
+        )
+        # And the drift itself was surfaced at detection (round-18
+        # finding 1) - the on-call signal that this is schema drift, not a
+        # wedge.
+        assert any(
+            "protocol drift" in r.message for r in caplog.records
+        )

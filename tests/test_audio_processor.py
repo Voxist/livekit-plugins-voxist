@@ -711,19 +711,34 @@ class TestRingBufferOptimization:
             processor.process_audio_frame(frame)
         processor.reset()
 
-        # Benchmark
+        # The STRUCTURAL pin, because wall clock cannot discriminate here:
+        # the O(n^2) per-frame-concatenation regression this test guards
+        # against was MEASURED at ~0.4ms for this whole volume (16MB of
+        # copies is nothing to numpy), so both the original 50ms bound and
+        # any load-proof bound are decorative against it. What actually
+        # distinguishes the ring design is allocation-freedom: the buffer is
+        # created once and never replaced, while the concatenation approach
+        # rebuilds an array every frame. Identity and size are asserted
+        # across the run - deterministic, load-immune, and red under the
+        # regression by construction.
+        buffer_id = id(processor._ring_buffer)
+        buffer_size = processor._ring_buffer.size
+
         start = time.perf_counter()
         for frame in frames:
             processor.process_audio_frame(frame)
         elapsed = time.perf_counter() - start
 
-        # 10 seconds of audio in well under a second. The bound is 10x
-        # looser than the nominal ~20ms so a loaded CI box cannot flake it
-        # (50ms absolute did, under consecutive full-suite runs), while an
-        # algorithmic regression to the original O(n^2) concatenation - the
-        # thing this test exists to catch - costs SECONDS at this volume and
-        # still goes red.
-        assert elapsed < 0.5, f"Processing too slow: {elapsed*1000:.2f}ms"
+        assert id(processor._ring_buffer) == buffer_id, (
+            "the ring buffer was replaced mid-stream: per-frame reallocation "
+            "is the concatenation regression this test exists to catch"
+        )
+        assert processor._ring_buffer.size == buffer_size
+
+        # Wall clock survives only as a gross smoke bound (10s of audio in
+        # under a second), stated for what it is - it cannot catch the
+        # concatenation regression and does not claim to.
+        assert elapsed < 1.0, f"Processing too slow: {elapsed*1000:.2f}ms"
 
     def test_ring_buffer_wrap_around(self):
         """Test ring buffer correctly handles wrap-around."""

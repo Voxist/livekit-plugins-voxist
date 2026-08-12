@@ -182,6 +182,7 @@ class _SessionOutcome:
     trailing_segment_unfinalized: bool = False
     engine_answered: bool = False
     undelivered_text_seen: bool = False
+    unreadable_text_seen: bool = False
     unanswered_tail_seconds: float = 0.0
 
 
@@ -1165,11 +1166,14 @@ class VoxistSTTStream(RecognizeStream):
         and read only after both tasks have ended, and a quiet participant
         passes because the engine keeps punctuating.
 
-        Remaining ambiguity, unresolved on purpose: a frame whose "text" is
-        malformed rather than absent (renamed field, null, numeric) reads as
-        empty, because _process_result cannot tell "the engine said nothing"
-        from "we could not read what it said". Detecting protocol drift
-        belongs in frame validation, not here.
+        Malformed text does NOT slip through this property unnoticed: a
+        present-but-non-string "text" latches a session-scoped known-loss
+        fact at the classification site (_unreadable_text_seen_in_session),
+        and the gate bars both quiet tiers on it - so even when this
+        property reads True for a drifted session (final seen, no readable
+        text, small tail), the clean certificate is refused one step later.
+        This property states only "the engine's answer read as empty"; the
+        gate decides whether that emptiness may be believed.
         """
         if self._last_final_at is None or self._speaking:
             return False
@@ -1257,6 +1261,7 @@ class VoxistSTTStream(RecognizeStream):
                     )
                     or self._unreadable_text_seen_in_session
                 ),
+                unreadable_text_seen=self._unreadable_text_seen_in_session,
                 unanswered_tail_seconds=(
                     self._bytes_sent_since_progress
                     / (self.WIRE_SAMPLE_RATE * 2)
@@ -1387,6 +1392,18 @@ class VoxistSTTStream(RecognizeStream):
                         "(at the tail, or mid-session if a failed attempt "
                         "left it behind)"
                     )
+                elif outcome.undelivered_text_seen:
+                    # Delivered finals outrank the quiet tiers, but a KNOWN
+                    # loss elsewhere in the session must not vanish behind
+                    # them: unreadable drift after a delivered utterance
+                    # latched this fact and used to complete in silence here.
+                    logger.warning(
+                        f"Stream {self._session_id} completing on the finals "
+                        f"already delivered: {outcome.detail} - but other "
+                        "transcript content this session is KNOWN lost "
+                        "(text seen and never delivered, or transcript "
+                        "frames whose text was unreadable)"
+                    )
                 elif not outcome.concluded:
                     logger.warning(
                         f"Stream {self._session_id} completing on the finals "
@@ -1483,9 +1500,16 @@ class VoxistSTTStream(RecognizeStream):
                 # on every silent participant: a crashed engine and a
                 # heartbeat death both return NOTHING, and both still land
                 # here.
+                drift_note = (
+                    " (transcript frames with unreadable 'text' were seen "
+                    "this session - suspect a protocol/schema change, not "
+                    "an engine wedge)"
+                    if outcome.unreadable_text_seen
+                    else ""
+                )
                 raise TranscriptLostError(
                     "no transcript was produced for audio that cannot be "
-                    f"replayed: {outcome.detail}"
+                    f"replayed: {outcome.detail}{drift_note}"
                 )
             elif not outcome.concluded:
                 # Nothing was lost, but the exchange never finished on the
@@ -2526,6 +2550,18 @@ class VoxistSTTStream(RecognizeStream):
             # check) and was certified clean, and drift seen by a dead
             # attempt left no evidence at all. This latch bars both quiet
             # tiers via the known-loss fact below.
+            if not self._unreadable_text_seen_in_session:
+                # Once per session, at detection - this is the one place the
+                # DRIFT itself is visible. Without it the only artifact was
+                # a wedge-flavoured fatal, and on-call escalated against
+                # backend availability while the actual cause (a text-field
+                # schema change) went unmentioned in every log.
+                logger.warning(
+                    f"Stream {self._session_id} received a transcript whose "
+                    f"'text' is not a string ({type(raw_text).__name__}) - "
+                    "protocol drift; that content cannot be delivered and "
+                    "the session will not be reported clean"
+                )
             self._unreadable_text_seen_in_session = True
         if is_transcript and (text or malformed_text):
             # Any text-bearing transcript proves the engine is mid-speech

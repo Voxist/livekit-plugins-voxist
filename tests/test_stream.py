@@ -4856,3 +4856,49 @@ class TestRoundSeventeenRegressions:
             "the session branch defaulted the loss facts and the retry "
             "re-silenced the round-18 warning"
         )
+
+    @pytest.mark.asyncio
+    async def test_interims_only_sessions_also_surface_the_drift(self, caplog):
+        """
+        Round-20's residual: case 2 (interims-only) never echoed the drift
+        flag, so unreadable-drift known loss completed on that path with only
+        the detection-time log. Same rule as case 1: loud on every path out.
+        """
+        config = dict(DEFAULT_CONFIG, interim_results=True)
+        ws = FakeWS()
+        stream = await make_stream(
+            dial=AsyncMock(return_value=ws), config=config
+        )
+        mock_event_ch(stream)
+
+        async def scenario():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            # Text reaches the caller as an interim; no final ever follows.
+            ws.feed_json({"type": "partial", "text": "bonjour", "segment": 0})
+            await asyncio.sleep(0.05)
+            # Then the engine drifts.
+            ws.feed_json({"type": "partial", "text": 123, "segment": 1})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()  # -> Done
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="livekit.plugins.voxist"
+            ):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        assert stream._session_complete, "interims reached the caller"
+        assert any(
+            "KNOWN lost" in r.message for r in caplog.records
+        ), (
+            "the interims-only tier completed a drift-known loss with no "
+            "gate-level drift mention"
+        )

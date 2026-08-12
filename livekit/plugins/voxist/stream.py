@@ -147,8 +147,12 @@ class _SessionOutcome:
             on-call chases the schema change instead of a wedge, and no
             decision branch may read it - the DECIDING fact for drift is
             undelivered_text_seen, which it feeds.
-        undelivered_text_seen: A transcript frame carried text at some point
-            THIS SESSION, and nothing was ever delivered to the caller. That
+        undelivered_text_seen: Text this session is KNOWN to have lost, by
+            either route: a transcript frame carried readable text and
+            nothing was ever delivered to the caller, OR a frame's text was
+            present but unreadable (drift) - the second route holds even
+            when other content WAS delivered, so this field and
+            delivered_final are not mutually exclusive. That
             conjunction is a KNOWN loss, not an ambiguous tail - it bars both
             the clean-empty certificate and the middle verdict. The first
             version of this fact was "text was seen" alone, which failed in
@@ -1450,6 +1454,16 @@ class VoxistSTTStream(RecognizeStream):
                     "read only FINAL_TRANSCRIPT events will see this "
                     "session's tail as lost"
                 )
+                if outcome.undelivered_text_seen:
+                    # Same rule as the delivered-final tier: a KNOWN loss is
+                    # loud on every path out. On this branch too only the
+                    # unreadable route reaches here (delivered interims zero
+                    # the readable conjunction).
+                    logger.warning(
+                        f"Stream {self._session_id} - transcript frames with "
+                        "unreadable text were also seen this session "
+                        "(protocol drift), and that content is KNOWN lost"
+                    )
             elif (
                 outcome.concluded
                 and outcome.engine_reported_empty

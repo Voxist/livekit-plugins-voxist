@@ -721,7 +721,13 @@ class TestRingBufferOptimization:
         # rebuilds an array every frame. Identity and size are asserted
         # across the run - deterministic, load-immune, and red under the
         # regression by construction.
-        buffer_id = id(processor._ring_buffer)
+        # A held STRONG REFERENCE, asserted with `is` - not id() integers.
+        # Round 19 caught the id() version passing under the very regression
+        # it guards: a freed buffer's address is readily reused by its
+        # same-size replacement, so id() compared equal across a free. The
+        # original object cannot be freed while this reference is held, so
+        # `is` cannot be fooled.
+        original_buffer = processor._ring_buffer
         buffer_size = processor._ring_buffer.size
 
         start = time.perf_counter()
@@ -729,7 +735,7 @@ class TestRingBufferOptimization:
             processor.process_audio_frame(frame)
         elapsed = time.perf_counter() - start
 
-        assert id(processor._ring_buffer) == buffer_id, (
+        assert processor._ring_buffer is original_buffer, (
             "the ring buffer was replaced mid-stream: per-frame reallocation "
             "is the concatenation regression this test exists to catch"
         )

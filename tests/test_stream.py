@@ -4795,3 +4795,64 @@ class TestRoundSeventeenRegressions:
         assert any(
             "protocol drift" in r.message for r in caplog.records
         )
+
+    @pytest.mark.asyncio
+    async def test_a_silence_only_retry_still_surfaces_the_drift(self, caplog):
+        """
+        Round-19 finding 0, reproduced live by the review: the session-
+        scoped branch of _outcome never plumbed the loss facts, so a retry
+        that shipped ONLY silence (zero-amplitude frames -> the session
+        branch) re-silenced the round-18 warning and stripped the fatal's
+        drift note. Attempt 1 delivers A, sees drifted B, dies; the retry
+        pushes pure zeros and ends cleanly - the drift must still be loud.
+        """
+        ws1, ws2 = FakeWS(), FakeWS()
+        stream = await make_stream(dial=AsyncMock(side_effect=[ws1, ws2]))
+        mock_event_ch(stream)
+
+        async def attempt_one():
+            stream._input_ch.send_nowait(speech_frame())
+            await asyncio.sleep(0.05)
+            ws1.feed_json({"type": "partial", "text": "bonjour", "segment": 0})
+            ws1.feed_json({"type": "final", "text": "bonjour", "segment": 0})
+            await asyncio.sleep(0.05)
+            ws1.feed_json({"type": "partial", "text": 123, "segment": 1})
+            await asyncio.sleep(0.05)
+            ws1.incoming.put_nowait(
+                SimpleNamespace(type=aiohttp.WSMsgType.ERROR, data=None)
+            )
+
+        task1 = asyncio.create_task(attempt_one())
+        with pytest.raises(APIConnectionError):
+            await asyncio.wait_for(stream._run(), timeout=10.0)
+        await task1
+
+        async def attempt_two():
+            # PURE SILENCE: zero-amplitude frames keep
+            # _real_audio_this_attempt False, forcing the session branch.
+            stream._input_ch.send_nowait(frame(1600))
+            await asyncio.sleep(0.05)
+            ws2.feed_json({"type": "final", "text": "", "segment": 0})
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws2.end()
+
+        task2 = asyncio.create_task(attempt_two())
+        try:
+            with caplog.at_level(
+                logging.WARNING, logger="livekit.plugins.voxist"
+            ):
+                await asyncio.wait_for(stream._run(), timeout=10.0)
+        finally:
+            task2.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task2
+
+        assert stream._session_complete, "A's delivery keeps the session up"
+        assert any(
+            "KNOWN lost" in r.message for r in caplog.records
+        ), (
+            "the session branch defaulted the loss facts and the retry "
+            "re-silenced the round-18 warning"
+        )

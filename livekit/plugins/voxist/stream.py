@@ -141,6 +141,12 @@ class _SessionOutcome:
             socket - the engine demonstrably worked, whatever happened at
             the tail. Distinguishes an ambiguous ending from an engine that
             never answered anything.
+        unreadable_text_seen: A transcript frame's "text" was present but
+            non-string at some point this session (protocol drift). MESSAGE-
+            ONLY by contract: it enriches the terminal error's prose so
+            on-call chases the schema change instead of a wedge, and no
+            decision branch may read it - the DECIDING fact for drift is
+            undelivered_text_seen, which it feeds.
         undelivered_text_seen: A transcript frame carried text at some point
             THIS SESSION, and nothing was ever delivered to the caller. That
             conjunction is a KNOWN loss, not an ambiguous tail - it bars both
@@ -1105,6 +1111,27 @@ class VoxistSTTStream(RecognizeStream):
         )
 
     @property
+    def _known_text_loss(self) -> bool:
+        """
+        Text this session is KNOWN to have lost, from either route.
+
+        Readable text: seen minus anything delivered (_speaking implies the
+        session latch, so the latch alone carries "seen"). Unreadable text:
+        lost by definition the moment it was seen - delivery flags cannot
+        excuse content nobody could decode.
+
+        ONE property, read by BOTH _outcome branches. It was inlined in the
+        per-attempt branch only, and the session branch's defaulted False
+        silenced every consumer on retry paths - the divergent-duplicate
+        failure this file keeps re-learning.
+        """
+        return (
+            self._text_seen_in_session
+            and not self._final_delivered_in_session
+            and not self._interim_delivered_in_session
+        ) or self._unreadable_text_seen_in_session
+
+    @property
     def _engine_reported_empty_this_attempt(self) -> bool:
         """
         Whether the engine finalized this attempt and found nothing in it.
@@ -1247,20 +1274,7 @@ class VoxistSTTStream(RecognizeStream):
                     or self._unfinalized_text_in_session
                 ),
                 engine_answered=self._last_final_at is not None,
-                undelivered_text_seen=(
-                    # Two known-loss routes. Readable text: seen minus
-                    # anything delivered (_speaking implies the session
-                    # latch, so the latch alone carries "seen"). Unreadable
-                    # text: lost by definition the moment it was seen -
-                    # delivery flags cannot excuse content nobody could
-                    # decode.
-                    (
-                        self._text_seen_in_session
-                        and not self._final_delivered_in_session
-                        and not self._interim_delivered_in_session
-                    )
-                    or self._unreadable_text_seen_in_session
-                ),
+                undelivered_text_seen=self._known_text_loss,
                 unreadable_text_seen=self._unreadable_text_seen_in_session,
                 unanswered_tail_seconds=(
                     self._bytes_sent_since_progress
@@ -1286,6 +1300,13 @@ class VoxistSTTStream(RecognizeStream):
                 self._trailing_segment_unfinalized
                 or self._unfinalized_text_in_session
             ),
+            # SESSION facts travel on the session branch too. Round 19
+            # reproduced the round-18 silence through exactly this omission:
+            # a retry that shipped only silence took this branch, both loss
+            # facts defaulted False, and the gate's warnings and the fatal's
+            # drift note all went quiet.
+            undelivered_text_seen=self._known_text_loss,
+            unreadable_text_seen=self._unreadable_text_seen_in_session,
         )
 
     def _finish_session(self, outcome: _SessionOutcome) -> None:
@@ -1397,12 +1418,15 @@ class VoxistSTTStream(RecognizeStream):
                     # loss elsewhere in the session must not vanish behind
                     # them: unreadable drift after a delivered utterance
                     # latched this fact and used to complete in silence here.
+                    # Only the unreadable route reaches this branch: a
+                    # delivered final sets the session delivery flag, which
+                    # zeroes the readable seen-minus-delivered conjunction.
                     logger.warning(
                         f"Stream {self._session_id} completing on the finals "
-                        f"already delivered: {outcome.detail} - but other "
-                        "transcript content this session is KNOWN lost "
-                        "(text seen and never delivered, or transcript "
-                        "frames whose text was unreadable)"
+                        f"already delivered: {outcome.detail} - but "
+                        "transcript frames with unreadable text were seen "
+                        "this session (protocol drift), and that content is "
+                        "KNOWN lost"
                     )
                 elif not outcome.concluded:
                     logger.warning(

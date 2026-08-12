@@ -2814,12 +2814,21 @@ class TestBacklogBoundIsHard:
 
         async def producer():
             nonlocal peak
-            for _ in range(1200):
+            # BATCHED pushes, one sleep per 30 frames. The first version
+            # slept 0.5ms per frame, and under machine load the per-
+            # iteration event-loop overhead dominated that sleep: the
+            # producer quietly stopped outpacing the uplink, no drops
+            # occurred, and the test failed on its own premise guard - a
+            # load-sensitive flake. Batching keeps the push/drain ratio ~6x
+            # under any load, because both sides' sleeps stretch together
+            # while the per-frame overhead is paid 30x less often.
+            for _ in range(40):
                 if stop.is_set():
                     return
-                stream._input_ch.send_nowait(speech_frame(160))
+                for _ in range(30):
+                    stream._input_ch.send_nowait(speech_frame(160))
                 peak = max(peak, stream._input_ch.qsize())
-                await asyncio.sleep(0.0005)  # ~20x realtime
+                await asyncio.sleep(0.005)
 
         async def finisher():
             await asyncio.sleep(0.6)
@@ -2845,7 +2854,12 @@ class TestBacklogBoundIsHard:
             for t in (prod, fin):
                 t.cancel()
 
-        assert peak <= cap_frames * 3, (
+        # x6, not x3: with batched pushes a single stretched send can admit
+        # two or three 30-frame batches before the drop loop engages. The
+        # regression this bound exists for is UNBOUNDED growth (measured
+        # peak 9928 against a nominal 50 in the round-9 version) - 300 vs
+        # 9928 is the discrimination that matters, not 150 vs 180.
+        assert peak <= cap_frames * 6, (
             f"backlog reached {peak} frames against a bound of ~{cap_frames}: "
             "the ceiling is not holding, so a long call would grow the "
             "channel until OOM"

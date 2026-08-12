@@ -1002,31 +1002,47 @@ class TestDialLimiterRegistryLifetime:
     async def test_the_budget_survives_dialer_teardown_and_gc(self):
         ws = object()
         first = FakeSession(responses=[token_response("t")], ws_results=[ws])
-        # A generous window: gc.collect() on a loaded interpreter is not free,
-        # and the assertion below is a LOWER bound on the successor's wait, so
-        # the window only has to outlast the teardown.
         dialer = make_dialer(
             first, max_dials_per_window=1, dial_rate_limit_window=0.6
         )
+        charged_at = time.perf_counter()
         assert await dialer.dial("fr", 16000) is ws
 
         # Job over: the only dialer for this credential goes away.
         del dialer
         gc.collect()
 
-        # Next job, same credential: it must inherit the spent window.
+        # THE mechanism under test, asserted structurally: the registry entry
+        # must survive the gc with its charge intact. A weak-value registry
+        # loses it right here. Structural, because the previous version
+        # asserted a LOWER BOUND on the successor's wall-clock wait - and on
+        # a loaded box the 0.6s window aged out during teardown+gc itself,
+        # so the successor legitimately waited ~0s and the test failed its
+        # own premise (a full-suite-only flake).
+        fingerprint = hashlib.sha256(b"k").hexdigest()[:16]
+        key = f"wss://host/ws|{fingerprint}|1/0.6"
+        limiter = connection._dial_limiters.get(key)
+        assert limiter is not None, (
+            "the credential's limiter was collected with its dialer: the "
+            "process-wide window resets every job teardown"
+        )
+        assert limiter.charged_attempts == 1, (
+            "the entry survived but its charge did not"
+        )
+
+        # Next job, same credential: it may only complete once the shared
+        # window's slot has aged out - measured from the CHARGE, which is
+        # load-immune in the safe direction (delay anywhere in between only
+        # makes the total larger).
         second = FakeSession(responses=[token_response("t")], ws_results=[ws])
         successor = make_dialer(
             second, max_dials_per_window=1, dial_rate_limit_window=0.6
         )
-
-        started = time.perf_counter()
         assert await successor.dial("fr", 16000) is ws
-        elapsed = time.perf_counter() - started
-
-        assert elapsed >= 0.15, (
-            f"the successor dialed in {elapsed:.3f}s, so teardown reset the "
-            "process-wide window to a full budget"
+        total_since_charge = time.perf_counter() - charged_at
+        assert total_since_charge >= 0.55, (
+            f"the successor completed {total_since_charge:.3f}s after the "
+            "charge, inside the 0.6s window - it was given a fresh budget"
         )
 
     def test_a_charged_limiter_outlives_gc_but_an_idle_one_is_evicted(

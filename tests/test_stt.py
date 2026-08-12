@@ -6,6 +6,7 @@ import inspect
 import logging
 import os
 import threading
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import aiohttp
@@ -676,11 +677,13 @@ class TestQUAL002InitializationState:
         assert isinstance(stt.initialization_error, asyncio.TimeoutError)
 
     @pytest.mark.asyncio
-    async def test_check_initialization_does_not_raise_on_success(self):
-        """Test check_initialization does not raise if not failed."""
+    async def test_check_initialization_does_not_raise_when_ready(self):
+        """Silence means READY, by the one readiness definition."""
         from livekit.plugins.voxist import InitializationState
 
-        stt = VoxistSTT(api_key="test")
+        # validate_websocket=False: the caller asked for the token-only
+        # contract, so a completed token warm-up IS the whole proof.
+        stt = VoxistSTT(api_key="test", validate_websocket=False)
         stt._init_state = InitializationState.COMPLETED
 
         # Should not raise
@@ -1596,6 +1599,11 @@ class TestWebSocketReachabilityValidation:
         from livekit.plugins.voxist import InitializationState
 
         class HangingProbeWebSocket:
+            async def receive(self):
+                # Silent past the grace window: the healthy shape, since the
+                # gateway sends no greeting frame.
+                await asyncio.Event().wait()
+
             async def close(self):
                 await asyncio.Event().wait()
 
@@ -1610,6 +1618,7 @@ class TestWebSocketReachabilityValidation:
         stt._ensure_dialer = AsyncMock(return_value=dialer)
         stt._init_state = InitializationState.COMPLETED
         monkeypatch.setattr(stt, "READINESS_CLOSE_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(stt, "READINESS_APPLICATION_GRACE_SECONDS", 0.01)
 
         assert await asyncio.wait_for(
             stt.wait_for_initialization(timeout=1.0), timeout=0.5
@@ -1621,7 +1630,12 @@ class TestWebSocketReachabilityValidation:
     async def test_background_warmup_alone_never_dials(self, mock_voxist_server):
         """The fire-and-forget warm-up stays token-only: each WS dial opens
         a real ASR engine session server-side, a cost only the explicit
-        readiness paths may incur (and only once)."""
+        readiness paths may incur (and only once).
+
+        Because it opens no socket it also cannot establish readiness, and the
+        readiness surface must say so - see
+        TestReadinessSurfaceIsOnePredicate.
+        """
         stt = VoxistSTT(
             api_key="test_key",
             base_url=f"ws://{mock_voxist_server.host}:{mock_voxist_server.port}/ws",
@@ -1634,8 +1648,238 @@ class TestWebSocketReachabilityValidation:
         assert mock_voxist_server.connections_count == 0, (
             "the background warm-up must not open engine sessions"
         )
+        assert stt.is_ready is False, (
+            "a token-only warm-up proves nothing about the WebSocket path"
+        )
 
         await stt.aclose()
+
+
+class TestReadinessSurfaceIsOnePredicate:
+    """
+    The readiness surface - is_ready, initialization_state,
+    initialization_error, check_initialization(), wait_for_initialization() -
+    used to be five accessors each answering a slightly different question
+    from a different subset of the internal flags. These tests pin the single
+    definition they now all derive from (documented in stt.py above
+    _reachability_proven), one test per way they used to disagree.
+    """
+
+    @pytest.mark.no_auto_mock_token
+    @pytest.mark.asyncio
+    async def test_a_blocked_ws_path_is_never_reported_healthy(self):
+        """[F1] The warm-up is plain HTTPS, so on a deployment whose WebSocket
+        path is blocked it SUCCEEDS. initialization_state reported that as
+        COMPLETED, initialization_error stayed None and check_initialization()
+        raised nothing - so a deployment health check built on those two APIs
+        called the plugin healthy while every stream() died on the dial. The
+        pre-rewrite initialize() raised at startup here; that guarantee is
+        restored by never reporting an unverified deployment as healthy.
+        """
+        from livekit.plugins.voxist import InitializationError, InitializationState
+
+        from .fixtures.mock_server import MockVoxistServer
+
+        server = MockVoxistServer(valid_api_key="any_key", error_mode="ws_blocked")
+        await server.start()
+        try:
+            stt = VoxistSTT(
+                api_key="any_key",
+                base_url=f"ws://{server.host}:{server.port}/ws",
+            )
+            assert stt._init_task is not None
+            with contextlib.suppress(Exception):
+                await stt._init_task
+
+            # The token half really did succeed: this is not a plugin that
+            # failed, it is a plugin nothing has verified.
+            assert server.token_requests_count == 1
+            assert server.connections_count == 0
+            assert stt._init_state is InitializationState.COMPLETED, (
+                "the warm-up phase itself completed - that is the trap"
+            )
+
+            # ...and not one accessor may call that healthy.
+            assert stt.initialization_state is not InitializationState.COMPLETED
+            assert stt.is_ready is False
+            with pytest.raises(InitializationError, match="not verified"):
+                stt.check_initialization()
+
+            await stt.aclose()
+        finally:
+            await server.stop()
+
+    @pytest.mark.no_auto_mock_token
+    @pytest.mark.asyncio
+    async def test_an_upgrade_then_1008_close_is_not_reachability(self):
+        """[F2] aiohttp's ws_connect returns on the 101, so a gateway that
+        accepts the upgrade and THEN closes with 1008 - its documented answer
+        for a refused app-level credential and for an exhausted balance -
+        satisfied a probe that only checked the handshake. Readiness reported
+        True and __aenter__ succeeded, then every real stream died with
+        "server closed the connection before end of input" after burning the
+        whole retry budget.
+        """
+        from livekit.plugins.voxist import InitializationError
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+
+        from .fixtures.mock_server import MockVoxistServer
+
+        server = MockVoxistServer(
+            valid_api_key="any_key", error_mode="ws_upgraded_then_rejected"
+        )
+        await server.start()
+        try:
+            stt = VoxistSTT(
+                api_key="any_key",
+                base_url=f"ws://{server.host}:{server.port}/ws",
+            )
+
+            assert await stt.wait_for_initialization(timeout=5.0) is False
+            assert server.connections_count >= 1, (
+                "the upgrade must have SUCCEEDED - otherwise this is the "
+                "handshake failure ws_blocked already covered, not an "
+                "application-layer rejection"
+            )
+            assert stt.is_ready is False
+            assert isinstance(
+                stt.initialization_error, AuthenticationError
+            ), f"got {stt.initialization_error!r}"
+
+            with pytest.raises(InitializationError):
+                await stt.__aenter__()
+
+            await stt.aclose()
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_replayed_probe_failure_keeps_its_classification(self):
+        """[F3a] Two readiness callers race (a health endpoint and
+        `async with` - the case the probe docstring cites). A dials and the
+        gateway rejects the key, recording a sticky AuthenticationError. B then
+        enters the probe lock, hits the cooldown branch, and used to raise a
+        FRESH VoxistConnectionError wrapping it - which, recorded LAST,
+        overwrote the sticky classification with a transient-looking one and
+        put a revoked credential on a 30s re-probe loop forever.
+        """
+        from livekit.plugins.voxist import InitializationError, InitializationState
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+
+        stt = VoxistSTT(api_key="test")
+        await _quiesce_background_init(stt)
+        clock = _install_fake_clock(stt)
+
+        async def slow_reject(*args, **kwargs):
+            await asyncio.sleep(0.05)  # wide enough for the racer to enter
+            raise AuthenticationError("revoked key")
+
+        dialer = AsyncMock()
+        dialer.dial = AsyncMock(side_effect=slow_reject)
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stt._init_state = InitializationState.COMPLETED
+
+        results = await asyncio.gather(
+            stt.wait_for_initialization(timeout=5.0),
+            stt.wait_for_initialization(timeout=5.0),
+        )
+
+        assert results == [False, False]
+        assert dialer.dial.await_count == 1, "one probe per cooldown window"
+        assert isinstance(stt.initialization_error, AuthenticationError), (
+            f"the replay downgraded the classification: "
+            f"{stt.initialization_error!r}"
+        )
+        assert stt._failure_is_permanent(stt.initialization_error) is True
+        with pytest.raises(InitializationError, match="will not clear"):
+            stt.check_initialization()
+
+        # The consequence that actually matters: the rejected key is never
+        # hammered, however much time passes.
+        clock["now"] += 100 * stt.READINESS_RETRY_COOLDOWN_SECONDS
+        assert await stt.wait_for_initialization(timeout=5.0) is False
+        assert dialer.dial.await_count == 1
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_a_permanent_failure_is_never_downgraded(self):
+        """[F3b] The other half, independent of the replay fix: a settled
+        permanent classification must survive both a later weaker recording
+        and being wrapped. _failure_is_permanent used to inspect only the
+        outermost exception TYPE, never __cause__, so any re-wrap reclassified
+        a revoked credential as a transient blip.
+        """
+        from livekit.plugins.voxist import InitializationState
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+
+        stt = VoxistSTT(api_key="test", validate_websocket=False)
+        await _quiesce_background_init(stt)
+        _install_fake_clock(stt)
+
+        rejected = AuthenticationError("revoked key")
+        stt._record_init_failure(rejected)
+        assert stt._failure_is_permanent(stt.initialization_error) is True
+
+        # A later, weaker report must not replace the settled verdict. This is
+        # the guard on its own: a bare transient error, nothing to see through.
+        stt._record_init_failure(VoxistConnectionError("plain blip"))
+        assert stt.initialization_error is rejected
+        assert stt.initialization_state is InitializationState.FAILED
+        assert stt._may_retry_failed_readiness() is False
+
+        # And the classification survives WRAPPING on its own, so neither half
+        # of the fix depends on the other masking it.
+        wrapped = VoxistConnectionError("probe failed")
+        wrapped.__cause__ = rejected
+        assert stt._failure_is_permanent(wrapped) is True
+        assert stt._failure_is_permanent(VoxistConnectionError("blip")) is False
+
+        # A __cause__ cycle must terminate rather than hang the classifier.
+        first = VoxistConnectionError("a")
+        second = VoxistConnectionError("b")
+        first.__cause__ = second
+        second.__cause__ = first
+        assert stt._failure_is_permanent(first) is False
+
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_a_closed_plugin_is_never_ready(self):
+        """[F4] aclose() sets _closed and stream() raises RuntimeError from
+        then on, but is_ready consulted neither _closed nor anything aclose()
+        touches - so a readiness/liveness endpoint kept reporting a torn-down
+        plugin healthy, traffic kept being routed to it, and every stream()
+        raised an unhandled RuntimeError at the call site instead of the
+        caller failing over.
+        """
+        from livekit.plugins.voxist import InitializationError, InitializationState
+
+        stt = VoxistSTT(api_key="test")
+        await _quiesce_background_init(stt)
+        stt._init_state = InitializationState.COMPLETED
+        stt._ws_validated = True
+        assert stt.is_ready is True
+
+        await stt.aclose()
+
+        # aclose() deliberately clears neither flag: _closed is a term of the
+        # readiness predicate, not something patched into each accessor.
+        assert stt._closed is True
+        assert stt._init_state is InitializationState.COMPLETED
+        assert stt._ws_validated is True
+
+        assert stt.is_ready is False
+        assert stt.initialization_state is InitializationState.FAILED
+        assert stt.initialization_error is not None
+        assert stt._may_retry_failed_readiness() is False
+        with pytest.raises(InitializationError, match="closed"):
+            stt.check_initialization()
+        assert await stt.wait_for_initialization(timeout=1.0) is False
+
+        # The whole point: readiness now agrees with what stream() does.
+        with pytest.raises(RuntimeError, match="closed VoxistSTT"):
+            stt.stream()
 
 
 async def _quiesce_background_init(stt: VoxistSTT) -> None:
@@ -1955,3 +2199,101 @@ class TestSessionLoopIntrospectionFailsLoud:
 
 async def _make_session() -> aiohttp.ClientSession:
     return aiohttp.ClientSession()
+
+
+class TestProbeTransportAbortIsReportedHonestly:
+    """
+    On the close-timeout path aiohttp has usually already released the
+    connection, so there is no transport left to abort - and the log said
+    "aborted the probe transport" regardless, telling an operator chasing a
+    leaked socket that cleanup had happened when it had not.
+
+    No test covered this at all: inverting the helper's return value left the
+    whole stt suite green.
+    """
+
+    @staticmethod
+    def _ws_with_transport(transport):
+        return SimpleNamespace(
+            _response=SimpleNamespace(
+                connection=SimpleNamespace(transport=transport)
+            )
+        )
+
+    def test_a_reachable_transport_is_aborted_and_reported(self):
+        aborted = []
+        ws = self._ws_with_transport(
+            SimpleNamespace(abort=lambda: aborted.append(True))
+        )
+        assert VoxistSTT._abort_probe_transport(ws) is True
+        assert aborted == [True]
+
+    def test_an_already_released_connection_reports_no_abort(self):
+        ws = SimpleNamespace(_response=SimpleNamespace(connection=None))
+        assert VoxistSTT._abort_probe_transport(ws) is False
+
+    def test_a_transport_that_refuses_reports_no_abort(self):
+        def boom():
+            raise RuntimeError("already closed")
+
+        ws = self._ws_with_transport(SimpleNamespace(abort=boom))
+        assert VoxistSTT._abort_probe_transport(ws) is False
+
+    @pytest.mark.asyncio
+    async def test_the_close_timeout_log_matches_what_happened(self, caplog):
+        """The log must distinguish an abort from a no-op."""
+        stt = VoxistSTT(api_key="k", validate_websocket=False)
+
+        class HangingWS:
+            def __init__(self, transport):
+                self._response = SimpleNamespace(
+                    connection=SimpleNamespace(transport=transport)
+                )
+
+            async def close(self):
+                await asyncio.Event().wait()
+
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            # Nothing left to abort: the honest message says so.
+            await stt._close_probe_socket(HangingWS(None))
+            released = [r.message for r in caplog.records]
+            caplog.clear()
+            # A live transport: the abort really happens.
+            aborted = []
+            await stt._close_probe_socket(
+                HangingWS(SimpleNamespace(abort=lambda: aborted.append(True)))
+            )
+            real = [r.message for r in caplog.records]
+
+        assert any("already released" in m for m in released), released
+        assert not any("already released" in m for m in real), real
+        assert any("aborted the probe transport" in m for m in real), real
+        assert aborted == [True]
+
+
+class TestPunctuationModeIsValidatedAtTheBoundary:
+    """
+    The gateway matches the EXACT string 'Dictated' (under its V2 flag);
+    anything else is silently ignored server-side and the caller gets full
+    automatic punctuation with nothing in any log. A dictation product
+    misconfigured that way ships wrong transcripts quietly, so the mistake
+    must fail at construction, where it is cheap.
+    """
+
+    def test_the_exact_value_is_accepted(self):
+        stt = VoxistSTT(api_key="k", punctuation_mode="Dictated")
+        assert stt._punctuation_mode == "Dictated"
+
+    def test_none_is_the_default_and_accepted(self):
+        assert VoxistSTT(api_key="k")._punctuation_mode is None
+        assert (
+            VoxistSTT(api_key="k", punctuation_mode=None)._punctuation_mode
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        "bad", ["dictated", "DICTATED", "Dictated ", " Dictated", "dictation"]
+    )
+    def test_lookalikes_fail_loudly(self, bad):
+        with pytest.raises(ConfigurationError, match="punctuation_mode"):
+            VoxistSTT(api_key="k", punctuation_mode=bad)

@@ -1,11 +1,15 @@
 """Unit tests for AudioProcessor."""
 
+import logging
 import time
 
 import numpy as np
 import pytest
 
-from livekit.plugins.voxist.audio_processor import AudioProcessor
+from livekit.plugins.voxist.audio_processor import (
+    MAX_FRAME_SIZE_BYTES,
+    AudioProcessor,
+)
 
 
 class TestAudioProcessor:
@@ -707,15 +711,40 @@ class TestRingBufferOptimization:
             processor.process_audio_frame(frame)
         processor.reset()
 
-        # Benchmark
+        # The STRUCTURAL pin, because wall clock cannot discriminate here:
+        # the O(n^2) per-frame-concatenation regression this test guards
+        # against was MEASURED at ~0.4ms for this whole volume (16MB of
+        # copies is nothing to numpy), so both the original 50ms bound and
+        # any load-proof bound are decorative against it. What actually
+        # distinguishes the ring design is allocation-freedom: the buffer is
+        # created once and never replaced, while the concatenation approach
+        # rebuilds an array every frame. Identity and size are asserted
+        # across the run - deterministic, load-immune, and red under the
+        # regression by construction.
+        # A held STRONG REFERENCE, asserted with `is` - not id() integers.
+        # Round 19 caught the id() version passing under the very regression
+        # it guards: a freed buffer's address is readily reused by its
+        # same-size replacement, so id() compared equal across a free. The
+        # original object cannot be freed while this reference is held, so
+        # `is` cannot be fooled.
+        original_buffer = processor._ring_buffer
+        buffer_size = processor._ring_buffer.size
+
         start = time.perf_counter()
         for frame in frames:
             processor.process_audio_frame(frame)
         elapsed = time.perf_counter() - start
 
-        # Should process 100 x 100ms frames (10 seconds of audio) in < 50ms
-        # This is much faster than original concatenation approach
-        assert elapsed < 0.05, f"Processing too slow: {elapsed*1000:.2f}ms"
+        assert processor._ring_buffer is original_buffer, (
+            "the ring buffer was replaced mid-stream: per-frame reallocation "
+            "is the concatenation regression this test exists to catch"
+        )
+        assert processor._ring_buffer.size == buffer_size
+
+        # Wall clock survives only as a gross smoke bound (10s of audio in
+        # under a second), stated for what it is - it cannot catch the
+        # concatenation regression and does not claim to.
+        assert elapsed < 1.0, f"Processing too slow: {elapsed*1000:.2f}ms"
 
     def test_ring_buffer_wrap_around(self):
         """Test ring buffer correctly handles wrap-around."""
@@ -730,3 +759,111 @@ class TestRingBufferOptimization:
             for chunk in chunks:
                 assert chunk.dtype == np.int16  # Voxist expects raw Int16 PCM
                 assert len(chunk) == 1600
+
+
+class TestLargeFrameIsAbsorbedLosslessly:
+    """
+    A frame longer than the ring buffer must not lose its oldest audio.
+
+    _add_to_buffer's overflow branches drop the OLDEST samples to make room -
+    right for a live ring buffer with a slow reader, catastrophic when the
+    reader is the next statement. A frame longer than _ring_buffer_size (2s at
+    the input rate) was truncated to its final 2s BEFORE any chunk was
+    extracted, so a batch caller pushing 5s blocks silently lost 60% of each
+    one, and the lost part was always the START of the utterance.
+    """
+
+    def test_first_chunk_is_the_start_of_the_frame(self):
+        """The tell: truncation kept the TAIL, so chunk 0 came from the middle."""
+        p = AudioProcessor(sample_rate=16000)
+        # 5 seconds at 16kHz: well over the 2-second ring buffer
+        samples = 5 * 16000
+        assert samples > p._ring_buffer_size, "frame must exceed the buffer"
+        # A non-periodic pattern on purpose: an `arange % N` ramp aliases,
+        # and with N=3000 the truncated tail started at sample 48000 - an
+        # exact multiple - so it compared EQUAL to the frame's opening and
+        # this test passed against the very bug it exists to catch.
+        audio = np.random.default_rng(1234).integers(
+            -20000, 20000, samples, dtype=np.int16
+        )
+
+        chunks = p.process_audio_frame(audio.tobytes())
+
+        assert chunks, "a 5s frame must yield chunks"
+        np.testing.assert_array_equal(
+            chunks[0],
+            audio[: p.chunk_samples],
+            err_msg="chunk 0 must be the frame's opening audio, not its tail",
+        )
+
+    def test_every_sample_is_covered(self):
+        """Stride overlap duplicates audio; nothing may be missing."""
+        p = AudioProcessor(sample_rate=16000)
+        samples = 5 * 16000
+        # A non-periodic pattern on purpose: an `arange % N` ramp aliases,
+        # and with N=3000 the truncated tail started at sample 48000 - an
+        # exact multiple - so it compared EQUAL to the frame's opening and
+        # this test passed against the very bug it exists to catch.
+        audio = np.random.default_rng(1234).integers(
+            -20000, 20000, samples, dtype=np.int16
+        )
+
+        chunks = p.process_audio_frame(audio.tobytes())
+        chunks += p.flush()
+
+        # Rebuild the stream from the non-overlapping part of each chunk.
+        rebuilt = [chunks[0]]
+        for c in chunks[1:]:
+            rebuilt.append(c[p.stride_samples :])
+        covered = int(np.concatenate(rebuilt).size)
+
+        assert covered >= samples * 0.99, (
+            f"only {covered} of {samples} samples survived the buffer"
+        )
+
+    def test_a_frame_that_fits_is_unaffected(self):
+        """The ordinary live path must behave exactly as before."""
+        p = AudioProcessor(sample_rate=16000)
+        # Exactly one 100ms chunk at 16kHz, the ordinary live frame size
+        audio = (np.arange(p.chunk_samples, dtype=np.int32) % 3000).astype(
+            np.int16
+        )
+
+        chunks = p.process_audio_frame(audio.tobytes())
+
+        assert len(chunks) == 1
+        np.testing.assert_array_equal(chunks[0], audio)
+
+    @pytest.mark.parametrize(
+        "rate,chunk_ms",
+        [(16000, 100), (16000, 500), (48000, 100), (48000, 500), (8000, 100)],
+    )
+    def test_no_overflow_branch_is_ever_reached(self, rate, chunk_ms, caplog):
+        """
+        _add_to_buffer's overflow branches all DISCARD the oldest audio.
+
+        They are unreachable by construction - the sole caller feeds at most
+        advance_samples per pass and drains between passes - and this pins
+        that, across sample rates and chunk sizes, for a frame many times the
+        ring buffer. If piecewise feeding ever regresses, one of these lines
+        reappears and the utterance loses its opening.
+        """
+        p = AudioProcessor(sample_rate=rate, chunk_duration_ms=chunk_ms)
+        # Many times the 2-second ring buffer, but within the 1MB contract
+        # limit so this exercises the buffer rather than frame validation.
+        samples = min(rate * 20, (MAX_FRAME_SIZE_BYTES // 2))
+        assert samples > p._ring_buffer_size * 2, "frame must dwarf the buffer"
+        audio = np.random.default_rng(7).integers(
+            -20000, 20000, samples, dtype=np.int16
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="livekit.plugins.voxist"):
+            chunks = p.process_audio_frame(audio.tobytes())
+
+        discards = [
+            r.message
+            for r in caplog.records
+            if "oldest" in r.message or "keeping most recent" in r.message
+        ]
+        assert not discards, f"audio was discarded: {discards}"
+        assert chunks, "a frame this size must yield chunks"

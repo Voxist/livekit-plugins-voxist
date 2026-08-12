@@ -84,7 +84,7 @@ class MockVoxistServer:
             send_interim: Whether to send interim results
             interim_delay_ms: Delay before sending interim result
             error_mode: Error simulation mode (None, "auth_failure", "wedge",
-                        "ws_blocked").
+                        "ws_blocked", "ws_upgraded_then_rejected").
                         "wedge" models a wedged ENGINE behind a healthy
                         gateway: the WebSocket layer stays connected (aiohttp
                         answers pings at protocol level) and keeps accepting
@@ -97,6 +97,18 @@ class MockVoxistServer:
                         hands out a valid-looking token URL while /ws answers
                         a plain HTTP 200 instead of upgrading. Refusals are
                         counted in self.ws_upgrade_refusals.
+                        "ws_upgraded_then_rejected" models a gateway that
+                        refuses at the APPLICATION layer: the token endpoint is
+                        healthy, the WebSocket upgrade SUCCEEDS (a real 101,
+                        counted in self.connections_count), and only then is
+                        the socket closed with 1008 - the gateway's documented
+                        answer for an invalid or expired app-level credential
+                        and for an exhausted wallet balance. Distinct from
+                        "auth_failure", which fails the token exchange with a
+                        401 and so never upgrades at all, and from
+                        "ws_blocked", which never upgrades either. This is the
+                        only mode where a client that observes nothing but the
+                        101 concludes the deployment is healthy.
             on_audio_received: Callback when audio is received (for testing)
             api_key_header: Header carrying the API key on the token exchange
                             (must match VoxistDialer's api_key_header, whose
@@ -133,6 +145,10 @@ class MockVoxistServer:
         # Observability for tests: what the server actually saw
         self.connected_languages: list[str | None] = []
         self.done_received_count = 0
+        # Faithful by default: the real engine always acks. Settable to False
+        # to model an engine variant that does not, since the API's own
+        # reference client treats the ack as skippable rather than required.
+        self.send_done_ack = True
         self.finals_sent = 0
         self.segments_finalized: list[int] = []  # speech bytes per segment
         self.interim_delay_ms = interim_delay_ms
@@ -205,8 +221,9 @@ class MockVoxistServer:
         4. Treat "Done" as end-of-SESSION: flush a final, then close
 
         error_mode shortcuts this: "ws_blocked" never upgrades at all,
-        "auth_failure" closes with 1008, "wedge" accepts everything and
-        answers nothing.
+        "auth_failure" closes with 1008, "ws_upgraded_then_rejected" upgrades
+        for a VALID credential and then closes with 1008, "wedge" accepts
+        everything and answers nothing.
         """
         if self.error_mode == "ws_blocked":
             # Broken WebSocket path behind a healthy token endpoint: answer
@@ -228,6 +245,17 @@ class MockVoxistServer:
 
             if self.error_mode == "auth_failure":
                 await ws.close(code=1008, message=b"Invalid API key")
+                return ws
+
+            if self.error_mode == "ws_upgraded_then_rejected":
+                # The credential is fine at the token endpoint and the upgrade
+                # already succeeded; the refusal happens at the application
+                # layer, after the 101. A client that treats the handshake as
+                # proof of a working deployment cannot tell this apart from a
+                # healthy connect.
+                await ws.close(
+                    code=1008, message=b"Application layer refused the session"
+                )
                 return ws
 
             is_valid = credential in (self.valid_api_key, self.ws_token)
@@ -302,6 +330,15 @@ class MockVoxistServer:
                     if "Done" in msg.data:
                         self.done_received_count += 1
                         await finalize_segment()
+                        # The engine acks with a bare non-JSON "Done!" text
+                        # frame, which the gateway forwards verbatim. Verified
+                        # live against api-asr.voxist.com (lang=fr): it lands
+                        # ~0.12s after Done, right behind the last final.
+                        # Modelled here so the plugin's handling of it is
+                        # exercised by the integration suite and not only by
+                        # unit tests.
+                        if self.send_done_ack:
+                            await ws.send_str("Done!")
                         break
 
                 elif msg.type == aiohttp.WSMsgType.BINARY:
@@ -457,6 +494,10 @@ class MockVoxistServer:
         self.ws_upgrade_refusals = 0
         self.connected_languages = []
         self.done_received_count = 0
+        # Faithful by default: the real engine always acks. Settable to False
+        # to model an engine variant that does not, since the API's own
+        # reference client treats the ack as skippable rather than required.
+        self.send_done_ack = True
         self.finals_sent = 0
         self.segments_finalized = []
 

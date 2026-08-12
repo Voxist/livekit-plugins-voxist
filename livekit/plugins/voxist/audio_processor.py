@@ -248,6 +248,20 @@ class AudioProcessor:
         - Buffer full conditions
         - Security limits enforcement
 
+        EVERY overflow branch below DISCARDS AUDIO, and discards the OLDEST
+        audio - the start of the utterance. None of them should be reachable:
+        the sole caller (process_audio_frame) feeds at most advance_samples per
+        call and drains chunks in between, so the buffer always has room. They
+        are kept as a backstop, and they log at ERROR rather than WARNING
+        because reaching one means transcript loss, not a tight buffer.
+
+        This used to be reachable and cost real audio: a frame longer than
+        _ring_buffer_size (2 seconds at the input rate) was truncated to its
+        final 2 seconds before a single chunk was extracted, so a caller
+        pushing 5-second blocks silently lost 60% of every block. If one of
+        these lines ever appears in a log again, the caller's piecewise
+        feeding has regressed - fix that, not the bound.
+
         Args:
             int16_audio: Int16 audio samples to add
         """
@@ -260,7 +274,7 @@ class AudioProcessor:
             num_samples = len(int16_audio)
             self._read_pos = 0
             self._write_pos = 0
-            logger.warning(
+            logger.error(
                 f"Frame ({num_samples + samples_to_skip} samples) exceeds buffer capacity "
                 f"({self._ring_buffer_size}), keeping most recent {num_samples} samples"
             )
@@ -270,7 +284,7 @@ class AudioProcessor:
         if num_samples > available_space:
             samples_to_trim = num_samples - available_space
             self._read_pos += samples_to_trim
-            logger.warning(
+            logger.error(
                 f"Ring buffer full, trimming {samples_to_trim} oldest samples"
             )
 
@@ -279,7 +293,7 @@ class AudioProcessor:
         if total_after_write > MAX_BUFFER_SAMPLES:
             trim_amount = total_after_write - MAX_BUFFER_SAMPLES
             self._read_pos += trim_amount
-            logger.warning(
+            logger.error(
                 f"Buffer exceeded max ({total_after_write} > {MAX_BUFFER_SAMPLES}), "
                 f"trimming {trim_amount} oldest samples"
             )
@@ -381,11 +395,28 @@ class AudioProcessor:
         # Track original sample count for logging
         num_samples = len(int16_audio)
 
-        # Add samples to ring buffer with overflow handling
-        self._add_to_buffer(int16_audio)
-
-        # Extract all available chunks
-        chunks = self._extract_available_chunks()
+        # Absorbed in pieces the ring buffer can hold, draining chunks out
+        # between pieces, so no sample is ever discarded for being early.
+        #
+        # _add_to_buffer's overflow branches drop the OLDEST samples to make
+        # room, which is correct for a live ring buffer under a slow reader
+        # but catastrophic here: the reader is the very next statement. A
+        # single frame longer than the buffer (_ring_buffer_size is 2 seconds
+        # at the input rate) used to arrive, overflow, and be truncated to its
+        # final 2 seconds before anything was extracted - so a batch caller
+        # pushing 5-second blocks silently lost 60% of every block, with only
+        # a debug-level "exceeds buffer capacity" line to show for it. The
+        # loss was in the OLDEST audio, i.e. the start of every utterance.
+        #
+        # Feeding at most advance_samples per pass guarantees the buffer never
+        # has to trim: each pass adds less than one chunk's worth of new audio
+        # and _extract_available_chunks then consumes everything a full chunk
+        # can cover.
+        chunks: list[np.ndarray] = []
+        piece_size = max(1, self.advance_samples)
+        for start in range(0, num_samples, piece_size):
+            self._add_to_buffer(int16_audio[start : start + piece_size])
+            chunks.extend(self._extract_available_chunks())
 
         # Update legacy buffer for backward compatibility
         self._update_legacy_buffer()

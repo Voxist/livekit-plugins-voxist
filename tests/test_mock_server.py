@@ -26,13 +26,22 @@ def silence_frame(ms=100, rate=16000):
 
 
 async def collect_json(ws, timeout=2.0):
-    """Drain currently-available JSON messages."""
+    """
+    Drain currently-available JSON messages.
+
+    Skips the engine's bare "Done!" acknowledgement, which is a real protocol
+    frame and not JSON - the API's own reference client skips it the same way
+    (kroko/bench/asr_bench.py:103). Parsing it raised JSONDecodeError here the
+    moment the mock became faithful to it.
+    """
     out = []
     try:
         while True:
             msg = await asyncio.wait_for(ws.receive(), timeout=timeout)
             if msg.type != aiohttp.WSMsgType.TEXT:
                 break
+            if msg.data.startswith("Done"):
+                continue
             out.append(msg.json())
     except asyncio.TimeoutError:
         pass
@@ -208,10 +217,17 @@ class TestMockServerBasics:
                 await ws.send_str("Done")
 
                 got_final = False
+                acked = False
                 closed = False
                 while True:
                     msg = await asyncio.wait_for(ws.receive(), timeout=3.0)
                     if msg.type == aiohttp.WSMsgType.TEXT:
+                        # The engine's bare "Done!" ack precedes the close and
+                        # is not JSON; parsing it here raised JSONDecodeError
+                        # once the mock became faithful to it.
+                        if msg.data.startswith("Done"):
+                            acked = True
+                            continue
                         if msg.json().get("type") == "final":
                             got_final = True
                     elif msg.type in (
@@ -223,6 +239,10 @@ class TestMockServerBasics:
                         break
 
         assert got_final, "pending speech must be finalized on Done"
+        assert acked, (
+            "the engine acks Done with a bare 'Done!' frame before the close; "
+            "verified live on api-asr.voxist.com"
+        )
         assert closed, "the server must close the socket after Done"
         assert mock_voxist_server.done_received_count == 1
 

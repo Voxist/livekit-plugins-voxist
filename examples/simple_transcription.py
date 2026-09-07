@@ -13,9 +13,12 @@ Usage:
     python simple_transcription.py dev
 """
 
+import asyncio
 import logging
-from livekit import agents, rtc
+
 from livekit.agents import cli, stt
+
+from livekit import agents, rtc
 
 # Import Voxist plugin
 from livekit.plugins import voxist
@@ -36,7 +39,6 @@ async def entrypoint(ctx: agents.JobContext):
     voxist_stt = voxist.VoxistSTT(
         language="fr",
         interim_results=True,  # Get partial transcriptions
-        connection_pool_size=2,
     )
 
     logger.info("Voxist STT initialized, waiting for participants...")
@@ -58,26 +60,30 @@ async def entrypoint(ctx: agents.JobContext):
         # Create STT stream
         stt_stream = voxist_stt.stream()
 
-        # Forward audio to STT
-        async for audio_event in audio_stream:
-            stt_stream.push_frame(audio_event.frame)
+        async def forward_audio():
+            async for audio_event in audio_stream:
+                stt_stream.push_frame(audio_event.frame)
+            # Signal end of audio once the track ends
+            stt_stream.end_input()
 
-        # Signal end of audio
-        stt_stream.end_input()
+        async def process_transcriptions():
+            async for event in stt_stream:
+                if event.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
+                    text = event.alternatives[0].text if event.alternatives else ""
+                    if text:
+                        logger.info(f"[INTERIM] {text}")
 
-        # Process transcription events
-        async for event in stt_stream:
-            if event.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
-                text = event.alternatives[0].text if event.alternatives else ""
-                if text:
-                    logger.info(f"[INTERIM] {text}")
+                elif event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
+                    text = event.alternatives[0].text if event.alternatives else ""
+                    if text:
+                        logger.info(f"[FINAL] {text}")
+                        # You can do something with the final transcript here
+                        # e.g., send to LLM, save to database, etc.
 
-            elif event.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-                text = event.alternatives[0].text if event.alternatives else ""
-                if text:
-                    logger.info(f"[FINAL] {text}")
-                    # You can do something with the final transcript here
-                    # e.g., send to LLM, save to database, etc.
+        # Run both concurrently: the track only ends when the participant
+        # leaves, so reading events afterwards would buffer every transcript
+        # until then.
+        await asyncio.gather(forward_audio(), process_transcriptions())
 
     # Listen for track subscriptions
     @ctx.room.on("track_subscribed")
@@ -88,7 +94,7 @@ async def entrypoint(ctx: agents.JobContext):
     ):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Audio track subscribed from {participant.identity}")
-            ctx.create_task(process_track(track))
+            asyncio.create_task(process_track(track))
 
     # Keep agent running
     logger.info("Agent ready, listening for audio...")

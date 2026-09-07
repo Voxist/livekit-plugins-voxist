@@ -114,8 +114,8 @@ class VoxistSTT(STT):
         )
 
         # Use in LiveKit agent
-        agent = agents.VoicePipelineAgent(stt=stt, llm=..., tts=...)
-        await agent.start(ctx.room)
+        session = agents.AgentSession(stt=stt, llm=..., tts=...)
+        await session.start(agent=agents.Agent(instructions=...), room=ctx.room)
 
         # Explicit initialization check (optional)
         await stt.wait_for_initialization()

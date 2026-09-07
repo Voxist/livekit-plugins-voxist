@@ -57,7 +57,6 @@ async def main():
         language="fr",
         sample_rate=48000,  # Match LiveKit's 48kHz output
         interim_results=True,
-        connection_pool_size=2,
         chunk_duration_ms=500,  # Larger chunks (500ms instead of 100ms)
     )
 

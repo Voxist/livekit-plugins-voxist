@@ -13,8 +13,8 @@ Example:
 
     async def entrypoint(ctx: agents.JobContext):
         stt = voxist.VoxistSTT(language="fr-medical")
-        agent = agents.VoicePipelineAgent(stt=stt, llm=..., tts=...)
-        await agent.start(ctx.room)
+        session = agents.AgentSession(stt=stt, llm=..., tts=...)
+        await session.start(agent=agents.Agent(instructions=...), room=ctx.room)
 
 Deprecated exception names:
     ConnectionPoolExhaustedError is a pool-era name that nothing raises any

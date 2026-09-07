@@ -20,8 +20,8 @@ pip install livekit-plugins-voxist
 ## Upgrading from 0.9.x
 
 0.10.0 replaces the connection pool with one WebSocket per stream and hands
-retries to LiveKit. Nothing was removed from the public API, but three things
-deserve a check in your code:
+retries to LiveKit. Every name the package root exported in 0.9.x still
+imports, but three things deserve a check in your code:
 
 1. **Drop `connection_pool_size` and `max_reconnect_attempts`.** Both are
    accepted and ignored, and a non-default value logs a deprecation warning.
@@ -34,39 +34,39 @@ deserve a check in your code:
    ```
 
 2. **Catch `ConnectionError` and `TranscriptLostError`.**
-   `ConnectionPoolExhaustedError`, `BackpressureError` and
-   `OwnershipViolationError` still import but are never raised.
-   `TranscriptLostError` is new: it means audio was consumed and no transcript
-   can be recovered, and it ends the stream with a single non-recoverable
-   error event rather than a fabricated empty result.
+   `ConnectionPoolExhaustedError` (package root) and `BackpressureError` /
+   `OwnershipViolationError` (`livekit.plugins.voxist.exceptions`) still
+   import but are never raised. `TranscriptLostError` is new: audio was
+   consumed and no transcript can be recovered, so the stream ends with one
+   non-recoverable error event instead of a fabricated empty result.
 
-3. **Expect one socket per stream.** A VAD-driven conversation now runs every
-   turn on the same socket (`flush()` marks a segment, `end_input()` sends
-   `Done` once). Per-stream `language` overrides are honoured, `fr-medical`
-   is emitted as `fr-MEDICAL` in `SpeechData.language`, and
-   `wait_for_initialization()` proves WebSocket reachability with one short
-   probe (set `validate_websocket=False` to skip it).
+3. **Compare `SpeechData.language` case-insensitively.** LiveKit normalises
+   it to BCP-47, so `fr-medical` is emitted as `fr-MEDICAL`. The raw code is
+   still what Voxist receives.
 
-The full list is in [CHANGELOG.md](https://github.com/voxist/livekit-plugins-voxist/blob/main/CHANGELOG.md).
+Everything else is behavioural: one socket per stream, `flush()` marks a
+segment and `end_input()` sends `Done` once, and readiness checks probe the
+WebSocket path. The full list is in [CHANGELOG.md](https://github.com/voxist/livekit-plugins-voxist/blob/main/CHANGELOG.md).
 
 ## Quick Start
 
 ```python
 from livekit import agents
+from livekit.agents import Agent, AgentSession, cli
 from livekit.plugins import voxist, openai, elevenlabs
 
 async def entrypoint(ctx: agents.JobContext):
-    # Initialize Voxist STT
-    stt = voxist.VoxistSTT(language="fr")
+    await ctx.connect()
 
-    # Create voice agent
-    agent = agents.VoicePipelineAgent(
-        stt=stt,
-        llm=openai.LLM(model="gpt-4"),
-        tts=elevenlabs.TTS(voice="Rachel"),
+    session = AgentSession(
+        stt=voxist.VoxistSTT(language="fr"),
+        llm=openai.LLM(model="gpt-4o-mini"),
+        tts=elevenlabs.TTS(),
     )
-
-    await agent.start(ctx.room)
+    await session.start(
+        agent=Agent(instructions="Tu es un assistant vocal. Réponds en français."),
+        room=ctx.room,
+    )
 
 if __name__ == "__main__":
     cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint))
@@ -96,9 +96,9 @@ stt = voxist.VoxistSTT(
     chunk_duration_ms=100,       # Audio chunk size
     stride_overlap_ms=20,        # Chunk overlap for accuracy
     connection_timeout=10.0,     # Bounds the token exchange and the dial
-    punctuation_mode=None,       # "Dictated" keeps the speaker's own punctuation (fr only)
+    punctuation_mode=None,       # "Dictated" keeps spoken punctuation (fr only, gateway V2 flag)
     ssl_context=None,            # For a private-CA deployment; verification is never disabled
-    validate_websocket=True,     # Readiness probes the WebSocket path once
+    validate_websocket=True,     # wait_for_initialization() / async with probe the WebSocket once
 )
 ```
 

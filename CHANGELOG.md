@@ -7,10 +7,10 @@ bump may change behaviour).
 
 ## [0.10.0] - 2026-09-07
 
-The transport was rewritten. The public API is import-compatible with 0.9.x
-(no class, function or exception was removed), but runtime behaviour changes
-in ways you should read before upgrading. See
-[Upgrading from 0.9.x](README.md#upgrading-from-09x) in the README for the
+The transport was rewritten. Every name exported from the package root in
+0.9.x still imports (see *Removed* for the two submodules that changed), but
+runtime behaviour changes in ways you should read before upgrading. See
+[Upgrading from 0.9.x](https://github.com/voxist/livekit-plugins-voxist#upgrading-from-09x) in the README for the
 short version.
 
 ### Changed
@@ -18,7 +18,7 @@ short version.
 - **One WebSocket per stream; the connection pool is gone.** The Voxist
   gateway closes every socket after `Done`, so sockets were never reusable.
   Each `stream()` now dials its own socket on demand, with the stream's
-  language in the URL. `connection_pool.py` is replaced by `connection.py`.
+  language in the URL.
 - **Retries belong to LiveKit.** The plugin no longer runs its own
   reconnect loop. Interruptions surface as `APIConnectionError`, and
   `RecognizeStream` re-attempts them according to `conn_options.max_retry`
@@ -54,12 +54,14 @@ short version.
   after `aclose()`.
 - **Fast turn ending.** The engine's `Done!` acknowledgement is recognised
   (0.9.x logged it as invalid JSON on every session), and a turn ends about
-  0.3 s after `Done` instead of waiting out a 5 s drain.
+  0.5 s after the engine's last post-`Done` final instead of waiting out a
+  5 s drain.
 - **Emitted language codes are BCP-47.** LiveKit normalises
   `SpeechData.language`, so `fr-medical` is emitted as `fr-MEDICAL`. The raw
   code is still what Voxist receives.
-- **`connection_timeout` is honoured.** It bounds both the HTTPS token
-  exchange and the WebSocket dial. 0.9.x accepted it and ignored it.
+- **`connection_timeout` bounds the token exchange too.** 0.9.x applied it
+  to the WebSocket dial only; the HTTPS token exchange had a fixed 10 s
+  timeout.
 - **Token lifetime comes from the JWT.** Expiry is read from the token's
   `exp` claim instead of an assumed hour.
 - **Programming errors are not retried.** `stream()` on a closed plugin,
@@ -112,26 +114,37 @@ short version.
 ### Deprecated
 
 - `connection_pool_size` and `max_reconnect_attempts` on `VoxistSTT` are
-  accepted and ignored. A non-default value logs a warning once. The old
-  1 to 5 range check on `connection_pool_size` is gone.
+  accepted and ignored. A non-default value logs a warning each time a
+  `VoxistSTT` is constructed. The old 1 to 5 range check on
+  `connection_pool_size` is gone.
 - `ConnectionPoolExhaustedError`, `BackpressureError` and
-  `OwnershipViolationError` are never raised. They stay importable so
-  existing `except` clauses keep working; catch `ConnectionError` and
-  `TranscriptLostError` instead.
-- `DEFAULT_CONFIG` no longer lists `connection_pool_size`.
+  `OwnershipViolationError` are never raised. They stay importable from
+  where they were (`ConnectionPoolExhaustedError` from the package root, all
+  three from `livekit.plugins.voxist.exceptions`) so existing `except`
+  clauses keep working; catch `ConnectionError` and `TranscriptLostError`
+  instead.
 
-### Internal
+### Removed
 
-- The mock gateway used by the test suite now mirrors the real protocol
-  (no greeting frame, one final per silence-delimited segment, `Done!`
-  acknowledgement, socket closed after `Done`) and binds ephemeral ports.
-- CI runs the integration suite and installs the package before `mypy`, so
-  the type gate checks real types.
-- 621 tests, about 80 s locally.
+- The `livekit.plugins.voxist.connection_pool` module, with `ConnectionPool`.
+- `Connection` and `ConnectionState` from `livekit.plugins.voxist.models`.
+  Neither was exported from the package root; code that imported them from
+  the submodule will fail at import.
 
 ## [0.9.1] - 2026-01-13
 
 Last release of the pooled-connection architecture.
 
+### Changed
+
+- Python 3.9 is no longer supported; `requires-python` is `>=3.10`.
+- Plugin logging aligned with LiveKit's conventions, with less noise at
+  INFO.
+
+## [0.9.0] - 2025-12-16
+
+First PyPI release.
+
 [0.10.0]: https://github.com/voxist/livekit-plugins-voxist/compare/0.9.1...v0.10.0
-[0.9.1]: https://github.com/voxist/livekit-plugins-voxist/releases/tag/0.9.1
+[0.9.1]: https://github.com/voxist/livekit-plugins-voxist/compare/v0.9.0...0.9.1
+[0.9.0]: https://github.com/voxist/livekit-plugins-voxist/releases/tag/v0.9.0

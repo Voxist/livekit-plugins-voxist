@@ -51,6 +51,7 @@ Homepage = "https://github.com/voxist/livekit-plugins-voxist"
 Documentation = "https://github.com/voxist/livekit-plugins-voxist#readme"
 Repository = "https://github.com/voxist/livekit-plugins-voxist"
 Issues = "https://github.com/voxist/livekit-plugins-voxist/issues"
+Changelog = "https://github.com/voxist/livekit-plugins-voxist/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["setuptools>=68.0.0", "wheel"]

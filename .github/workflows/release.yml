@@ -18,19 +18,27 @@ jobs:
       - name: Generate release notes
         id: notes
         run: |
-          # Get the previous tag
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          # Prefer the curated CHANGELOG.md section for this version; fall
+          # back to the raw commit list only when no section exists.
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
+          awk -v ver="$VERSION" '
+            /^## \[/ { if (found) exit; if (index($0, "## [" ver "]") == 1) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > /tmp/changes.txt 2>/dev/null || true
 
-          if [ -n "$PREV_TAG" ]; then
-            echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
-            CHANGES=$(git log --pretty=format:"- %s" $PREV_TAG..${{ github.ref_name }} --no-merges)
+          if [ -s /tmp/changes.txt ]; then
+            echo "Release notes taken from CHANGELOG.md section [$VERSION]"
           else
-            echo "First release, showing all commits"
-            CHANGES=$(git log --pretty=format:"- %s" --no-merges)
+            PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+            if [ -n "$PREV_TAG" ]; then
+              echo "No CHANGELOG section for $VERSION; listing commits from $PREV_TAG to ${{ github.ref_name }}"
+              git log --pretty=format:"- %s" $PREV_TAG..${{ github.ref_name }} --no-merges > /tmp/changes.txt
+            else
+              echo "No CHANGELOG section and no previous tag; listing all commits"
+              git log --pretty=format:"- %s" --no-merges > /tmp/changes.txt
+            fi
           fi
-
-          # Write to file to handle multiline
-          echo "$CHANGES" > /tmp/changes.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1

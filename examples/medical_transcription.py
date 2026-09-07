@@ -16,8 +16,10 @@ Usage:
 import asyncio
 import logging
 from datetime import datetime
-from livekit import agents, rtc
+
 from livekit.agents import cli, stt
+
+from livekit import agents, rtc
 
 # Import Voxist plugin
 from livekit.plugins import voxist
@@ -129,7 +131,7 @@ async def entrypoint(ctx: agents.JobContext):
     ):
         if track.kind == rtc.TrackKind.KIND_AUDIO:
             logger.info(f"Processing audio from {participant.identity}")
-            ctx.create_task(process_audio_track(track, participant.identity))
+            asyncio.create_task(process_audio_track(track, participant.identity))
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):

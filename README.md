@@ -17,6 +17,38 @@ Production-ready LiveKit Speech-to-Text plugin for [Voxist](https://voxist.com) 
 pip install livekit-plugins-voxist
 ```
 
+## Upgrading from 0.9.x
+
+0.10.0 replaces the connection pool with one WebSocket per stream and hands
+retries to LiveKit. Nothing was removed from the public API, but three things
+deserve a check in your code:
+
+1. **Drop `connection_pool_size` and `max_reconnect_attempts`.** Both are
+   accepted and ignored, and a non-default value logs a deprecation warning.
+   Retries are configured on the stream instead:
+
+   ```python
+   from livekit.agents import APIConnectOptions
+
+   stream = stt.stream(conn_options=APIConnectOptions(max_retry=3, retry_interval=2.0))
+   ```
+
+2. **Catch `ConnectionError` and `TranscriptLostError`.**
+   `ConnectionPoolExhaustedError`, `BackpressureError` and
+   `OwnershipViolationError` still import but are never raised.
+   `TranscriptLostError` is new: it means audio was consumed and no transcript
+   can be recovered, and it ends the stream with a single non-recoverable
+   error event rather than a fabricated empty result.
+
+3. **Expect one socket per stream.** A VAD-driven conversation now runs every
+   turn on the same socket (`flush()` marks a segment, `end_input()` sends
+   `Done` once). Per-stream `language` overrides are honoured, `fr-medical`
+   is emitted as `fr-MEDICAL` in `SpeechData.language`, and
+   `wait_for_initialization()` proves WebSocket reachability with one short
+   probe (set `validate_websocket=False` to skip it).
+
+The full list is in [CHANGELOG.md](https://github.com/voxist/livekit-plugins-voxist/blob/main/CHANGELOG.md).
+
 ## Quick Start
 
 ```python
@@ -63,6 +95,10 @@ stt = voxist.VoxistSTT(
     interim_results=True,
     chunk_duration_ms=100,       # Audio chunk size
     stride_overlap_ms=20,        # Chunk overlap for accuracy
+    connection_timeout=10.0,     # Bounds the token exchange and the dial
+    punctuation_mode=None,       # "Dictated" keeps the speaker's own punctuation (fr only)
+    ssl_context=None,            # For a private-CA deployment; verification is never disabled
+    validate_websocket=True,     # Readiness probes the WebSocket path once
 )
 ```
 
@@ -92,8 +128,8 @@ stt = voxist.VoxistSTT(
 
 ## Documentation
 
-- **Technical Specification:** See `/claudedocs/livekit-plugin-technical-specification.md`
-- **API Reference:** Coming soon
+- **Changelog:** [CHANGELOG.md](https://github.com/voxist/livekit-plugins-voxist/blob/main/CHANGELOG.md)
+- **API Reference:** the `VoxistSTT` constructor docstring documents every parameter
 - **Examples:** See `examples/` directory
 
 ## Local Development with Docker

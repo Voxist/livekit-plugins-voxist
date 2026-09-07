@@ -39,7 +39,6 @@ async def entrypoint(ctx: agents.JobContext):
     stt = voxist.VoxistSTT(
         language="fr",
         interim_results=True,
-        connection_pool_size=2,
     )
 
     # Initialize VAD (Voice Activity Detection)

@@ -36,7 +36,6 @@ async def entrypoint(ctx: agents.JobContext):
     voxist_stt = voxist.VoxistSTT(
         language="fr",
         interim_results=True,  # Get partial transcriptions
-        connection_pool_size=2,
     )
 
     logger.info("Voxist STT initialized, waiting for participants...")

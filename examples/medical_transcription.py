@@ -60,7 +60,6 @@ async def entrypoint(ctx: agents.JobContext):
     voxist_stt = voxist.VoxistSTT(
         language="fr-medical",  # Specialized medical vocabulary
         interim_results=True,
-        connection_pool_size=3,  # More connections for reliability
     )
 
     logger.info("Voxist Medical STT initialized")

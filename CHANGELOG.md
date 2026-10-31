@@ -15,10 +15,15 @@ bump may change behaviour).
   repeats them; never persisted by the gateway. Cleaned like the gateway
   does (whitespace, blanks, duplicates, 256-byte terms, 5000 cap). Only
   effective where the deployment has a vocabulary pack for the language.
-  The gateway must forward the frame to the engine (it does when the pod
-  has `KROKO_VOCAB_PACK_DIR`); otherwise hotwords are ignored and
-  transcription runs unbiased. The gateway's `{"type": "hotwords", ...}`
-  reply is logged as counts only, never the terms. A refusal
+  The gateway must forward the frame to the engine: it needs
+  `KROKO_VOCAB_PACK_DIR` on the pod and, with the language in the URL,
+  asr-all with Voxist/asr-all#918 (before it, a config that reached the
+  gateway after the engine socket opened was stored but never sent);
+  otherwise hotwords are ignored and transcription runs unbiased. The
+  gateway's `{"type": "hotwords", ...}` reply is logged as counts only,
+  never the terms; a reply carrying a reason (`too_late`: the engine had
+  already received data, so nothing was boosted) is logged as a warning.
+  A refusal
   (close code 1008) is classified by the stream's receive path, as for any
   other session; the config send itself does not detect it, because aiohttp
   only sets `close_code` once the close frame has been read.

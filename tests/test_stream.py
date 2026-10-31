@@ -4961,3 +4961,25 @@ class TestHotwordsOnTheStream:
         assert "reason=too_late" in caplog.text
         assert "Secret" not in caplog.text and "Other Term" not in caplog.text
         assert not stream._text_seen_in_session  # not treated as a transcript
+
+    @pytest.mark.asyncio
+    async def test_a_reply_with_a_reason_is_a_warning_because_nothing_was_boosted(self, caplog):
+        # asr-all answers a hotwords config it could not apply (it arrived after the
+        # engine had already received data) with reason=too_late (vr-68y1.5). That
+        # session runs unboosted, which an operator must see without INFO logging.
+        stream = await make_stream()
+        with caplog.at_level("INFO", logger="livekit.plugins.voxist"):
+            await stream._process_result(
+                {"type": "hotwords", "accepted": 0, "rejected": [], "reason": "too_late"}
+            )
+            await stream._process_result(
+                {"type": "hotwords", "accepted": 3, "rejected": ["Secret Name"]}
+            )
+        levels = {
+            r.getMessage(): r.levelname for r in caplog.records if "hotwords:" in r.getMessage()
+        }
+        too_late = [m for m in levels if "reason=too_late" in m]
+        partial = [m for m in levels if "accepted=3 rejected=1" in m]
+        assert len(too_late) == 1 and levels[too_late[0]] == "WARNING"
+        assert len(partial) == 1 and levels[partial[0]] == "INFO"
+        assert "Secret" not in caplog.text

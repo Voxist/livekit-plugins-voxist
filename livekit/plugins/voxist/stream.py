@@ -2572,10 +2572,14 @@ class VoxistSTTStream(RecognizeStream):
             # log. Not a transcript, so it touches no liveness accounting.
             accepted = data.get("accepted")
             rejected = data.get("rejected")
-            logger.info(
+            reason = _reason_suffix(data.get("reason"))
+            # A reason (e.g. too_late: the config reached the gateway after the
+            # engine had data) means nothing was boosted: this session runs
+            # unbiased, so it is a warning, not routine.
+            log = logger.warning if reason else logger.info
+            log(
                 f"Stream {self._session_id} hotwords: "
-                f"accepted={_count(accepted)} rejected={_count(rejected)}"
-                f"{_reason_suffix(data.get('reason'))}"
+                f"accepted={_count(accepted)} rejected={_count(rejected)}{reason}"
             )
             return
         is_transcript = msg_type in ("partial", "final")

@@ -211,6 +211,13 @@ def _frame_seconds(frame: rtc.AudioFrame) -> float:
     return samples / rate
 
 
+def _reason_suffix(value: object) -> str:
+    """The gateway's short machine reason (e.g. "too_late"), if it is one."""
+    if isinstance(value, str) and 0 < len(value) <= 40 and value.isidentifier():
+        return f" reason={value}"
+    return ""
+
+
 def _count(value: object) -> str:
     """A count from a gateway field that may be a number or a list; never its content."""
     if isinstance(value, bool):
@@ -2568,6 +2575,7 @@ class VoxistSTTStream(RecognizeStream):
             logger.info(
                 f"Stream {self._session_id} hotwords: "
                 f"accepted={_count(accepted)} rejected={_count(rejected)}"
+                f"{_reason_suffix(data.get('reason'))}"
             )
             return
         is_transcript = msg_type in ("partial", "final")

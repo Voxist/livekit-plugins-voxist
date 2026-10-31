@@ -874,10 +874,12 @@ class VoxistSTT(STT):
             try:
                 await ws.send_str(json.dumps({"config": config}))
             except Exception as e:
-                # A refusal at the application layer (1008: bad credential or
-                # exhausted balance) can land between the upgrade and this
-                # send; it is the same permanent answer the readiness probe
-                # maps to AuthenticationError, not a retryable transport blip.
+                # Defensive only: aiohttp sets close_code once the close frame
+                # has been READ, which a failed send_str does not do, so this
+                # is usually None here and the stream's receive path is what
+                # classifies a 1008. If the code is known, 1008 is the same
+                # permanent answer the readiness probe maps to
+                # AuthenticationError, not a retryable transport blip.
                 code = ws.close_code
                 with contextlib.suppress(Exception):
                     await ws.close()

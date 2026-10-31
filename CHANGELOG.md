@@ -18,8 +18,10 @@ bump may change behaviour).
   The gateway must forward the frame to the engine (it does when the pod
   has `KROKO_VOCAB_PACK_DIR`); otherwise hotwords are ignored and
   transcription runs unbiased. The gateway's `{"type": "hotwords", ...}`
-  reply is logged as counts only, never the terms. A 1008 close during the
-  send raises `AuthenticationError`, like the readiness probe.
+  reply is logged as counts only, never the terms. A refusal
+  (close code 1008) is classified by the stream's receive path, as for any
+  other session; the config send itself does not detect it, because aiohttp
+  only sets `close_code` once the close frame has been read.
 
 ## [0.10.0] - 2026-09-07
 

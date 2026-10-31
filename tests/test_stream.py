@@ -4954,5 +4954,10 @@ class TestHotwordsOnTheStream:
                 {"type": "hotwords", "accepted": 0, "rejected": ["Secret Name", "Other Term"]}
             )
         assert "accepted=0 rejected=2" in caplog.text
+        with caplog.at_level("INFO", logger="livekit.plugins.voxist"):
+            await stream._process_result(
+                {"type": "hotwords", "accepted": 0, "rejected": [], "reason": "too_late"}
+            )
+        assert "reason=too_late" in caplog.text
         assert "Secret" not in caplog.text and "Other Term" not in caplog.text
         assert not stream._text_seen_in_session  # not treated as a transcript

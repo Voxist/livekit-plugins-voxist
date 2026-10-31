@@ -2297,3 +2297,137 @@ class TestPunctuationModeIsValidatedAtTheBoundary:
     def test_lookalikes_fail_loudly(self, bad):
         with pytest.raises(ConfigurationError, match="punctuation_mode"):
             VoxistSTT(api_key="k", punctuation_mode=bad)
+
+
+class TestHotwordsPassThrough:
+    """Per-call hotwords ride a {"config": {"hotwords": [...]}} message sent
+    right after every dial, before any audio (gateway contract:
+    asr-all session-hotwords.util.ts). Offline: the dialer is a mock."""
+
+    @staticmethod
+    def _dialed(stt, ws):
+        dialer = AsyncMock()
+        dialer.dial.return_value = ws
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        return dialer
+
+    @pytest.mark.asyncio
+    async def test_frame_is_sent_after_dial_on_every_dial(self):
+        import json
+
+        stt = VoxistSTT(
+            api_key="k", hotwords=["Robin des Bois", "rue Victor Hugo"],
+            hotwords_score=3.0,
+        )
+        for _ in range(2):  # a reconnect repeats the same config
+            ws = AsyncMock()
+            self._dialed(stt, ws)
+            assert await stt._dial("fr") is ws
+            ws.send_str.assert_awaited_once()
+            assert json.loads(ws.send_str.await_args.args[0]) == {
+                "config": {
+                    "hotwords": ["Robin des Bois", "rue Victor Hugo"],
+                    "hotwords_score": 3.0,
+                }
+            }
+
+    @pytest.mark.asyncio
+    async def test_no_hotwords_sends_nothing(self):
+        stt = VoxistSTT(api_key="k")
+        ws = AsyncMock()
+        self._dialed(stt, ws)
+        await stt._dial("fr")
+        ws.send_str.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_score_omitted_when_unset(self):
+        import json
+
+        stt = VoxistSTT(api_key="k", hotwords=["Acme"])
+        ws = AsyncMock()
+        self._dialed(stt, ws)
+        await stt._dial("fr")
+        sent = json.loads(ws.send_str.await_args.args[0])
+        assert sent == {"config": {"hotwords": ["Acme"]}}
+
+    @pytest.mark.asyncio
+    async def test_send_failure_closes_socket_and_is_a_connection_error(self):
+        from livekit.plugins.voxist.exceptions import ConnectionError as VCE
+
+        stt = VoxistSTT(api_key="k", hotwords=["Acme"])
+        ws = AsyncMock()
+        ws.send_str.side_effect = RuntimeError("closed")
+        self._dialed(stt, ws)
+        with pytest.raises(VCE):
+            await stt._dial("fr")
+        ws.close.assert_awaited_once()
+
+    def test_list_is_cleaned_like_the_gateway(self):
+        stt = VoxistSTT(
+            api_key="k",
+            hotwords=["  Acme   Corp ", "acme corp", "", "x" * 257, "Zed"],
+        )
+        assert stt._hotwords == ("Acme Corp", "Zed")
+
+    def test_list_is_capped_at_the_gateway_limit(self):
+        stt = VoxistSTT(api_key="k", hotwords=[f"w{i}" for i in range(6000)])
+        assert len(stt._hotwords) == 5000
+
+    @pytest.mark.parametrize("bad", ["Acme", b"Acme", 5, [1], ["ok", None]])
+    def test_malformed_list_fails_at_construction(self, bad):
+        with pytest.raises(ConfigurationError, match="hotwords"):
+            VoxistSTT(api_key="k", hotwords=bad)
+
+    @pytest.mark.parametrize("bad", [0.1, 11, float("nan"), float("inf"), "3", True])
+    def test_bad_score_fails_at_construction(self, bad):
+        with pytest.raises(ConfigurationError, match="hotwords_score"):
+            VoxistSTT(api_key="k", hotwords=["Acme"], hotwords_score=bad)
+
+
+class TestHotwordsEdgeCases:
+    @pytest.mark.asyncio
+    async def test_1008_during_the_send_is_an_authentication_error(self):
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+
+        stt = VoxistSTT(api_key="k", hotwords=["Acme"])
+        ws = AsyncMock()
+        ws.send_str.side_effect = ConnectionResetError("closed")
+        ws.close_code = 1008
+        dialer = AsyncMock()
+        dialer.dial.return_value = ws
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        with pytest.raises(AuthenticationError):
+            await stt._dial("fr")
+        ws.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_other_close_codes_stay_retryable_connection_errors(self):
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+        from livekit.plugins.voxist.exceptions import ConnectionError as VCE
+
+        stt = VoxistSTT(api_key="k", hotwords=["Acme"])
+        ws = AsyncMock()
+        ws.send_str.side_effect = ConnectionResetError("closed")
+        ws.close_code = 1006
+        dialer = AsyncMock()
+        dialer.dial.return_value = ws
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        with pytest.raises(VCE) as exc:
+            await stt._dial("fr")
+        assert not isinstance(exc.value, AuthenticationError)
+
+    @pytest.mark.asyncio
+    async def test_the_readiness_probe_sends_no_config_frame(self):
+        stt = VoxistSTT(api_key="k", hotwords=["Acme"])
+        ws = AsyncMock()
+        ws.receive = AsyncMock(side_effect=asyncio.TimeoutError)
+        dialer = AsyncMock()
+        dialer.dial.return_value = ws
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        try:
+            await stt._validate_websocket_path(1.0)
+        except Exception:
+            pass  # the probe's verdict is irrelevant here; only what it sent
+        dialer.dial.assert_awaited_once()
+        ws.send_str.assert_not_awaited()
+        ws.send_bytes.assert_not_awaited()

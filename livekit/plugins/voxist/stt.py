@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import math
 import os
 import ssl
 import time
 import weakref
+from collections.abc import Sequence
 from enum import Enum
 
 import aiohttp
@@ -57,6 +60,54 @@ class InitializationState(Enum):
     RUNNING = "running"           # Initialization in progress
     COMPLETED = "completed"       # Successfully initialized
     FAILED = "failed"             # Initialization failed with error
+
+
+#: Same bounds as the gateway's intake (session-hotwords.util.ts in asr-all):
+#: it drops over-long terms and truncates, so cleaning here changes nothing
+#: the server would not, but keeps an oversized frame off the wire.
+HOTWORDS_MAX_TERMS = 5000
+HOTWORDS_MAX_TERM_BYTES = 256
+HOTWORDS_MIN_SCORE = 0.5
+HOTWORDS_MAX_SCORE = 10.0
+
+
+def _clean_hotwords(raw: Sequence[str] | None) -> tuple[str, ...]:
+    """Normalise a hotword list the way the gateway does; never silently
+    accept a non-string (a str passed instead of a list would otherwise be
+    split into characters)."""
+    if raw is None:
+        return ()
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise ConfigurationError(
+            "hotwords must be a list of strings, not "
+            f"{type(raw).__name__}"
+        )
+    seen: set[str] = set()
+    terms: list[str] = []
+    dropped = 0
+    for item in raw:
+        if not isinstance(item, str):
+            raise ConfigurationError(
+                f"hotwords entries must be strings, got {type(item).__name__}"
+            )
+        term = " ".join(item.split())
+        if not term or len(term.encode("utf-8")) > HOTWORDS_MAX_TERM_BYTES:
+            dropped += 1
+            continue
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        terms.append(term)
+    truncated = max(0, len(terms) - HOTWORDS_MAX_TERMS)
+    if dropped or truncated:
+        logger.warning(
+            "hotwords: dropped %d unusable and %d beyond the %d-term cap",
+            dropped,
+            truncated,
+            HOTWORDS_MAX_TERMS,
+        )
+    return tuple(terms[:HOTWORDS_MAX_TERMS])
 
 
 class VoxistSTT(STT):
@@ -143,6 +194,8 @@ class VoxistSTT(STT):
         punctuation_mode: str | None = None,
         ssl_context: ssl.SSLContext | None = None,
         validate_websocket: bool = True,
+        hotwords: Sequence[str] | None = None,
+        hotwords_score: float | None = None,
     ):
         """
         Initialize Voxist STT plugin.
@@ -188,6 +241,21 @@ class VoxistSTT(STT):
                 _validate_websocket_path for the deployment-health story
                 and the cost). Set False to make readiness token-only, as
                 it was before this validation existed.
+            hotwords: Plain words or phrases to bias decoding toward (names,
+                brands, streets). Sent to the gateway as a
+                {"config": {"hotwords": [...]}} message right after every
+                dial, before any audio, so a retried stream repeats them.
+                Per connection: the gateway never persists them. The list is
+                cleaned the way the gateway cleans it (whitespace collapsed,
+                blanks, duplicates and terms over 256 UTF-8 bytes dropped,
+                at most 5000 kept); a non-string entry raises
+                ConfigurationError. Only effective where the deployment has a
+                vocabulary pack (KROKO_VOCAB_PACK_DIR) for the language;
+                elsewhere the gateway ignores them and transcription runs
+                unbiased.
+            hotwords_score: Boost strength, 0.5 to 10 (the gateway clamps to
+                the same range). None (default) uses the deployed pack's
+                tuned value.
 
         Raises:
             ConfigurationError: If API key missing or invalid config
@@ -295,6 +363,19 @@ class VoxistSTT(STT):
                 "keep automatic punctuation."
             )
         self._punctuation_mode = punctuation_mode
+        self._hotwords = _clean_hotwords(hotwords)
+        if hotwords_score is not None and (
+            isinstance(hotwords_score, bool)
+            or not isinstance(hotwords_score, (int, float))
+            or not math.isfinite(hotwords_score)
+            or not HOTWORDS_MIN_SCORE <= hotwords_score <= HOTWORDS_MAX_SCORE
+        ):
+            raise ConfigurationError(
+                f"hotwords_score={hotwords_score!r} must be a number between "
+                f"{HOTWORDS_MIN_SCORE} and {HOTWORDS_MAX_SCORE}, or None for "
+                "the deployed pack's tuned value."
+            )
+        self._hotwords_score = hotwords_score
         self._heartbeat_interval = heartbeat_interval
         self._connection_timeout = connection_timeout
         self._owns_session = http_session is None
@@ -777,9 +858,41 @@ class VoxistSTT(STT):
         # dies immediately after connecting. Readiness has one source of
         # proof, the probe, which actually watches for that close; see the
         # readiness definition above _reachability_proven.
-        return await dialer.dial(
+        ws = await dialer.dial(
             language, 16000, punctuation_mode=self._punctuation_mode
         )
+        if self._hotwords:
+            # Before any audio: the engine applies the frame only while its
+            # stream has heard nothing. Every dial (first attempt and each
+            # retry) goes through here, so a reconnect repeats the list.
+            # Terms containing "/" are not filtered here: the engine drops
+            # them (it rewrites "/" to a newline) and the gateway reports them
+            # back as rejected, so filtering is downstream by design.
+            config: dict[str, object] = {"hotwords": list(self._hotwords)}
+            if self._hotwords_score is not None:
+                config["hotwords_score"] = self._hotwords_score
+            try:
+                await ws.send_str(json.dumps({"config": config}))
+            except Exception as e:
+                # Defensive only: aiohttp sets close_code once the close frame
+                # has been READ, which a failed send_str does not do, so this
+                # is usually None here and the stream's receive path is what
+                # classifies a 1008. If the code is known, 1008 is the same
+                # permanent answer the readiness probe maps to
+                # AuthenticationError, not a retryable transport blip.
+                code = ws.close_code
+                with contextlib.suppress(Exception):
+                    await ws.close()
+                if code == 1008:
+                    raise AuthenticationError(
+                        "The gateway closed the socket with 1008 before the "
+                        "hotwords could be sent: the credential or the "
+                        "account was refused at the application layer."
+                    ) from e
+                raise VoxistConnectionError(
+                    f"Sending hotwords failed: {e}"
+                ) from e
+        return ws
 
     async def _initialize_pool(self) -> None:
         """

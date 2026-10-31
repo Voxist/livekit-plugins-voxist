@@ -5,6 +5,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/) (pre-1.0: a minor
 bump may change behaviour).
 
+## [Unreleased]
+
+### Added
+
+- `VoxistSTT(hotwords=[...], hotwords_score=...)`: per-connection decoding
+  hotwords (names, brands, streets). Sent as a `{"config": {"hotwords": [...]}}`
+  message right after every dial, before any audio, so a retried stream
+  repeats them; never persisted by the gateway. Cleaned like the gateway
+  does (whitespace, blanks, duplicates, 256-byte terms, 5000 cap). Only
+  effective where the deployment has a vocabulary pack for the language.
+  The gateway must forward the frame to the engine (it does when the pod
+  has `KROKO_VOCAB_PACK_DIR`); otherwise hotwords are ignored and
+  transcription runs unbiased. The gateway's `{"type": "hotwords", ...}`
+  reply is logged as counts only, never the terms. A refusal
+  (close code 1008) is classified by the stream's receive path, as for any
+  other session; the config send itself does not detect it, because aiohttp
+  only sets `close_code` once the close frame has been read.
+
 ## [0.10.0] - 2026-09-07
 
 The transport was rewritten. Every name exported from the package root in

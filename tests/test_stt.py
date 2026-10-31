@@ -2382,3 +2382,52 @@ class TestHotwordsPassThrough:
     def test_bad_score_fails_at_construction(self, bad):
         with pytest.raises(ConfigurationError, match="hotwords_score"):
             VoxistSTT(api_key="k", hotwords=["Acme"], hotwords_score=bad)
+
+
+class TestHotwordsEdgeCases:
+    @pytest.mark.asyncio
+    async def test_1008_during_the_send_is_an_authentication_error(self):
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+
+        stt = VoxistSTT(api_key="k", hotwords=["Acme"])
+        ws = AsyncMock()
+        ws.send_str.side_effect = ConnectionResetError("closed")
+        ws.close_code = 1008
+        dialer = AsyncMock()
+        dialer.dial.return_value = ws
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        with pytest.raises(AuthenticationError):
+            await stt._dial("fr")
+        ws.close.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_other_close_codes_stay_retryable_connection_errors(self):
+        from livekit.plugins.voxist.exceptions import AuthenticationError
+        from livekit.plugins.voxist.exceptions import ConnectionError as VCE
+
+        stt = VoxistSTT(api_key="k", hotwords=["Acme"])
+        ws = AsyncMock()
+        ws.send_str.side_effect = ConnectionResetError("closed")
+        ws.close_code = 1006
+        dialer = AsyncMock()
+        dialer.dial.return_value = ws
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        with pytest.raises(VCE) as exc:
+            await stt._dial("fr")
+        assert not isinstance(exc.value, AuthenticationError)
+
+    @pytest.mark.asyncio
+    async def test_the_readiness_probe_sends_no_config_frame(self):
+        stt = VoxistSTT(api_key="k", hotwords=["Acme"])
+        ws = AsyncMock()
+        ws.receive = AsyncMock(side_effect=asyncio.TimeoutError)
+        dialer = AsyncMock()
+        dialer.dial.return_value = ws
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        try:
+            await stt._validate_websocket_path(1.0)
+        except Exception:
+            pass  # the probe's verdict is irrelevant here; only what it sent
+        dialer.dial.assert_awaited_once()
+        ws.send_str.assert_not_awaited()
+        ws.send_bytes.assert_not_awaited()

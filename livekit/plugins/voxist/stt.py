@@ -865,14 +865,28 @@ class VoxistSTT(STT):
             # Before any audio: the engine applies the frame only while its
             # stream has heard nothing. Every dial (first attempt and each
             # retry) goes through here, so a reconnect repeats the list.
+            # Terms containing "/" are not filtered here: the engine drops
+            # them (it rewrites "/" to a newline) and the gateway reports them
+            # back as rejected, so filtering is downstream by design.
             config: dict[str, object] = {"hotwords": list(self._hotwords)}
             if self._hotwords_score is not None:
                 config["hotwords_score"] = self._hotwords_score
             try:
                 await ws.send_str(json.dumps({"config": config}))
             except Exception as e:
+                # A refusal at the application layer (1008: bad credential or
+                # exhausted balance) can land between the upgrade and this
+                # send; it is the same permanent answer the readiness probe
+                # maps to AuthenticationError, not a retryable transport blip.
+                code = ws.close_code
                 with contextlib.suppress(Exception):
                     await ws.close()
+                if code == 1008:
+                    raise AuthenticationError(
+                        "The gateway closed the socket with 1008 before the "
+                        "hotwords could be sent: the credential or the "
+                        "account was refused at the application layer."
+                    ) from e
                 raise VoxistConnectionError(
                     f"Sending hotwords failed: {e}"
                 ) from e

@@ -211,6 +211,17 @@ def _frame_seconds(frame: rtc.AudioFrame) -> float:
     return samples / rate
 
 
+def _count(value: object) -> str:
+    """A count from a gateway field that may be a number or a list; never its content."""
+    if isinstance(value, bool):
+        return "n/a"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, list):
+        return str(len(value))
+    return "n/a"
+
+
 class VoxistSTTStream(RecognizeStream):
     """
     Streaming interface for Voxist ASR.
@@ -2547,6 +2558,18 @@ class VoxistSTTStream(RecognizeStream):
             return
 
         msg_type = data.get("type")
+        if msg_type == "hotwords":
+            # The gateway's answer to our hotwords config:
+            # {"type": "hotwords", "accepted": n, "rejected": [...]}. Counts
+            # only: the terms are the customer's vocabulary and never go to a
+            # log. Not a transcript, so it touches no liveness accounting.
+            accepted = data.get("accepted")
+            rejected = data.get("rejected")
+            logger.info(
+                f"Stream {self._session_id} hotwords: "
+                f"accepted={_count(accepted)} rejected={_count(rejected)}"
+            )
+            return
         is_transcript = msg_type in ("partial", "final")
 
         # "text" is server-supplied: anything that is not a string (absent,

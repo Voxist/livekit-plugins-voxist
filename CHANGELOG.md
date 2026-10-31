@@ -15,6 +15,11 @@ bump may change behaviour).
   repeats them; never persisted by the gateway. Cleaned like the gateway
   does (whitespace, blanks, duplicates, 256-byte terms, 5000 cap). Only
   effective where the deployment has a vocabulary pack for the language.
+  The gateway must forward the frame to the engine (it does when the pod
+  has `KROKO_VOCAB_PACK_DIR`); otherwise hotwords are ignored and
+  transcription runs unbiased. The gateway's `{"type": "hotwords", ...}`
+  reply is logged as counts only, never the terms. A 1008 close during the
+  send raises `AuthenticationError`, like the readiness probe.
 
 ## [0.10.0] - 2026-09-07
 

@@ -4902,3 +4902,57 @@ class TestRoundSeventeenRegressions:
             "the interims-only tier completed a drift-known loss with no "
             "gate-level drift mention"
         )
+
+
+class TestHotwordsOnTheStream:
+    """Hotwords at stream level: config before the first audio byte, and the
+    gateway's reply is logged as counts only."""
+
+    @pytest.mark.asyncio
+    async def test_config_frame_precedes_the_first_audio_frame(self):
+        from livekit.plugins.voxist import VoxistSTT
+
+        order: list[str] = []
+
+        class OrderedWS(FakeWS):
+            async def send_str(self, data):
+                order.append("str:" + ("config" if '"hotwords"' in data else data))
+                await super().send_str(data)
+
+            async def send_bytes(self, data):
+                order.append("bytes")
+                await super().send_bytes(data)
+
+        ws = OrderedWS()
+        stt = VoxistSTT(api_key="k", hotwords=["Robin des Bois"])
+        dialer = AsyncMock()
+        dialer.dial.return_value = ws
+        stt._ensure_dialer = AsyncMock(return_value=dialer)
+        stream = await make_stream(dial=stt._dial)
+        stream._event_ch = Mock()
+
+        async def scenario():
+            stream._input_ch.send_nowait(frame(1600))
+            await asyncio.sleep(0.05)
+            stream._input_ch.close()
+            await asyncio.sleep(0.05)
+            ws.end()
+
+        task = asyncio.create_task(scenario())
+        await asyncio.wait_for(stream._run(), timeout=5.0)
+        await task
+
+        assert order[0] == "str:config"
+        assert "bytes" in order
+        assert order.index("str:config") < order.index("bytes")
+
+    @pytest.mark.asyncio
+    async def test_gateway_hotwords_reply_is_logged_as_counts_only(self, caplog):
+        stream = await make_stream()
+        with caplog.at_level("INFO", logger="livekit.plugins.voxist"):
+            await stream._process_result(
+                {"type": "hotwords", "accepted": 0, "rejected": ["Secret Name", "Other Term"]}
+            )
+        assert "accepted=0 rejected=2" in caplog.text
+        assert "Secret" not in caplog.text and "Other Term" not in caplog.text
+        assert not stream._text_seen_in_session  # not treated as a transcript

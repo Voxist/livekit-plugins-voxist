@@ -5,10 +5,50 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/) (pre-1.0: a minor
 bump may change behaviour).
 
-## [Unreleased]
+## [0.11.0] - 2026-11-01
+
+### Changed
+
+- `aiohttp>=3.11` (was 3.10), for `ClientWSTimeout`.
+- `livekit-agents>=1.8.8` (was 1.6.0), the tested floor (CI job
+  `test-min-livekit`). `VoxistTTS` relies on `SynthesizeStream` replaying its
+  buffered input when a retryable error is raised before any audio.
 
 ### Added
 
+- `VoxistTTS`: streaming text-to-speech over voxist-tts's
+  `/v1/tts/{voice_id}/stream/text` WebSocket (contract version `2026-08-01`,
+  `pcm_s16le` at 24 kHz). Text is forwarded as it is pushed and audio is
+  emitted as it arrives; on the deployed service a Kyutai voice (`ada`, fr/en)
+  starts in about 0.28 s where the REST endpoint takes 1-3.8 s for the whole
+  clip. Extra handshake `headers` (Cloudflare Access) are never logged, and a
+  redirect is refused rather than followed. Closing the stream closes the
+  socket (barge-in). Fatal error frames map to `APIStatusError` with the
+  server's `code` and `request_id`; advisories are logged and the session goes
+  on. `synthesize()` uses the same socket for one-shot text.
+  - Retries: a fatal `backend_error`, or `capacity_exceeded` (the server's
+    connection cap, shared with other services, or the OmniVoice worker being
+    at capacity: one retry per stream at most),
+    before any audio of the stream is retryable (LiveKit replays the text on a
+    new socket); every other error, and any error once audio was heard, is not.
+    The server's message is in `APIStatusError.body["message"]` (and in the
+    error text for `backend_error`, where "No slots available, please retry"
+    means the backend could not take the session: usually a full GPU, but
+    voxist-tts also uses this text for other submission failures).
+    The dial itself retries locally (`conn_options.max_retry`) on a connection
+    failure, timeout, 408, 429 or 5xx; the last attempt's error is final.
+  - Deadlines: `connect_timeout` per dial; `first_audio_timeout` from the latest
+    text sent (an LLM still writing its sentence is not dead air), capped at 3x
+    from the first text; once audio has started, `idle_timeout` without a frame
+    or a text (a stall); after `end`, `idle_timeout` between server messages;
+    the close handshake is bounded by 1 s.
+  - After a `text_limit_reached` advisory nothing more is sent; a `done` with
+    `limit_reached` or `ignored_messages` is logged as a warning.
+  - Plain `http://` / `ws://` base URLs are refused except to a loopback host;
+    `.` and `..` are refused as voice ids.
+  - `VoxistTTS.check_connection()`: a readiness probe that opens the socket,
+    sends the config, listens briefly for a fatal frame and closes, synthesising
+    nothing.
 - `VoxistSTT(hotwords=[...], hotwords_score=...)`: per-connection decoding
   hotwords (names, brands, streets). Sent as a `{"config": {"hotwords": [...]}}`
   message right after every dial, before any audio, so a retried stream

@@ -27,12 +27,14 @@ bump may change behaviour).
   server's `code` and `request_id`; advisories are logged and the session goes
   on. `synthesize()` uses the same socket for one-shot text.
   - Retries: a fatal `backend_error`, or `capacity_exceeded` (the server's
-    connection cap, shared with other services: one retry per stream at most),
+    connection cap, shared with other services, or the OmniVoice worker being
+    at capacity: one retry per stream at most),
     before any audio of the stream is retryable (LiveKit replays the text on a
     new socket); every other error, and any error once audio was heard, is not.
     The server's message is in `APIStatusError.body["message"]` (and in the
     error text for `backend_error`, where "No slots available, please retry"
-    means the GPU is full rather than a failure).
+    means the backend could not take the session: usually a full GPU, but
+    voxist-tts also uses this text for other submission failures).
     The dial itself retries locally (`conn_options.max_retry`) on a connection
     failure, timeout, 408, 429 or 5xx; the last attempt's error is final.
   - Deadlines: `connect_timeout` per dial; `first_audio_timeout` from the latest

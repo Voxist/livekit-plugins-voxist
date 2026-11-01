@@ -33,7 +33,8 @@ Behaviour:
 - Retries by LiveKit: only a fatal ``backend_error`` (on this endpoint, the
   server's "No slots available, please retry" or a voice-encoding failure) or
   ``capacity_exceeded`` (the server's connection cap, shared with other
-  services: one retry per stream at most) that arrives before any audio of the
+  services, or the OmniVoice worker being at capacity: one retry per stream at
+  most) that arrives before any audio of the
   stream is retryable; livekit-agents (>= 1.8.8) then replays the buffered text
   on a new socket. Everything else is non-retryable, so text the caller already
   heard is never spoken twice. The server's message travels in
@@ -121,7 +122,8 @@ _ERROR_STATUS = {
 #: ``session_timeout`` is not one: voxist-tts sends it on the batch ``/stream``
 #: socket only (on ``/stream/text`` the timed-out session is already gone).
 RETRYABLE_CODES = frozenset({"capacity_exceeded", "backend_error"})
-#: The connection cap is shared (Voxlingo uses the same service): retry it once.
+#: The connection cap is shared (Voxlingo uses the same service) and the
+#: OmniVoice worker can be at capacity too: retry it once.
 CAPACITY_RETRIES = 1
 #: Longest server message carried into an error (the server bounds its own echoes).
 _MAX_MESSAGE_CHARS = 200
@@ -189,8 +191,10 @@ class VoxistTTS(tts.TTS):
         headers: Extra handshake headers, e.g. ``CF-Access-Client-Id`` /
             ``CF-Access-Client-Secret``. Never logged.
         connect_timeout: Seconds for one handshake, config included.
-        first_audio_timeout: Seconds from the latest text sent to the first audio.
-        idle_timeout: Seconds between server messages once ``end`` is sent.
+        first_audio_timeout: Seconds from the latest text sent to the first audio,
+            capped at 3x this value measured from the first text.
+        idle_timeout: Seconds without a server message or a text once audio has
+            started (a stall), and between server messages once ``end`` is sent.
         protocol_version: Contract generation stated on the config message.
     """
 

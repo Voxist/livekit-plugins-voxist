@@ -1,6 +1,6 @@
 [project]
 name = "livekit-plugins-voxist"
-version = "0.10.0"
+version = "0.11.0"
 description = "LiveKit STT and TTS plugin for Voxist: real-time streaming transcription and speech synthesis"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -22,9 +22,10 @@ classifiers = [
 ]
 
 dependencies = [
-    # The plugin imports LanguageCode in addition to NOT_GIVEN/NotGivenOr.
-    # LanguageCode is part of the supported API from livekit-agents 1.6.0.
-    "livekit-agents>=1.6.0",
+    # 1.8.8 is the tested floor (CI job test-min-livekit): VoxistTTS relies on
+    # SynthesizeStream replaying its buffered input on a retry, and the STT on
+    # LanguageCode (1.6.0+).
+    "livekit-agents>=1.8.8",
     # Within livekit-agents' own aiohttp~=3.10 requirement; 3.11 for
     # ClientWSTimeout (VoxistTTS bounds its close handshake with it).
     "aiohttp>=3.11",
@@ -42,6 +43,7 @@ dev = [
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.1.0",
     "pytest-benchmark>=4.0.0",
+    "pytest-timeout>=2.2",
     "black>=23.0.0",
     "ruff>=0.1.0",
     "mypy>=1.5.0",

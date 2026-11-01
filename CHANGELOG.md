@@ -5,11 +5,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/) (pre-1.0: a minor
 bump may change behaviour).
 
-## [Unreleased]
+## [0.11.0] - 2026-11-01
 
 ### Changed
 
 - `aiohttp>=3.11` (was 3.10), for `ClientWSTimeout`.
+- `livekit-agents>=1.8.8` (was 1.6.0), the tested floor (CI job
+  `test-min-livekit`). `VoxistTTS` relies on `SynthesizeStream` replaying its
+  buffered input when a retryable error is raised before any audio.
 
 ### Added
 
@@ -23,6 +26,22 @@ bump may change behaviour).
   socket (barge-in). Fatal error frames map to `APIStatusError` with the
   server's `code` and `request_id`; advisories are logged and the session goes
   on. `synthesize()` uses the same socket for one-shot text.
+  - Retries: a fatal `capacity_exceeded`, `backend_error` or `session_timeout`
+    before any audio of the stream is retryable (LiveKit replays the text on a
+    new socket); every other error, and any error once audio was heard, is not.
+    The dial itself retries locally (`conn_options.max_retry`) on a connection
+    failure, timeout, 408, 429 or 5xx; the last attempt's error is final.
+  - Deadlines: `connect_timeout` per dial, `first_audio_timeout` from the latest
+    text sent (an LLM still writing its sentence is not dead air),
+    `idle_timeout` between server messages after `end`; the close handshake is
+    bounded by 1 s.
+  - After a `text_limit_reached` advisory nothing more is sent; a `done` with
+    `limit_reached` or `ignored_messages` is logged as a warning.
+  - Plain `http://` / `ws://` base URLs are refused except to a loopback host;
+    `.` and `..` are refused as voice ids.
+  - `VoxistTTS.check_connection()`: a readiness probe that opens the socket,
+    sends the config, listens briefly for a fatal frame and closes, synthesising
+    nothing.
 - `VoxistSTT(hotwords=[...], hotwords_score=...)`: per-connection decoding
   hotwords (names, brands, streets). Sent as a `{"config": {"hotwords": [...]}}`
   message right after every dial, before any audio, so a retried stream

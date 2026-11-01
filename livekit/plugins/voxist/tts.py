@@ -24,13 +24,23 @@ Behaviour:
 - Barge-in: closing the stream closes the socket, which frees the server's slot.
 - Deadlines: ``connect_timeout`` per dial (local retries follow
   ``conn_options.max_retry``: the first immediately, later ones after
-  ``retry_interval``), ``first_audio_timeout`` from the first text sent to the
-  first audio frame, and ``idle_timeout`` between server messages once ``end``
-  is sent. Every error raised to LiveKit is non-retryable, so LiveKit never
-  replays text the server already spoke.
+  ``retry_interval``; the last attempt's error is non-retryable),
+  ``first_audio_timeout`` from the latest text sent to the first audio frame (so
+  the time an LLM takes to finish a sentence is not counted), and
+  ``idle_timeout`` between server messages once ``end`` is sent.
+- Retries by LiveKit: only a fatal ``capacity_exceeded``, ``backend_error`` or
+  ``session_timeout`` that arrives before any audio of the stream is retryable;
+  livekit-agents (>= 1.8.8) then replays the buffered text on a new socket.
+  Everything else is non-retryable, so text the caller already heard is never
+  spoken twice.
+- Text limits: after a ``text_limit_reached`` advisory nothing more is sent (the
+  contract's "stop sending"); the rest of that segment is dropped and ``done`` is
+  awaited. A ``done`` reporting ``limit_reached`` or ``ignored_messages`` is
+  logged as a warning.
 - Credentials: ``headers`` (for example a Cloudflare Access service token) go on
   the handshake only, are never logged and never appear in an error message. A
-  redirect is never followed, since it would carry them to another URL.
+  redirect is never followed, since it would carry them to another URL, and a
+  plain ``http``/``ws`` base URL is refused unless the host is loopback.
 """
 
 from __future__ import annotations
@@ -70,11 +80,16 @@ FRAME_SIZE_MS = 80
 CONNECT_TIMEOUT_DEFAULT = 5.0
 FIRST_AUDIO_TIMEOUT_DEFAULT = 6.0
 IDLE_TIMEOUT_DEFAULT = 6.0
+#: How long a close waits for the server's close frame before dropping the socket.
 CLOSE_TIMEOUT = 1.0
+#: How long :meth:`VoxistTTS.check_connection` listens for a refusal after the config.
+CHECK_QUIET_S = 0.5
 _WATCHDOG_TICK_S = 0.05
 
-#: Voice ids that collide with other server routes (``/v1/tts/jobs`` ...).
-RESERVED_VOICE_IDS = frozenset({"jobs", "languages", "voices"})
+#: Voice ids that collide with other server routes (``/v1/tts/jobs`` ...) or that a
+#: URL would resolve as a path step.
+RESERVED_VOICE_IDS = frozenset({"jobs", "languages", "voices", ".", ".."})
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 #: HTTP-equivalent status per fatal error code (``ws.rs`` ``WsErrorCode``).
 _ERROR_STATUS = {
@@ -94,6 +109,9 @@ _ERROR_STATUS = {
     "text_empty": 400,
     "text_too_long": 413,
 }
+#: Fatal codes worth a new socket, as long as nothing has been heard yet.
+RETRYABLE_CODES = frozenset({"capacity_exceeded", "backend_error", "session_timeout"})
+_TEXT_LIMIT_CODE = "text_limit_reached"
 
 
 class _RedirectRefused(Exception):
@@ -105,7 +123,9 @@ class _RedirectRefused(Exception):
 async def _refuse_redirect(
     _session: aiohttp.ClientSession, _ctx: Any, params: aiohttp.TraceRequestRedirectParams
 ) -> None:
-    raise _RedirectRefused(params.response.status)
+    status = params.response.status
+    params.response.close()  # release the connection: nothing of it is read or reused
+    raise _RedirectRefused(status)
 
 
 def _ws_base(base_url: str) -> str:
@@ -115,6 +135,11 @@ def _ws_base(base_url: str) -> str:
         raise ValueError("base_url must be an http(s) or ws(s) URL with a host")
     if parts.query or parts.fragment:
         raise ValueError("base_url must not carry a query or a fragment")
+    if scheme == "ws" and parts.hostname not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            "base_url must be https:// or wss:// (plain http/ws only to a loopback host): "
+            "the handshake carries the credentials"
+        )
     return f"{scheme}://{parts.netloc}{parts.path}"
 
 
@@ -143,14 +168,14 @@ class VoxistTTS(tts.TTS):
     """Streaming Voxist TTS over ``/v1/tts/{voice_id}/stream/text``.
 
     Args:
-        base_url: Service root, e.g. ``https://tts.voxist-api.com`` (``ws(s)://``
-            accepted too).
+        base_url: Service root, e.g. ``https://tts.voxist-api.com`` (``wss://``
+            accepted too; ``http``/``ws`` only to a loopback host).
         voice_id: A Voxist voice id (``ada``, ``103488-es`` ...).
         language: The language the voice speaks, as the server takes it (``fr``).
         headers: Extra handshake headers, e.g. ``CF-Access-Client-Id`` /
             ``CF-Access-Client-Secret``. Never logged.
         connect_timeout: Seconds for one handshake, config included.
-        first_audio_timeout: Seconds from the first text sent to the first audio.
+        first_audio_timeout: Seconds from the latest text sent to the first audio.
         idle_timeout: Seconds between server messages once ``end`` is sent.
         protocol_version: Contract generation stated on the config message.
     """
@@ -226,6 +251,43 @@ class VoxistTTS(tts.TTS):
         stream = VoxistTTSStream(tts=self, conn_options=conn_options)
         self._streams.add(stream)
         return stream
+
+    async def check_connection(self, *, quiet_s: float = CHECK_QUIET_S) -> None:
+        """Open the socket, send the config, listen ``quiet_s`` for a refusal, close.
+
+        A readiness probe for the streaming path itself (handshake, Access, voice
+        and language as the server resolves them on this socket). Nothing is
+        synthesised. One dial, no retry.
+
+        Raises:
+            APIStatusError: the handshake was refused (``status_code`` is the HTTP
+                status) or the server sent a fatal error frame (``body["code"]``).
+            APIConnectionError / APITimeoutError: the service could not be reached,
+                or the socket closed before ``quiet_s`` ran out.
+        """
+        ws = await self._connect_once(final=True)
+        try:
+            deadline = time.monotonic() + quiet_s
+            while (left := deadline - time.monotonic()) > 0:
+                try:
+                    msg = await asyncio.wait_for(ws.receive(), left)
+                except asyncio.TimeoutError:
+                    return
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    data = _json_object(msg.data)
+                    if data is not None and "error" in data:
+                        if data.get("severity") != "advisory":
+                            raise _fatal_error(data, heard=True)
+                        _log_advisory(data)
+                    continue
+                if msg.type == aiohttp.WSMsgType.BINARY:
+                    continue
+                raise APIConnectionError(
+                    f"Voxist TTS socket closed during the check (close code {ws.close_code})",
+                    retryable=False,
+                )
+        finally:
+            await _close(ws)
 
     async def aclose(self) -> None:
         """Close every open stream and the HTTP session; later streams fail."""
@@ -315,17 +377,47 @@ class VoxistTTS(tts.TTS):
 
 async def _close(ws: aiohttp.ClientWebSocketResponse) -> None:
     try:
-        await ws.close()
+        await ws.close()  # bounded by CLOSE_TIMEOUT (ClientWSTimeout.ws_close)
     except Exception:  # noqa: BLE001 - best effort; the socket is discarded anyway
         pass
+
+
+def _json_object(raw: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.warning("Voxist TTS sent a text frame that is not JSON; ignored")
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _log_advisory(data: dict[str, Any]) -> None:
+    logger.warning(
+        "Voxist TTS advisory",
+        extra={"code": str(data.get("code") or ""), "request_id": data.get("request_id")},
+    )
+
+
+def _fatal_error(data: dict[str, Any], *, heard: bool) -> APIStatusError:
+    code = str(data.get("code") or "")
+    request_id = data.get("request_id")
+    return APIStatusError(
+        f"Voxist TTS error {code or 'unknown'}",
+        status_code=_ERROR_STATUS.get(code, 500),
+        request_id=request_id if isinstance(request_id, str) else None,
+        body={"code": code},
+        retryable=code in RETRYABLE_CODES and not heard,
+    )
 
 
 @dataclass
 class _Utterance:
     """Progress of one socket, read by the watchdog."""
 
-    first_text_at: float | None = None
+    heard_before: bool = False  # audio of an earlier socket of the same stream
+    last_text_at: float | None = None
     end_sent: bool = False
+    limit_reached: bool = False
     audio: bool = False
     last_message_at: float = field(default_factory=time.monotonic)
     audio_bytes: int = 0
@@ -334,9 +426,9 @@ class _Utterance:
     def deadline(self, opts: _TTSOptions) -> tuple[float, str] | None:
         if self.done is not None:
             return None
-        if self.first_text_at is not None and not self.audio:
-            return self.first_text_at + opts.first_audio_timeout, "first audio"
-        if self.end_sent:
+        if self.last_text_at is not None and not self.audio:
+            return self.last_text_at + opts.first_audio_timeout, "first audio"
+        if self.end_sent or self.limit_reached:
             return self.last_message_at + opts.idle_timeout, "the next server message"
         return None
 
@@ -365,31 +457,19 @@ async def _receive(
             emitter.push(msg.data)
             continue
         if msg.type == aiohttp.WSMsgType.TEXT:
-            try:
-                data = json.loads(msg.data)
-            except ValueError:
-                logger.warning("Voxist TTS sent a text frame that is not JSON; ignored")
-                continue
-            if not isinstance(data, dict):
+            data = _json_object(msg.data)
+            if data is None:
                 continue
             if data.get("done") is True:
                 state.done = data
                 return data
             if "error" in data:
-                code = str(data.get("code") or "")
-                request_id = data.get("request_id")
                 if data.get("severity") == "advisory":
-                    logger.warning(
-                        "Voxist TTS advisory", extra={"code": code, "request_id": request_id}
-                    )
+                    _log_advisory(data)
+                    if data.get("code") == _TEXT_LIMIT_CODE:
+                        state.limit_reached = True
                     continue
-                raise APIStatusError(
-                    f"Voxist TTS error {code or 'unknown'}",
-                    status_code=_ERROR_STATUS.get(code, 500),
-                    request_id=request_id if isinstance(request_id, str) else None,
-                    body={"code": code},
-                    retryable=False,
-                )
+                raise _fatal_error(data, heard=state.audio or state.heard_before)
             continue  # "cancelled" acks and future message types
         raise APIConnectionError(
             f"Voxist TTS socket closed before done (close code {ws.close_code})",
@@ -406,6 +486,17 @@ def _check_done(done: dict[str, Any], state: _Utterance) -> None:
                 "Voxist TTS audio length differs from done (rate mismatch?)",
                 extra={"received_s": round(received, 3), "duration_s": duration},
             )
+    ignored = done.get("ignored_messages")
+    if done.get("limit_reached") is True or (isinstance(ignored, int) and ignored > 0):
+        logger.warning(
+            "Voxist TTS did not speak all the text it was sent",
+            extra={
+                "limit_reached": done.get("limit_reached") is True,
+                "ignored_messages": ignored if isinstance(ignored, int) else 0,
+                "stop_reason": done.get("stop_reason"),
+                "request_id": done.get("request_id"),
+            },
+        )
 
 
 async def _run_tasks(
@@ -451,7 +542,7 @@ class VoxistTTSChunkedStream(tts.ChunkedStream):
         state = _Utterance()
         try:
             await ws.send_str(json.dumps({"text": self._input_text}))
-            state.first_text_at = time.monotonic()
+            state.last_text_at = time.monotonic()
             await ws.send_str(json.dumps({"end": True}))
             state.end_sent = True
             done = await _run_tasks(
@@ -475,6 +566,7 @@ class VoxistTTSStream(tts.SynthesizeStream):
     def __init__(self, *, tts: VoxistTTS, conn_options: APIConnectOptions):
         super().__init__(tts=tts, conn_options=conn_options)
         self._voxist = tts
+        self._heard = False
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         output_emitter.initialize(
@@ -509,6 +601,13 @@ class VoxistTTSStream(tts.SynthesizeStream):
             if first is None:
                 return
 
+    async def _drain_segment(self) -> bool:
+        """Drop the rest of the current segment. False once the input has ended."""
+        async for data in self._input_ch:
+            if isinstance(data, self._FlushSentinel):
+                return True
+        return False
+
     async def _segment(
         self,
         ws: aiohttp.ClientWebSocketResponse,
@@ -516,8 +615,9 @@ class VoxistTTSStream(tts.SynthesizeStream):
         first: str | None,
     ) -> bool:
         """Speak one segment on `ws`. Returns False once the input has ended."""
-        state = _Utterance()
+        state = _Utterance(heard_before=self._heard)
         input_open = True
+        segment_over = False
 
         async def texts() -> AsyncIterator[str | tts.SynthesizeStream._FlushSentinel]:
             if first is not None:
@@ -526,25 +626,29 @@ class VoxistTTSStream(tts.SynthesizeStream):
                 yield data
 
         async def send() -> None:
-            nonlocal input_open
+            nonlocal input_open, segment_over
             started = False
             async for data in texts():
                 if isinstance(data, self._FlushSentinel):
                     if started:
+                        segment_over = True
                         break
                     continue
                 if not data:
                     continue
+                if state.limit_reached:
+                    continue  # the server stopped reading: send nothing more
                 if not started:
                     output_emitter.start_segment(segment_id=shortuuid())
                     started = True
                 await ws.send_str(json.dumps({"text": data}))
-                if state.first_text_at is None:
-                    state.first_text_at = time.monotonic()
+                if state.last_text_at is None:
                     self._mark_started()
+                state.last_text_at = time.monotonic()
             else:
                 input_open = False
-            if started:
+                segment_over = True
+            if started and not state.limit_reached:
                 await ws.send_str(json.dumps({"end": True}))
                 state.last_message_at = time.monotonic()
                 state.end_sent = True
@@ -555,13 +659,16 @@ class VoxistTTSStream(tts.SynthesizeStream):
         try:
             # Nothing to say: the input ended (or only flushed) with no text.
             await asyncio.wait({sender, receiver, watchdog}, return_when=asyncio.FIRST_COMPLETED)
-            if sender.done() and sender.exception() is None and state.first_text_at is None:
+            if sender.done() and sender.exception() is None and state.last_text_at is None:
                 return input_open
             done = await _run_tasks(sender, receiver, watchdog)
         finally:
+            self._heard = self._heard or state.audio
             for task in (sender, receiver, watchdog):
                 task.cancel()
             await asyncio.gather(sender, receiver, watchdog, return_exceptions=True)
         _check_done(done, state)
         output_emitter.end_segment()
+        if not segment_over:  # done came first (text limit): drop the segment's rest
+            input_open = await self._drain_segment()
         return input_open

@@ -127,11 +127,15 @@ session = agents.AgentSession(stt=..., llm=..., tts=tts)
   the LLM's first token. `flush()` / `end_input()` send `end` and wait for `done`.
 - Barge-in: closing the stream closes the socket, which frees the server slot.
 - `connect_timeout` (per dial; `conn_options.max_retry` local retries on a
-  connection failure, 408, 429 or 5xx), `first_audio_timeout` (first text to
-  first audio) and `idle_timeout` (between server messages after `end`). Errors
-  reach LiveKit as non-retryable, so already spoken text is never replayed.
+  connection failure, 408, 429 or 5xx), `first_audio_timeout` (latest text to
+  first audio) and `idle_timeout` (between server messages after `end`).
+- Only a `capacity_exceeded`, `backend_error` or `session_timeout` frame before
+  any audio reaches LiveKit as retryable (it replays the text on a new socket);
+  nothing already heard is ever spoken twice.
 - A redirect on the handshake is refused, never followed: it would carry the
-  credentials to another URL.
+  credentials to another URL. Plain `http`/`ws` is accepted for loopback only.
+- `await tts.check_connection()` opens the socket, sends the config and closes,
+  raising on a refusal: a readiness probe of the streaming path.
 
 ## Supported Languages
 

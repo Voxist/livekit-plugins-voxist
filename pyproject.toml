@@ -1,14 +1,14 @@
 [project]
 name = "livekit-plugins-voxist"
 version = "0.10.0"
-description = "LiveKit STT plugin for Voxist ASR real-time streaming transcription"
+description = "LiveKit STT and TTS plugin for Voxist: real-time streaming transcription and speech synthesis"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
     {name = "Voxist", email = "contact@voxist.com"}
 ]
-keywords = ["livekit", "stt", "speech-to-text", "asr", "voxist", "real-time", "voice-ai"]
+keywords = ["livekit", "stt", "speech-to-text", "asr", "tts", "text-to-speech", "voxist", "real-time", "voice-ai"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -25,8 +25,9 @@ dependencies = [
     # The plugin imports LanguageCode in addition to NOT_GIVEN/NotGivenOr.
     # LanguageCode is part of the supported API from livekit-agents 1.6.0.
     "livekit-agents>=1.6.0",
-    # Matches livekit-agents' own aiohttp~=3.10 requirement.
-    "aiohttp>=3.10",
+    # Within livekit-agents' own aiohttp~=3.10 requirement; 3.11 for
+    # ClientWSTimeout (VoxistTTS bounds its close handshake with it).
+    "aiohttp>=3.11",
     "numpy>=1.24.0",
 ]
 

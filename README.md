@@ -102,6 +102,37 @@ stt = voxist.VoxistSTT(
 )
 ```
 
+## Text-to-Speech (`VoxistTTS`)
+
+Streaming synthesis over voxist-tts's text-streaming WebSocket,
+`/v1/tts/{voice_id}/stream/text` (the protocol is in voxist-tts
+`docs/tts-websocket-contract.md`). Text is forwarded as the LLM produces it and
+audio comes back as 80 ms PCM16 frames at 24 kHz, so a Kyutai voice starts
+speaking about 0.3 s after its first text instead of after the whole clip.
+
+```python
+from livekit.plugins import voxist
+
+tts = voxist.VoxistTTS(
+    base_url="https://tts.voxist-api.com",
+    voice_id="ada",
+    language="fr",
+    # e.g. a Cloudflare Access service token; sent on the handshake only, never logged
+    headers={"CF-Access-Client-Id": "...", "CF-Access-Client-Secret": "..."},
+)
+session = agents.AgentSession(stt=..., llm=..., tts=tts)
+```
+
+- One socket per segment, dialed when the stream starts so the handshake overlaps
+  the LLM's first token. `flush()` / `end_input()` send `end` and wait for `done`.
+- Barge-in: closing the stream closes the socket, which frees the server slot.
+- `connect_timeout` (per dial; `conn_options.max_retry` local retries on a
+  connection failure, 408, 429 or 5xx), `first_audio_timeout` (first text to
+  first audio) and `idle_timeout` (between server messages after `end`). Errors
+  reach LiveKit as non-retryable, so already spoken text is never replayed.
+- A redirect on the handshake is refused, never followed: it would carry the
+  credentials to another URL.
+
 ## Supported Languages
 
 | Code | Language |

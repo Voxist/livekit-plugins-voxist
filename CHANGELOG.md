@@ -7,8 +7,22 @@ bump may change behaviour).
 
 ## [Unreleased]
 
+### Changed
+
+- `aiohttp>=3.11` (was 3.10), for `ClientWSTimeout`.
+
 ### Added
 
+- `VoxistTTS`: streaming text-to-speech over voxist-tts's
+  `/v1/tts/{voice_id}/stream/text` WebSocket (contract version `2026-08-01`,
+  `pcm_s16le` at 24 kHz). Text is forwarded as it is pushed and audio is
+  emitted as it arrives; on the deployed service a Kyutai voice (`ada`, fr/en)
+  starts in about 0.28 s where the REST endpoint takes 1-3.8 s for the whole
+  clip. Extra handshake `headers` (Cloudflare Access) are never logged, and a
+  redirect is refused rather than followed. Closing the stream closes the
+  socket (barge-in). Fatal error frames map to `APIStatusError` with the
+  server's `code` and `request_id`; advisories are logged and the session goes
+  on. `synthesize()` uses the same socket for one-shot text.
 - `VoxistSTT(hotwords=[...], hotwords_score=...)`: per-connection decoding
   hotwords (names, brands, streets). Sent as a `{"config": {"hotwords": [...]}}`
   message right after every dial, before any audio, so a retried stream

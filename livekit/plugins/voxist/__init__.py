@@ -1,5 +1,5 @@
 """
-LiveKit STT plugin for Voxist ASR.
+LiveKit STT and TTS plugin for Voxist (ASR streaming, TTS streaming).
 
 Features:
 - One WebSocket per stream, aligned with the gateway's session protocol
@@ -37,10 +37,12 @@ from .exceptions import (
     VoxistError,
 )
 from .stt import InitializationState, VoxistSTT
+from .tts import VoxistTTS
 from .version import __version__
 
 __all__ = [
     "VoxistSTT",
+    "VoxistTTS",
     "InitializationState",
     "__version__",
     "VoxistError",

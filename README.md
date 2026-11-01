@@ -129,9 +129,12 @@ session = agents.AgentSession(stt=..., llm=..., tts=tts)
 - `connect_timeout` (per dial; `conn_options.max_retry` local retries on a
   connection failure, 408, 429 or 5xx), `first_audio_timeout` (latest text to
   first audio) and `idle_timeout` (between server messages after `end`).
-- Only a `capacity_exceeded`, `backend_error` or `session_timeout` frame before
-  any audio reaches LiveKit as retryable (it replays the text on a new socket);
-  nothing already heard is ever spoken twice.
+- Only a `backend_error` frame, or one `capacity_exceeded` per stream, before any
+  audio reaches LiveKit as retryable (it replays the text on a new socket);
+  nothing already heard is ever spoken twice. `body["message"]` carries the
+  server's text ("No slots available, please retry" means busy).
+- First audio is also capped at 3 x `first_audio_timeout` from the first text,
+  and a stall after audio started (no frame, no text for `idle_timeout`) fails.
 - A redirect on the handshake is refused, never followed: it would carry the
   credentials to another URL. Plain `http`/`ws` is accepted for loopback only.
 - `await tts.check_connection()` opens the socket, sends the config and closes,

@@ -26,13 +26,18 @@ Behaviour:
   ``conn_options.max_retry``: the first immediately, later ones after
   ``retry_interval``; the last attempt's error is non-retryable),
   ``first_audio_timeout`` from the latest text sent to the first audio frame (so
-  the time an LLM takes to finish a sentence is not counted), and
-  ``idle_timeout`` between server messages once ``end`` is sent.
-- Retries by LiveKit: only a fatal ``capacity_exceeded``, ``backend_error`` or
-  ``session_timeout`` that arrives before any audio of the stream is retryable;
-  livekit-agents (>= 1.8.8) then replays the buffered text on a new socket.
-  Everything else is non-retryable, so text the caller already heard is never
-  spoken twice.
+  the time an LLM takes to finish a sentence is not counted), capped at
+  ``FIRST_AUDIO_CEILING_FACTOR`` x ``first_audio_timeout`` from the first text;
+  once audio has started, ``idle_timeout`` without a server message or a text
+  sent (a stall), and after ``end``, ``idle_timeout`` between server messages.
+- Retries by LiveKit: only a fatal ``backend_error`` (on this endpoint, the
+  server's "No slots available, please retry" or a voice-encoding failure) or
+  ``capacity_exceeded`` (the server's connection cap, shared with other
+  services: one retry per stream at most) that arrives before any audio of the
+  stream is retryable; livekit-agents (>= 1.8.8) then replays the buffered text
+  on a new socket. Everything else is non-retryable, so text the caller already
+  heard is never spoken twice. The server's message travels in
+  ``APIStatusError.body["message"]``.
 - Text limits: after a ``text_limit_reached`` advisory nothing more is sent (the
   contract's "stop sending"); the rest of that segment is dropped and ``done`` is
   awaited. A ``done`` reporting ``limit_reached`` or ``ignored_messages`` is
@@ -79,6 +84,9 @@ FRAME_SIZE_MS = 80
 
 CONNECT_TIMEOUT_DEFAULT = 5.0
 FIRST_AUDIO_TIMEOUT_DEFAULT = 6.0
+#: However the text trickles in, first audio must come within this many
+#: ``first_audio_timeout`` of the first text.
+FIRST_AUDIO_CEILING_FACTOR = 3
 IDLE_TIMEOUT_DEFAULT = 6.0
 #: How long a close waits for the server's close frame before dropping the socket.
 CLOSE_TIMEOUT = 1.0
@@ -110,7 +118,13 @@ _ERROR_STATUS = {
     "text_too_long": 413,
 }
 #: Fatal codes worth a new socket, as long as nothing has been heard yet.
-RETRYABLE_CODES = frozenset({"capacity_exceeded", "backend_error", "session_timeout"})
+#: ``session_timeout`` is not one: voxist-tts sends it on the batch ``/stream``
+#: socket only (on ``/stream/text`` the timed-out session is already gone).
+RETRYABLE_CODES = frozenset({"capacity_exceeded", "backend_error"})
+#: The connection cap is shared (Voxlingo uses the same service): retry it once.
+CAPACITY_RETRIES = 1
+#: Longest server message carried into an error (the server bounds its own echoes).
+_MAX_MESSAGE_CHARS = 200
 _TEXT_LIMIT_CODE = "text_limit_reached"
 
 
@@ -277,7 +291,7 @@ class VoxistTTS(tts.TTS):
                     data = _json_object(msg.data)
                     if data is not None and "error" in data:
                         if data.get("severity") != "advisory":
-                            raise _fatal_error(data, heard=True)
+                            raise _fatal_error(data, heard=True, attempts=_Attempts())
                         _log_advisory(data)
                     continue
                 if msg.type == aiohttp.WSMsgType.BINARY:
@@ -398,15 +412,32 @@ def _log_advisory(data: dict[str, Any]) -> None:
     )
 
 
-def _fatal_error(data: dict[str, Any], *, heard: bool) -> APIStatusError:
+@dataclass
+class _Attempts:
+    """Per-stream retry budget, kept across LiveKit's attempts (same stream object)."""
+
+    capacity_left: int = CAPACITY_RETRIES
+
+
+def _fatal_error(data: dict[str, Any], *, heard: bool, attempts: _Attempts) -> APIStatusError:
     code = str(data.get("code") or "")
     request_id = data.get("request_id")
+    prose = data.get("error")
+    message = prose[:_MAX_MESSAGE_CHARS] if isinstance(prose, str) else ""
+    retryable = code in RETRYABLE_CODES and not heard
+    if retryable and code == "capacity_exceeded":
+        retryable = attempts.capacity_left > 0
+        attempts.capacity_left -= 1
+    # backend_error's text is what tells "busy" (No slots available) from a failure.
+    text = f"Voxist TTS error {code or 'unknown'}"
+    if code == "backend_error" and message:
+        text += f": {message}"
     return APIStatusError(
-        f"Voxist TTS error {code or 'unknown'}",
+        text,
         status_code=_ERROR_STATUS.get(code, 500),
         request_id=request_id if isinstance(request_id, str) else None,
-        body={"code": code},
-        retryable=code in RETRYABLE_CODES and not heard,
+        body={"code": code, "message": message},
+        retryable=retryable,
     )
 
 
@@ -415,6 +446,8 @@ class _Utterance:
     """Progress of one socket, read by the watchdog."""
 
     heard_before: bool = False  # audio of an earlier socket of the same stream
+    attempts: _Attempts = field(default_factory=_Attempts)
+    first_text_at: float | None = None
     last_text_at: float | None = None
     end_sent: bool = False
     limit_reached: bool = False
@@ -427,9 +460,16 @@ class _Utterance:
         if self.done is not None:
             return None
         if self.last_text_at is not None and not self.audio:
-            return self.last_text_at + opts.first_audio_timeout, "first audio"
+            ceiling = (self.first_text_at or self.last_text_at) + (
+                FIRST_AUDIO_CEILING_FACTOR * opts.first_audio_timeout
+            )
+            return min(self.last_text_at + opts.first_audio_timeout, ceiling), "first audio"
         if self.end_sent or self.limit_reached:
             return self.last_message_at + opts.idle_timeout, "the next server message"
+        if self.audio and self.last_text_at is not None:
+            # Speaking, more text may come: a stall is neither a frame nor a text.
+            last = max(self.last_message_at, self.last_text_at)
+            return last + opts.idle_timeout, "audio after the last frame"
         return None
 
 
@@ -469,7 +509,9 @@ async def _receive(
                     if data.get("code") == _TEXT_LIMIT_CODE:
                         state.limit_reached = True
                     continue
-                raise _fatal_error(data, heard=state.audio or state.heard_before)
+                raise _fatal_error(
+                    data, heard=state.audio or state.heard_before, attempts=state.attempts
+                )
             continue  # "cancelled" acks and future message types
         raise APIConnectionError(
             f"Voxist TTS socket closed before done (close code {ws.close_code})",
@@ -527,6 +569,7 @@ class VoxistTTSChunkedStream(tts.ChunkedStream):
     def __init__(self, *, tts: VoxistTTS, input_text: str, conn_options: APIConnectOptions):
         super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
         self._voxist = tts
+        self._attempts = _Attempts()
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         output_emitter.initialize(
@@ -539,10 +582,10 @@ class VoxistTTSChunkedStream(tts.ChunkedStream):
         if not self._input_text.strip():
             return
         ws = await self._voxist._connect(self._conn_options)
-        state = _Utterance()
+        state = _Utterance(attempts=self._attempts)
         try:
             await ws.send_str(json.dumps({"text": self._input_text}))
-            state.last_text_at = time.monotonic()
+            state.first_text_at = state.last_text_at = time.monotonic()
             await ws.send_str(json.dumps({"end": True}))
             state.end_sent = True
             done = await _run_tasks(
@@ -567,6 +610,7 @@ class VoxistTTSStream(tts.SynthesizeStream):
         super().__init__(tts=tts, conn_options=conn_options)
         self._voxist = tts
         self._heard = False
+        self._attempts = _Attempts()
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         output_emitter.initialize(
@@ -615,7 +659,7 @@ class VoxistTTSStream(tts.SynthesizeStream):
         first: str | None,
     ) -> bool:
         """Speak one segment on `ws`. Returns False once the input has ended."""
-        state = _Utterance(heard_before=self._heard)
+        state = _Utterance(heard_before=self._heard, attempts=self._attempts)
         input_open = True
         segment_over = False
 
@@ -642,8 +686,9 @@ class VoxistTTSStream(tts.SynthesizeStream):
                     output_emitter.start_segment(segment_id=shortuuid())
                     started = True
                 await ws.send_str(json.dumps({"text": data}))
-                if state.last_text_at is None:
+                if state.first_text_at is None:
                     self._mark_started()
+                    state.first_text_at = time.monotonic()
                 state.last_text_at = time.monotonic()
             else:
                 input_open = False

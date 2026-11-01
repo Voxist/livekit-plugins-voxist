@@ -26,15 +26,20 @@ bump may change behaviour).
   socket (barge-in). Fatal error frames map to `APIStatusError` with the
   server's `code` and `request_id`; advisories are logged and the session goes
   on. `synthesize()` uses the same socket for one-shot text.
-  - Retries: a fatal `capacity_exceeded`, `backend_error` or `session_timeout`
+  - Retries: a fatal `backend_error`, or `capacity_exceeded` (the server's
+    connection cap, shared with other services: one retry per stream at most),
     before any audio of the stream is retryable (LiveKit replays the text on a
     new socket); every other error, and any error once audio was heard, is not.
+    The server's message is in `APIStatusError.body["message"]` (and in the
+    error text for `backend_error`, where "No slots available, please retry"
+    means the GPU is full rather than a failure).
     The dial itself retries locally (`conn_options.max_retry`) on a connection
     failure, timeout, 408, 429 or 5xx; the last attempt's error is final.
-  - Deadlines: `connect_timeout` per dial, `first_audio_timeout` from the latest
-    text sent (an LLM still writing its sentence is not dead air),
-    `idle_timeout` between server messages after `end`; the close handshake is
-    bounded by 1 s.
+  - Deadlines: `connect_timeout` per dial; `first_audio_timeout` from the latest
+    text sent (an LLM still writing its sentence is not dead air), capped at 3x
+    from the first text; once audio has started, `idle_timeout` without a frame
+    or a text (a stall); after `end`, `idle_timeout` between server messages;
+    the close handshake is bounded by 1 s.
   - After a `text_limit_reached` advisory nothing more is sent; a `done` with
     `limit_reached` or `ignored_messages` is logged as a warning.
   - Plain `http://` / `ws://` base URLs are refused except to a loopback host;

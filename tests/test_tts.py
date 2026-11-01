@@ -341,18 +341,18 @@ async def test_closed_tts_refuses_new_streams(fake):
         await run_stream(tts, ["Bonjour."])
 
 
-def _refuse_with(code: str, *, after_audio: bool = False):
+def _refuse_with(code: str, *, after_audio: bool = False, error: str = "x"):
     async def refuse(ws, session):
         msg = await ws.receive()
         session["texts"].append(json.loads(msg.data).get("text"))
         if after_audio:
             await ws.send_bytes(FRAME)
-        await ws.send_str(json.dumps({"error": "x", "code": code, "severity": "fatal",
+        await ws.send_str(json.dumps({"error": error, "code": code, "severity": "fatal",
                                       "request_id": "r"}))
     return refuse
 
 
-@pytest.mark.parametrize("code", ["capacity_exceeded", "backend_error", "session_timeout"])
+@pytest.mark.parametrize("code", ["capacity_exceeded", "backend_error"])
 async def test_a_503_class_refusal_before_any_audio_is_retried_with_the_same_text(fake, code):
     refuse = _refuse_with(code)
 
@@ -530,7 +530,7 @@ async def test_check_connection_reports_a_fatal_frame(fake):
     with pytest.raises(APIStatusError) as info:
         await tts.check_connection(quiet_s=1.0)
     await tts.aclose()
-    assert info.value.status_code == 404 and info.value.body == {"code": "voice_not_found"}
+    assert info.value.status_code == 404 and info.value.body["code"] == "voice_not_found"
 
 
 async def test_check_connection_reports_an_access_refusal(fake):
@@ -540,3 +540,145 @@ async def test_check_connection_reports_an_access_refusal(fake):
         await tts.check_connection()
     await tts.aclose()
     assert info.value.status_code == 403
+
+
+@pytest.mark.parametrize("code", ["internal_error", "session_timeout", "voice_not_found"])
+async def test_other_fatal_codes_before_any_audio_are_not_retried(fake, code):
+    fake.behaviour = _refuse_with(code)
+    tts = make_tts(fake)
+    with pytest.raises(APIStatusError) as info:
+        await run_stream(tts, ["Bonjour."], conn=FAST_RETRY)
+    await tts.aclose()
+    assert not info.value.retryable
+    assert len(fake.sessions) == 1
+
+
+async def test_capacity_exceeded_is_retried_once_only(fake):
+    """The connection cap is shared with other services: one more try, not max_retry."""
+    fake.behaviour = _refuse_with("capacity_exceeded")
+    tts = make_tts(fake)
+    with pytest.raises(APIStatusError) as info:
+        await run_stream(tts, ["Bonjour."], conn=FAST_RETRY)  # max_retry=2
+    await tts.aclose()
+    assert info.value.status_code == 503 and not info.value.retryable
+    assert len(fake.sessions) == 2
+
+
+async def test_backend_error_carries_the_server_message(fake):
+    fake.behaviour = _refuse_with("backend_error", error="No slots available, please retry")
+    tts = make_tts(fake)
+    with pytest.raises(APIStatusError) as info:
+        await run_stream(tts, ["Bonjour."])
+    await tts.aclose()
+    assert info.value.body == {"code": "backend_error",
+                               "message": "No slots available, please retry"}
+    assert "No slots available" in str(info.value)
+
+
+async def test_first_audio_has_a_ceiling_however_the_text_trickles(fake):
+    async def mute(ws, session):
+        async for _ in ws:
+            pass
+
+    fake.behaviour = mute
+    tts = make_tts(fake, first_audio_timeout=0.3)  # ceiling 0.9 s from the first text
+    stream = tts.stream(conn_options=NO_RETRY)
+
+    async def trickle():
+        for _ in range(20):  # a text every 0.2 s for 4 s: the per-text clock never fires
+            stream.push_text("mot ")
+            await asyncio.sleep(0.2)
+
+    feeder = asyncio.create_task(trickle())
+    started = time.monotonic()
+    with pytest.raises(APITimeoutError):
+        [ev async for ev in stream]
+    elapsed = time.monotonic() - started
+    feeder.cancel()
+    await stream.aclose()
+    await tts.aclose()
+    assert 0.8 < elapsed < 2.0
+
+
+async def test_a_stall_after_audio_started_and_before_end_is_a_timeout(fake):
+    async def one_frame(ws, session):
+        await ws.receive()
+        await ws.send_bytes(FRAME)
+        async for _ in ws:
+            pass
+
+    fake.behaviour = one_frame
+    tts = make_tts(fake, idle_timeout=0.3)
+    stream = tts.stream(conn_options=NO_RETRY)
+    stream.push_text("Bonjour.")  # no end_input: the stream stays open
+    started = time.monotonic()
+    with pytest.raises(APITimeoutError):
+        [ev async for ev in stream]
+    assert time.monotonic() - started < 2.0
+    await stream.aclose()
+    await tts.aclose()
+
+
+async def test_check_connection_closes_the_socket_after_a_refusal(fake):
+    async def refuse(ws, session):
+        await ws.send_str(json.dumps({"error": "no", "code": "voice_not_found",
+                                      "severity": "fatal"}))
+        async for _ in ws:  # wait for the client's close, as the server does
+            pass
+
+    fake.behaviour = refuse
+    tts = make_tts(fake)
+    with pytest.raises(APIStatusError):
+        await tts.check_connection(quiet_s=1.0)
+    await asyncio.wait_for(fake.closed.wait(), 2.0)
+    await tts.aclose()
+
+
+async def test_check_connection_treats_a_closed_socket_as_a_failure(fake):
+    async def hang_up(ws, session):
+        return  # the server closes without an error frame
+
+    fake.behaviour = hang_up
+    tts = make_tts(fake)
+    with pytest.raises(APIConnectionError):
+        await tts.check_connection(quiet_s=1.0)
+    await tts.aclose()
+
+
+async def test_done_before_the_flush_ends_the_segment_and_drops_its_rest(fake):
+    async def early_done(ws, session):
+        msg = await ws.receive()
+        session["texts"].append(json.loads(msg.data)["text"])
+        await ws.send_bytes(FRAME)
+        await ws.send_str(json.dumps({"done": True, "duration_s": 0.08}))
+
+    fake.behaviour = early_done
+    tts = make_tts(fake)
+    stream = tts.stream(conn_options=NO_RETRY)
+    stream.push_text("Premier. ")
+    await asyncio.wait_for(stream.__anext__(), 2.0)
+    await asyncio.sleep(0.1)  # done has arrived
+    stream.push_text("Second.")
+    stream.end_input()
+    events = [ev async for ev in stream]
+    await stream.aclose()
+    await tts.aclose()
+    assert events[-1].is_final
+    assert len(fake.sessions) == 1  # the dropped rest does not open a new socket
+
+
+async def test_ignored_messages_alone_are_logged(fake, caplog):
+    async def ignoring(ws, session):
+        await ws.receive()
+        await ws.receive()
+        await ws.send_bytes(FRAME)
+        await ws.send_str(json.dumps({"done": True, "duration_s": 0.08,
+                                      "ignored_messages": 2}))
+
+    fake.behaviour = ignoring
+    tts = make_tts(fake)
+    with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+        await run_stream(tts, ["Bonjour."])
+    await tts.aclose()
+    record = next(r for r in caplog.records if "did not speak all" in r.getMessage())
+    assert record.ignored_messages == 2 and record.limit_reached is False

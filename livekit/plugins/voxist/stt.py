@@ -65,7 +65,8 @@ class InitializationState(Enum):
 #: Same bounds as the gateway's intake (session-hotwords.util.ts in asr-all):
 #: it drops over-long terms and truncates, so cleaning here changes nothing
 #: the server would not, but keeps an oversized frame off the wire.
-HOTWORDS_MAX_TERMS = 5000
+#: The gateway's intake cap is 1000 terms (was 5000); keep this equal to it.
+HOTWORDS_MAX_TERMS = 1000
 HOTWORDS_MAX_TERM_BYTES = 256
 HOTWORDS_MIN_SCORE = 0.5
 HOTWORDS_MAX_SCORE = 10.0
@@ -248,7 +249,7 @@ class VoxistSTT(STT):
                 Per connection: the gateway never persists them. The list is
                 cleaned the way the gateway cleans it (whitespace collapsed,
                 blanks, duplicates and terms over 256 UTF-8 bytes dropped,
-                at most 5000 kept); a non-string entry raises
+                at most 1000 kept); a non-string entry raises
                 ConfigurationError. Only effective where the deployment has a
                 vocabulary pack (KROKO_VOCAB_PACK_DIR) for the language;
                 elsewhere the gateway ignores them and transcription runs

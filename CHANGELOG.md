@@ -5,6 +5,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/) (pre-1.0: a minor
 bump may change behaviour).
 
+## [Unreleased]
+
+### Changed
+
+- `VoxistSTT(hotwords=...)`: the list is now cut to 1000 terms (was 5000) to match
+  the gateway's lowered intake cap; terms beyond 1000 are
+  dropped client-side, as the gateway would have truncated them anyway.
+
 ## [0.11.1] - 2026-11-02
 
 ### Changed

@@ -4965,7 +4965,7 @@ class TestHotwordsOnTheStream:
     @pytest.mark.asyncio
     async def test_a_reply_with_a_reason_is_a_warning_because_nothing_was_boosted(self, caplog):
         # asr-all answers a hotwords config it could not apply (it arrived after the
-        # engine had already received data) with reason=too_late (vr-68y1.5). That
+        # engine had already received data) with reason=too_late. That
         # session runs unboosted, which an operator must see without INFO logging.
         stream = await make_stream()
         with caplog.at_level("INFO", logger="livekit.plugins.voxist"):

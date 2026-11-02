@@ -13,6 +13,32 @@ bump may change behaviour).
   the gateway's lowered intake cap (asr-all vr-nmwj); terms beyond 1000 are
   dropped client-side, as the gateway would have truncated them anyway.
 
+## [0.11.1] - 2026-11-02
+
+### Changed
+
+- `VoxistTTS` stall rule: after audio has started, `idle_timeout` now runs only
+  from a text the server has not answered with a message since. A quiet input
+  (an LLM pausing longer than `idle_timeout` between sentences) is no longer a
+  stall, and frames of a long playout keep it alive. A server that dies with
+  nothing outstanding is bounded by `end` (`idle_timeout` between server
+  messages) or by the socket closing.
+- `VoxistTTS` retries a fatal `backend_error` only when its message starts with
+  "No slots available" (the server could not take the session). Any other
+  `backend_error`, such as a voice-encoding refusal, is permanent. Compatible
+  with voxist-tts moving non-capacity failures to `internal_error`, which was
+  never retried.
+- Packaging: SPDX `license = "MIT"` with `license-files` (PEP 639; needs
+  setuptools >= 77.0.3 to build), which removes the setuptools license-table
+  deprecation warning; `CHANGELOG.md` is included in the sdist. Internal
+  hostnames and the issue-tracker section are dropped from the README.
+
+### Tests
+
+- Frames keep a long playout alive past `idle_timeout`; steady text and a quiet
+  input do not trip the stall; each stream gets its own capacity retry;
+  `synthesize()` capacity retry; `VoxistTTS` pinned in the public API test.
+
 ## [0.11.0] - 2026-11-01
 
 ### Changed
@@ -216,6 +242,8 @@ Last release of the pooled-connection architecture.
 
 First PyPI release.
 
+[0.11.1]: https://github.com/voxist/livekit-plugins-voxist/compare/v0.11.0...v0.11.1
+[0.11.0]: https://github.com/voxist/livekit-plugins-voxist/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/voxist/livekit-plugins-voxist/compare/0.9.1...v0.10.0
 [0.9.1]: https://github.com/voxist/livekit-plugins-voxist/compare/v0.9.0...0.9.1
 [0.9.0]: https://github.com/voxist/livekit-plugins-voxist/releases/tag/v0.9.0

@@ -1378,6 +1378,27 @@ class TestFlushStreams:
         await stt.aclose()
 
     @pytest.mark.asyncio
+    async def test_a_stream_that_fails_is_logged_and_the_others_are_still_flushed(
+        self, caplog
+    ):
+        stt = await self._stt()
+        broken, first, second = Mock(), Mock(), Mock()
+        broken.flush = Mock(side_effect=ValueError("resampler"))
+        for stream in (first, broken, second):
+            stt._live_streams.add(stream)
+
+        with caplog.at_level(logging.WARNING, logger="livekit.plugins.voxist"):
+            assert stt.flush_streams() == 2
+        first.flush.assert_called_once_with()
+        second.flush.assert_called_once_with()
+        assert any(
+            "flush_streams" in r.getMessage() and "ValueError" in r.getMessage()
+            for r in caplog.records
+        )
+        stt._closed = True  # the fakes have nothing to close
+        await stt.aclose()
+
+    @pytest.mark.asyncio
     async def test_a_real_stream_gets_a_segment_boundary_and_an_ended_one_is_skipped(self):
         stt = await self._stt()
         opts = APIConnectOptions(max_retry=0, retry_interval=0.1, timeout=1.0)

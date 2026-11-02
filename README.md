@@ -99,7 +99,7 @@ stt = voxist.VoxistSTT(
     punctuation_mode=None,       # "Dictated" keeps spoken punctuation (fr only, gateway V2 flag)
     ssl_context=None,            # For a private-CA deployment; verification is never disabled
     validate_websocket=True,     # wait_for_initialization() / async with probe the WebSocket once
-    flush_silence_seconds=0.4,   # Silence a mid-session flush() puts on the wire (0.1-3.0 s)
+    flush_silence_seconds=0.4,   # Silence a mid-session flush() puts on the wire (0.1-3.0 s, 100 ms steps)
 )
 ```
 
@@ -112,6 +112,9 @@ speech, `stt.flush_streams()` ends the segment on every live stream at once:
 each one sends `flush_silence_seconds` of silence, which the engine decodes as
 fast as it arrives, so the final comes about that much sooner. Size it to the
 engine (about 1.2-1.3 s for a final right away); the injected audio is billed.
+The silence goes out in 100 ms chunks, rounded to the nearest whole chunk (half
+to even: 1.25 s sends 1.2 s). Call `flush_streams()` from the event loop the
+streams run on.
 
 ```python
 stt = voxist.VoxistSTT(language="fr", flush_silence_seconds=1.3)

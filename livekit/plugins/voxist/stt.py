@@ -262,8 +262,10 @@ class VoxistSTT(STT):
                 flush() (and flush_streams()) puts on the wire so the engine
                 ends the segment without waiting for that much real silence
                 to stream in: the engine clocks audio, not wall time. 0.1 to
-                3.0, default 0.4. The 32-L streaming models need about 1.2 s
-                of audio past the speech to finalize (rule2 0.6 s, checked at
+                3.0, default 0.4. Sent in 100 ms chunks, rounded to the
+                nearest whole chunk (half to even: 1.25 gives 1.2 s). The
+                32-L streaming models need about 1.2 s of audio past the
+                speech to finalize (rule2 0.6 s, checked at
                 0.64 s decode-chunk boundaries, counted from a token emitted
                 about a chunk late); a shorter value still moves the final
                 earlier by about the injected amount. The injected audio is
@@ -1323,7 +1325,12 @@ class VoxistSTT(STT):
         the next segment.
 
         A stream whose input has ended or that is closed is skipped (its
-        flush() raises RuntimeError: there is nothing left to finalize).
+        flush() raises RuntimeError: there is nothing left to finalize). Any
+        other failure of one stream is logged and the next stream is still
+        flushed.
+
+        Call it from the event loop the streams run on: flush() queues with
+        send_nowait, which is not thread-safe.
 
         Returns:
             How many streams were flushed.
@@ -1333,6 +1340,9 @@ class VoxistSTT(STT):
             try:
                 stream.flush()
             except RuntimeError:
+                continue
+            except Exception as e:
+                logger.warning(f"flush_streams: a stream failed to flush: {e!r}")
                 continue
             flushed += 1
         return flushed

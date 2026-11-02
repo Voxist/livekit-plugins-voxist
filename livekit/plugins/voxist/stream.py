@@ -1748,7 +1748,8 @@ class VoxistSTTStream(RecognizeStream):
         speech frames (VAD-gated capture that stops pushing during silence)
         never puts that silence on the wire, so its flush() would otherwise
         produce no final at all. Sending flush_silence_seconds of zeros
-        (VoxistSTT config, default SEGMENT_SILENCE_SECONDS) provides the
+        (VoxistSTT config, default SEGMENT_SILENCE_SECONDS, sent in 100ms
+        chunks: rounded half to even, so 1.25 s sends 1.2 s) provides the
         endpointing trigger without "Done" - the session (and socket) stay
         open for the next segment. The engine clocks audio, not wall time, so
         the same zeros also end a segment early for a caller that streams its

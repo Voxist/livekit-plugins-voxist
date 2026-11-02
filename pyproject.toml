@@ -88,6 +88,7 @@ select = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+timeout = 60
 markers = [
     "live: marks tests that require live Voxist API access",
     "integration: marks integration tests with mock server",

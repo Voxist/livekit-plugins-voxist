@@ -370,13 +370,16 @@ async def test_a_503_class_refusal_before_any_audio_is_retried_with_the_same_tex
     assert len(pcm(events)) > 0
 
 
-async def test_a_503_class_refusal_after_audio_is_not_retried(fake):
-    fake.behaviour = _refuse_with("backend_error", after_audio=True)
+@pytest.mark.parametrize("code", ["capacity_exceeded", "backend_error"])
+async def test_a_503_class_refusal_after_audio_is_not_retried(fake, code):
+    fake.behaviour = _refuse_with(
+        code, after_audio=True, error="No slots available, please retry"
+    )
     tts = make_tts(fake)
     with pytest.raises(APIStatusError) as info:
         await run_stream(tts, ["Bonjour."], conn=FAST_RETRY)
     await tts.aclose()
-    assert info.value.status_code == 502 and not info.value.retryable
+    assert info.value.status_code in (502, 503) and not info.value.retryable
     assert len(fake.sessions) == 1
 
 

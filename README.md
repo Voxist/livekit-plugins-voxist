@@ -114,7 +114,7 @@ speaking about 0.3 s after its first text instead of after the whole clip.
 from livekit.plugins import voxist
 
 tts = voxist.VoxistTTS(
-    base_url="https://tts.voxist-api.com",
+    base_url="https://tts.example.com",
     voice_id="ada",
     language="fr",
     # e.g. a Cloudflare Access service token; sent on the handshake only, never logged
@@ -265,29 +265,6 @@ python examples/simple_transcription.py dev
 ```
 
 The agent will connect to the room and transcribe audio from participants.
-
-### Staging Backend
-
-For testing against Voxist staging:
-
-```python
-stt = voxist.VoxistSTT(
-    api_key="your_staging_key",
-    base_url="wss://asr-staging-dev.voxist.com/ws",
-    language="fr",
-)
-```
-
-## Development Status
-
-🚧 **Under Active Development**
-
-Track progress with beads issue tracker:
-```bash
-/beads:stats              # View project statistics
-/beads:ready              # See ready-to-work issues
-/beads:show livekit-1     # View epic details
-```
 
 ## License
 

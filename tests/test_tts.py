@@ -257,7 +257,7 @@ async def test_silence_after_end_is_a_timeout(fake):
     fake.behaviour = stall
     tts = make_tts(fake, idle_timeout=0.3)
     with pytest.raises(APITimeoutError):
-        await run_stream(tts, ["Bonjour."])
+        await asyncio.wait_for(run_stream(tts, ["Bonjour."]), 5.0)
     await tts.aclose()
 
 
@@ -354,7 +354,7 @@ def _refuse_with(code: str, *, after_audio: bool = False, error: str = "x"):
 
 @pytest.mark.parametrize("code", ["capacity_exceeded", "backend_error"])
 async def test_a_503_class_refusal_before_any_audio_is_retried_with_the_same_text(fake, code):
-    refuse = _refuse_with(code)
+    refuse = _refuse_with(code, error="No slots available, please retry")
 
     async def first_refuses_then_speaks(ws, session):
         if len(fake.sessions) == 1:
@@ -370,13 +370,16 @@ async def test_a_503_class_refusal_before_any_audio_is_retried_with_the_same_tex
     assert len(pcm(events)) > 0
 
 
-async def test_a_503_class_refusal_after_audio_is_not_retried(fake):
-    fake.behaviour = _refuse_with("backend_error", after_audio=True)
+@pytest.mark.parametrize("code", ["capacity_exceeded", "backend_error"])
+async def test_a_503_class_refusal_after_audio_is_not_retried(fake, code):
+    fake.behaviour = _refuse_with(
+        code, after_audio=True, error="No slots available, please retry"
+    )
     tts = make_tts(fake)
     with pytest.raises(APIStatusError) as info:
         await run_stream(tts, ["Bonjour."], conn=FAST_RETRY)
     await tts.aclose()
-    assert info.value.status_code == 502 and not info.value.retryable
+    assert info.value.status_code in (502, 503) and not info.value.retryable
     assert len(fake.sessions) == 1
 
 
@@ -564,6 +567,37 @@ async def test_capacity_exceeded_is_retried_once_only(fake):
     assert len(fake.sessions) == 2
 
 
+async def test_each_stream_gets_its_own_capacity_retry(fake):
+    fake.behaviour = _refuse_with("capacity_exceeded")
+    tts = make_tts(fake)
+    for expected in (2, 4):  # a first stream's spent budget is not the next one's
+        with pytest.raises(APIStatusError):
+            await run_stream(tts, ["Bonjour."], conn=FAST_RETRY)
+        assert len(fake.sessions) == expected
+    await tts.aclose()
+
+
+async def test_synthesize_capacity_exceeded_is_retried_once_only(fake):
+    fake.behaviour = _refuse_with("capacity_exceeded")
+    tts = make_tts(fake)
+    with pytest.raises(APIStatusError) as info:
+        [ev async for ev in tts.synthesize("Merci.", conn_options=FAST_RETRY)]
+    await tts.aclose()
+    assert info.value.status_code == 503 and not info.value.retryable
+    assert len(fake.sessions) == 2
+
+
+@pytest.mark.parametrize("error", ["Failed to encode voice", ""])
+async def test_a_backend_error_that_is_not_busy_is_not_retried(fake, error):
+    fake.behaviour = _refuse_with("backend_error", error=error)
+    tts = make_tts(fake)
+    with pytest.raises(APIStatusError) as info:
+        await run_stream(tts, ["Bonjour."], conn=FAST_RETRY)
+    await tts.aclose()
+    assert info.value.status_code == 502 and not info.value.retryable
+    assert len(fake.sessions) == 1
+
+
 async def test_backend_error_carries_the_server_message(fake):
     fake.behaviour = _refuse_with("backend_error", error="No slots available, please retry")
     tts = make_tts(fake)
@@ -572,7 +606,7 @@ async def test_backend_error_carries_the_server_message(fake):
     await tts.aclose()
     assert info.value.body == {"code": "backend_error",
                                "message": "No slots available, please retry"}
-    assert "No slots available" in str(info.value)
+    assert "No slots available" in info.value.message
 
 
 async def test_first_audio_has_a_ceiling_however_the_text_trickles(fake):
@@ -600,10 +634,10 @@ async def test_first_audio_has_a_ceiling_however_the_text_trickles(fake):
     assert 0.8 < elapsed < 2.0
 
 
-async def test_a_stall_after_audio_started_and_before_end_is_a_timeout(fake):
+async def test_a_text_left_unanswered_after_audio_started_is_a_timeout(fake):
     async def one_frame(ws, session):
         await ws.receive()
-        await ws.send_bytes(FRAME)
+        await ws.send_bytes(FRAME)  # answers the first text only
         async for _ in ws:
             pass
 
@@ -611,12 +645,102 @@ async def test_a_stall_after_audio_started_and_before_end_is_a_timeout(fake):
     tts = make_tts(fake, idle_timeout=0.3)
     stream = tts.stream(conn_options=NO_RETRY)
     stream.push_text("Bonjour.")  # no end_input: the stream stays open
+
+    async def second_text():
+        await asyncio.sleep(0.1)  # after the frame
+        stream.push_text(" Et vous ?")
+
+    feeder = asyncio.create_task(second_text())
     started = time.monotonic()
     with pytest.raises(APITimeoutError):
-        [ev async for ev in stream]
+        await asyncio.wait_for(_drain(stream), 5.0)
     assert time.monotonic() - started < 2.0
+    await feeder
     await stream.aclose()
     await tts.aclose()
+
+
+async def _drain(stream) -> list[Any]:
+    return [ev async for ev in stream]
+
+
+async def test_frames_keep_a_long_playout_alive_past_idle_timeout(fake):
+    """One frame every 80 ms, no new text and no `end` yet, for 3x idle_timeout."""
+    async def playout(ws, session):
+        await ws.receive()
+        for _ in range(15):  # 1.2 s of frames against idle_timeout=0.4
+            await ws.send_bytes(FRAME)
+            await asyncio.sleep(0.08)
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT and json.loads(msg.data).get("end"):
+                await ws.send_str(json.dumps({"done": True, "duration_s": 1.2}))
+                return
+
+    fake.behaviour = playout
+    tts = make_tts(fake, idle_timeout=0.4)
+    stream = tts.stream(conn_options=NO_RETRY)
+    stream.push_text("Bonjour.")
+    reader = asyncio.create_task(_drain(stream))
+    await asyncio.sleep(1.4)  # past the frames, input still open
+    assert not reader.done()
+    stream.end_input()
+    events = await asyncio.wait_for(reader, 5.0)
+    await stream.aclose()
+    await tts.aclose()
+    assert len(pcm(events)) >= 15 * len(FRAME)
+
+
+async def test_steady_text_after_one_frame_does_not_trip_the_stall(fake):
+    """The server answers the first text only; a text every 0.2 s keeps re-arming."""
+    async def one_frame(ws, session):
+        await ws.receive()
+        await ws.send_bytes(FRAME)
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT and json.loads(msg.data).get("end"):
+                await ws.send_str(json.dumps({"done": True, "duration_s": 0.08}))
+                return
+
+    fake.behaviour = one_frame
+    tts = make_tts(fake, idle_timeout=0.5)
+    stream = tts.stream(conn_options=NO_RETRY)
+    stream.push_text("Bonjour.")
+    reader = asyncio.create_task(_drain(stream))
+    for _ in range(8):  # 1.6 s of text, over 3x idle_timeout
+        await asyncio.sleep(0.2)
+        stream.push_text(" mot")
+    stream.end_input()
+    events = await asyncio.wait_for(reader, 5.0)
+    await stream.aclose()
+    await tts.aclose()
+    assert len(pcm(events)) >= len(FRAME)
+
+
+async def test_a_quiet_input_after_audio_is_not_a_stall(fake):
+    """An LLM pause longer than idle_timeout, with nothing outstanding, is fine."""
+    fake.behaviour = _speak_then_wait_for_end(frames=1)
+    tts = make_tts(fake, idle_timeout=0.3)
+    stream = tts.stream(conn_options=NO_RETRY)
+    stream.push_text("Bonjour.")
+    reader = asyncio.create_task(_drain(stream))
+    await asyncio.sleep(0.9)
+    assert not reader.done()
+    stream.end_input()
+    events = await asyncio.wait_for(reader, 5.0)
+    await stream.aclose()
+    await tts.aclose()
+    assert len(pcm(events)) >= len(FRAME)
+
+
+def _speak_then_wait_for_end(*, frames: int):
+    async def behaviour(ws, session):
+        await ws.receive()
+        for _ in range(frames):
+            await ws.send_bytes(FRAME)
+        async for msg in ws:
+            if msg.type == WSMsgType.TEXT and json.loads(msg.data).get("end"):
+                await ws.send_str(json.dumps({"done": True, "duration_s": 0.08}))
+                return
+    return behaviour
 
 
 async def test_check_connection_closes_the_socket_after_a_refusal(fake):

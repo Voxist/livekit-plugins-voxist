@@ -323,9 +323,10 @@ class VoxistSTTStream(RecognizeStream):
     # end of a turn and costs ~10 wakeups per session.
     DRAIN_POLL_INTERVAL_SECONDS = 0.05
 
-    # Silence synthesized at a segment boundary (flush()) to force engine
-    # endpointing; see _on_segment_end. Slightly above the engine's ~300ms
-    # endpointing threshold.
+    # Default silence synthesized at a segment boundary (flush()) to force
+    # engine endpointing; see _on_segment_end. VoxistSTT(flush_silence_seconds=)
+    # sets it per plugin: the 32-L streaming models need about 1.2 s of audio
+    # past the speech to finalize, not the ~300ms this default was sized for.
     SEGMENT_SILENCE_SECONDS = 0.4
 
     # The wire format is always 16kHz Int16 mono; the AudioProcessor
@@ -1746,9 +1747,14 @@ class VoxistSTTStream(RecognizeStream):
         ~300ms of silence ON THE WIRE to endpoint. A caller that only pushes
         speech frames (VAD-gated capture that stops pushing during silence)
         never puts that silence on the wire, so its flush() would otherwise
-        produce no final at all. Sending SEGMENT_SILENCE_SECONDS of zeros
-        provides the endpointing trigger without "Done" - the session (and
-        socket) stay open for the next segment.
+        produce no final at all. Sending flush_silence_seconds of zeros
+        (VoxistSTT config, default SEGMENT_SILENCE_SECONDS, sent in 100ms
+        chunks: rounded half to even, so 1.25 s sends 1.2 s) provides the
+        endpointing trigger without "Done" - the session (and socket) stay
+        open for the next segment. The engine clocks audio, not wall time, so
+        the same zeros also end a segment early for a caller that streams its
+        real silence: VoxistSTT.flush_streams() at the caller's VAD end of
+        speech gets the final without waiting for that silence to stream in.
 
         The zeros are built directly at the 16kHz wire rate and go through
         _send_audio_chunk like any other audio; they deliberately BYPASS the
@@ -1767,7 +1773,8 @@ class VoxistSTTStream(RecognizeStream):
         """
         # 100ms chunks, matching the normal streaming cadence
         chunk = np.zeros(self.WIRE_SAMPLE_RATE // 10, dtype=np.int16)
-        for _ in range(int(self.SEGMENT_SILENCE_SECONDS * 10)):
+        seconds = self._config.get("flush_silence_seconds", self.SEGMENT_SILENCE_SECONDS)
+        for _ in range(round(seconds * 10)):
             await self._send_audio_chunk(chunk, caller_audio=False)
 
     def _probe_pending_input_only_sentinels(self) -> bool | None:

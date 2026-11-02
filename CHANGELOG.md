@@ -10,7 +10,7 @@ bump may change behaviour).
 ### Changed
 
 - `VoxistSTT(hotwords=...)`: the list is now cut to 1000 terms (was 5000) to match
-  the gateway's lowered intake cap (asr-all vr-nmwj); terms beyond 1000 are
+  the gateway's lowered intake cap; terms beyond 1000 are
   dropped client-side, as the gateway would have truncated them anyway.
 
 ## [0.11.1] - 2026-11-02

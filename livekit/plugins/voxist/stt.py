@@ -250,7 +250,7 @@ class VoxistSTT(STT):
                 Per connection: the gateway never persists them. The list is
                 cleaned the way the gateway cleans it (whitespace collapsed,
                 blanks, duplicates and terms over 256 UTF-8 bytes dropped,
-                at most 5000 kept); a non-string entry raises
+                at most 1000 kept); a non-string entry raises
                 ConfigurationError. Only effective where the deployment has a
                 vocabulary pack (KROKO_VOCAB_PACK_DIR) for the language;
                 elsewhere the gateway ignores them and transcription runs

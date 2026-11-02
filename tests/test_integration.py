@@ -727,6 +727,55 @@ class TestTurnBoundarySilence:
 
 
 @pytest.mark.integration
+class TestFlushStreamsFinalizes:
+    """flush_streams() at the caller's end of speech: the engine finalizes on the
+    injected silence, without waiting for that much real silence to stream in."""
+
+    @staticmethod
+    async def _first_final_after_flush(generate_test_audio, flush_silence_seconds):
+        server = MockVoxistServer(valid_api_key="test")
+        # An engine that needs 1 s of audio past the speech (rule2 0.6 s plus a
+        # decode chunk, as on the 32-L models), not the 300 ms default.
+        server.silence_ms_to_finalize = 1000
+        await server.start()
+        try:
+            stt = VoxistSTT(api_key="test", base_url=f"ws://{server.host}:{server.port}/ws",
+                            flush_silence_seconds=flush_silence_seconds)
+            stream = stt.stream(conn_options=APIConnectOptions(max_retry=0))
+            speech = generate_test_audio(duration_ms=500)
+            stream.push_frame(rtc.AudioFrame(data=speech.tobytes(), sample_rate=16000,
+                                             num_channels=1, samples_per_channel=len(speech)))
+            assert stt.flush_streams() == 1
+
+            async def first_final():
+                async for event in stream:
+                    if event.type == SpeechEventType.FINAL_TRANSCRIPT:
+                        return event
+            try:
+                return await asyncio.wait_for(first_final(), timeout=2.0)
+            except asyncio.TimeoutError:
+                return None
+            finally:
+                await stream.aclose()
+                await stt.aclose()
+        finally:
+            await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_enough_injected_silence_brings_the_final_with_no_more_caller_audio(
+        self, generate_test_audio
+    ):
+        final = await self._first_final_after_flush(generate_test_audio, 1.2)
+        assert final is not None and final.alternatives[0].text
+
+    @pytest.mark.asyncio
+    async def test_too_little_silence_leaves_the_engine_waiting_for_more(
+        self, generate_test_audio
+    ):
+        assert await self._first_final_after_flush(generate_test_audio, 0.4) is None
+
+
+@pytest.mark.integration
 class TestZeroAudioSession:
     """end_input() with no frames: clean empty completion, zero network."""
 

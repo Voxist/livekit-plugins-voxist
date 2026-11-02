@@ -1690,6 +1690,24 @@ class TestSegmentEndSilence:
         await asyncio.wait_for(task, timeout=5.0)
 
     @pytest.mark.asyncio
+    async def test_the_silence_length_follows_flush_silence_seconds(self):
+        """VoxistSTT(flush_silence_seconds=...) sets the length per stream: the
+        32-L engines need ~1.2 s of audio past the speech to finalize."""
+        stream = await make_stream(
+            config={**DEFAULT_CONFIG, "flush_silence_seconds": 1.3}
+        )
+        ws = attach_mock_ws(stream)
+
+        stream._input_ch.send_nowait(VoxistSTTStream._FlushSentinel())
+        task = asyncio.create_task(stream._send_audio_task())
+        await asyncio.sleep(0.2)  # sentinel consumed, channel still open
+
+        assert len(self.silence_payloads(ws)) == 13  # 100 ms chunks
+
+        stream._input_ch.close()
+        await asyncio.wait_for(task, timeout=5.0)
+
+    @pytest.mark.asyncio
     async def test_silence_bypasses_the_audio_processor(self):
         """Silence is wire-rate by construction; resampling it would change
         its duration. It must not pass through the AudioProcessor."""

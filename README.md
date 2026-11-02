@@ -99,7 +99,27 @@ stt = voxist.VoxistSTT(
     punctuation_mode=None,       # "Dictated" keeps spoken punctuation (fr only, gateway V2 flag)
     ssl_context=None,            # For a private-CA deployment; verification is never disabled
     validate_websocket=True,     # wait_for_initialization() / async with probe the WebSocket once
+    flush_silence_seconds=0.4,   # Silence a mid-session flush() puts on the wire (0.1-3.0 s)
 )
+```
+
+### Finalizing at the end of speech
+
+livekit-agents never calls `flush()` on the STT stream, so the engine sends its
+final only once enough real trailing silence has streamed in: about 1.2 s after
+the speech on the 32-L streaming models. When your own VAD sees the end of
+speech, `stt.flush_streams()` ends the segment on every live stream at once:
+each one sends `flush_silence_seconds` of silence, which the engine decodes as
+fast as it arrives, so the final comes about that much sooner. Size it to the
+engine (about 1.2-1.3 s for a final right away); the injected audio is billed.
+
+```python
+stt = voxist.VoxistSTT(language="fr", flush_silence_seconds=1.3)
+
+@session.on("user_state_changed")
+def _on_user_state(ev):
+    if ev.old_state == "speaking" and ev.new_state == "listening":
+        stt.flush_streams()
 ```
 
 ## Text-to-Speech (`VoxistTTS`)

@@ -1330,6 +1330,79 @@ class TestDeadAndLiveParameters:
         assert not any("ignored" in r.message for r in caplog.records)
 
 
+class TestFlushSilence:
+    """flush_silence_seconds: how much silence a mid-session flush() puts on the
+    wire. The default keeps the 0.4 s every earlier release sent."""
+
+    def test_default_is_the_stream_constant(self):
+        from livekit.plugins.voxist.stream import VoxistSTTStream
+
+        stt = VoxistSTT(api_key="test_key")
+        assert stt._config["flush_silence_seconds"] == VoxistSTTStream.SEGMENT_SILENCE_SECONDS
+
+    def test_a_value_in_range_reaches_the_stream_config(self):
+        stt = VoxistSTT(api_key="test_key", flush_silence_seconds=1.3)
+        assert stt._config["flush_silence_seconds"] == 1.3
+
+    @pytest.mark.parametrize("value", [0.0, 0.05, 3.5, float("nan"), True, "1.0"])
+    def test_out_of_range_or_not_a_number_is_refused(self, value):
+        with pytest.raises(ConfigurationError, match="flush_silence_seconds"):
+            VoxistSTT(api_key="test_key", flush_silence_seconds=value)
+
+
+class TestFlushStreams:
+    """flush_streams(): end the current segment on every live stream, for a caller
+    whose own VAD has just seen the end of speech (livekit never calls flush())."""
+
+    @staticmethod
+    async def _stt(**kwargs):
+        stt = VoxistSTT(api_key="test_key", base_url="ws://127.0.0.1:9/ws", **kwargs)
+        if stt._init_task is not None:
+            stt._init_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await stt._init_task
+        return stt
+
+    @pytest.mark.asyncio
+    async def test_it_flushes_each_live_stream_and_counts_them(self):
+        stt = await self._stt()
+        live, ended = Mock(), Mock()
+        ended.flush = Mock(side_effect=RuntimeError("input ended"))
+        stt._live_streams.add(live)
+        stt._live_streams.add(ended)
+
+        assert stt.flush_streams() == 1
+        live.flush.assert_called_once_with()
+        ended.flush.assert_called_once_with()
+        stt._closed = True  # the fakes have nothing to close
+        await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_a_real_stream_gets_a_segment_boundary_and_an_ended_one_is_skipped(self):
+        stt = await self._stt()
+        opts = APIConnectOptions(max_retry=0, retry_interval=0.1, timeout=1.0)
+        stream = stt.stream(conn_options=opts)
+        try:
+            queued = stream._input_ch.qsize()
+            assert stt.flush_streams() == 1
+            assert stream._input_ch.qsize() == queued + 1  # one flush sentinel
+
+            stream.end_input()
+            assert stt.flush_streams() == 0  # input ended: nothing to finalize
+        finally:
+            await stream.aclose()
+            if stream._task.done() and not stream._task.cancelled():
+                with contextlib.suppress(Exception):
+                    stream._task.exception()
+            await stt.aclose()
+
+    @pytest.mark.asyncio
+    async def test_no_stream_is_no_op(self):
+        stt = await self._stt()
+        assert stt.flush_streams() == 0
+        await stt.aclose()
+
+
 class TestInitTaskExceptionRetrieval:
     """
     The background init task re-raises AuthenticationError for awaiting

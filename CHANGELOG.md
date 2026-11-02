@@ -7,6 +7,21 @@ bump may change behaviour).
 
 ## [Unreleased]
 
+## [0.12.0] - Unreleased
+
+### Added
+
+- `VoxistSTT.flush_streams()`: ends the current segment on every live stream
+  (`flush()` each one; a stream whose input ended is skipped) and returns how
+  many it flushed. livekit-agents never calls `flush()` on an STT stream, so the
+  engine finalized only once ~1.2 s of real trailing silence had streamed in; a
+  caller calls this at its VAD end of speech to get the final at once.
+- `VoxistSTT(flush_silence_seconds=0.4)`: the silence a mid-session `flush()`
+  puts on the wire, 0.1 to 3.0 s (`ConfigurationError` otherwise). The default
+  is the 0.4 s every earlier release sent. The engine clocks audio, not wall
+  time, so the final comes about that much sooner; about 1.2-1.3 s brings it at
+  once on the 32-L streaming models. The injected audio is billed.
+
 ### Changed
 
 - `VoxistSTT(hotwords=...)`: the list is now cut to 1000 terms (was 5000) to match

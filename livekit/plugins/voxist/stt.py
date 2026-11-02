@@ -197,6 +197,7 @@ class VoxistSTT(STT):
         validate_websocket: bool = True,
         hotwords: Sequence[str] | None = None,
         hotwords_score: float | None = None,
+        flush_silence_seconds: float = VoxistSTTStream.SEGMENT_SILENCE_SECONDS,
     ):
         """
         Initialize Voxist STT plugin.
@@ -257,6 +258,16 @@ class VoxistSTT(STT):
             hotwords_score: Boost strength, 0.5 to 10 (the gateway clamps to
                 the same range). None (default) uses the deployed pack's
                 tuned value.
+            flush_silence_seconds: Silence, in seconds, that a mid-session
+                flush() (and flush_streams()) puts on the wire so the engine
+                ends the segment without waiting for that much real silence
+                to stream in: the engine clocks audio, not wall time. 0.1 to
+                3.0, default 0.4. The 32-L streaming models need about 1.2 s
+                of audio past the speech to finalize (rule2 0.6 s, checked at
+                0.64 s decode-chunk boundaries, counted from a token emitted
+                about a chunk late); a shorter value still moves the final
+                earlier by about the injected amount. The injected audio is
+                billed like any other.
 
         Raises:
             ConfigurationError: If API key missing or invalid config
@@ -300,6 +311,16 @@ class VoxistSTT(STT):
                 f"Recommended: 16000 Hz for optimal quality."
             )
 
+        # bool is an int subclass: True would otherwise pass as 1.0 s.
+        if (
+            isinstance(flush_silence_seconds, bool)
+            or not isinstance(flush_silence_seconds, (int, float))
+            or not 0.1 <= flush_silence_seconds <= 3.0
+        ):
+            raise ConfigurationError(
+                f"flush_silence_seconds must be 0.1-3.0 s, got {flush_silence_seconds!r}"
+            )
+
         # connection_pool_size is deliberately NOT range-checked: it is
         # accepted-and-ignored (see the deprecation warning below), so a hard
         # ConfigurationError for an out-of-range value would reject a setting
@@ -333,6 +354,7 @@ class VoxistSTT(STT):
             "interim_results": interim_results,
             "chunk_duration_ms": chunk_duration_ms,
             "stride_overlap_ms": stride_overlap_ms,
+            "flush_silence_seconds": float(flush_silence_seconds),
         }
 
         self._base_url = base_url
@@ -1287,6 +1309,33 @@ class VoxistSTT(STT):
         # their own drop out of the set automatically.
         self._live_streams.add(stream)
         return stream
+
+    def flush_streams(self) -> int:
+        """
+        End the current segment on every live stream: flush() each one.
+
+        livekit-agents never calls flush() on an STT stream, so the engine
+        finalizes only once enough real trailing silence has streamed in
+        (about 1.2 s past the speech on the 32-L models). A caller whose own
+        VAD has seen the end of speech calls this to get the final at once:
+        each flush() puts flush_silence_seconds of silence on the wire, which
+        the engine decodes as fast as it arrives. The stream stays open for
+        the next segment.
+
+        A stream whose input has ended or that is closed is skipped (its
+        flush() raises RuntimeError: there is nothing left to finalize).
+
+        Returns:
+            How many streams were flushed.
+        """
+        flushed = 0
+        for stream in list(self._live_streams):
+            try:
+                stream.flush()
+            except RuntimeError:
+                continue
+            flushed += 1
+        return flushed
 
     async def _recognize_impl(  # type: ignore[override]
         self,

@@ -135,3 +135,12 @@ def test_no_pool_fiction_in_the_stt_class_docstring():
     assert "connection_pool_size" not in doc, (
         "the documented example must not pass a deprecated, ignored parameter"
     )
+
+
+def test_voxist_tts_is_a_public_root_export():
+    """VoxistTTS shipped in 0.11.0; pin it by name, not only through __all__."""
+    from livekit.plugins.voxist import VoxistTTS
+    from livekit.plugins.voxist.tts import VoxistTTS as SubmoduleVoxistTTS
+
+    assert "VoxistTTS" in voxist.__all__
+    assert VoxistTTS is SubmoduleVoxistTTS

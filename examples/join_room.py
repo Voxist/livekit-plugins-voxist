@@ -53,7 +53,7 @@ async def main():
     # LiveKit sends audio at 48kHz, so we configure for that
     voxist_stt = voxist.VoxistSTT(
         api_key=os.environ.get("VOXIST_API_KEY"),
-        base_url=os.environ.get("VOXIST_BASE_URL", "wss://asr-staging-dev.voxist.com/ws"),
+        base_url=os.environ.get("VOXIST_BASE_URL", "wss://api-asr.voxist.com/ws"),
         language="fr",
         sample_rate=48000,  # Match LiveKit's 48kHz output
         interim_results=True,

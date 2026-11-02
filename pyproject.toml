@@ -1,10 +1,11 @@
 [project]
 name = "livekit-plugins-voxist"
-version = "0.11.0"
+version = "0.11.1"
 description = "LiveKit STT and TTS plugin for Voxist: real-time streaming transcription and speech synthesis"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     {name = "Voxist", email = "contact@voxist.com"}
 ]
@@ -12,7 +13,6 @@ keywords = ["livekit", "stt", "speech-to-text", "asr", "tts", "text-to-speech", 
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -57,7 +57,7 @@ Issues = "https://github.com/voxist/livekit-plugins-voxist/issues"
 Changelog = "https://github.com/voxist/livekit-plugins-voxist/blob/main/CHANGELOG.md"
 
 [build-system]
-requires = ["setuptools>=68.0.0", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

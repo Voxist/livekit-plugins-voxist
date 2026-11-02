@@ -28,10 +28,13 @@ Behaviour:
   ``first_audio_timeout`` from the latest text sent to the first audio frame (so
   the time an LLM takes to finish a sentence is not counted), capped at
   ``FIRST_AUDIO_CEILING_FACTOR`` x ``first_audio_timeout`` from the first text;
-  once audio has started, ``idle_timeout`` without a server message or a text
-  sent (a stall), and after ``end``, ``idle_timeout`` between server messages.
-- Retries by LiveKit: only a fatal ``backend_error`` (on this endpoint, the
-  server's "No slots available, please retry" or a voice-encoding failure) or
+  once audio has started, ``idle_timeout`` from a text the server has not
+  answered with a frame since (a stall: armed only while text is outstanding, so
+  a long LLM pause between sentences is not one), and after ``end``,
+  ``idle_timeout`` between server messages.
+- Retries by LiveKit: only a fatal ``backend_error`` whose message starts with
+  "No slots available" (the server could not take the session; any other
+  ``backend_error``, such as a voice-encoding refusal, is permanent) or
   ``capacity_exceeded`` (the server's connection cap, shared with other
   services, or the OmniVoice worker being at capacity: one retry per stream at
   most) that arrives before any audio of the
@@ -122,6 +125,10 @@ _ERROR_STATUS = {
 #: ``session_timeout`` is not one: voxist-tts sends it on the batch ``/stream``
 #: socket only (on ``/stream/text`` the timed-out session is already gone).
 RETRYABLE_CODES = frozenset({"capacity_exceeded", "backend_error"})
+#: A ``backend_error`` is a capacity refusal only with this message prefix; anything
+#: else (a voice-encoding failure ...) is permanent. voxist-tts may soon send
+#: ``internal_error`` for its non-capacity failures (vr-b93u), which is not retried.
+_BACKEND_BUSY_PREFIX = "No slots available"
 #: The connection cap is shared (Voxlingo uses the same service) and the
 #: OmniVoice worker can be at capacity too: retry it once.
 CAPACITY_RETRIES = 1
@@ -184,7 +191,7 @@ class VoxistTTS(tts.TTS):
     """Streaming Voxist TTS over ``/v1/tts/{voice_id}/stream/text``.
 
     Args:
-        base_url: Service root, e.g. ``https://tts.voxist-api.com`` (``wss://``
+        base_url: Service root, e.g. ``https://tts.example.com`` (``wss://``
             accepted too; ``http``/``ws`` only to a loopback host).
         voice_id: A Voxist voice id (``ada``, ``103488-es`` ...).
         language: The language the voice speaks, as the server takes it (``fr``).
@@ -193,8 +200,10 @@ class VoxistTTS(tts.TTS):
         connect_timeout: Seconds for one handshake, config included.
         first_audio_timeout: Seconds from the latest text sent to the first audio,
             capped at 3x this value measured from the first text.
-        idle_timeout: Seconds without a server message or a text once audio has
-            started (a stall), and between server messages once ``end`` is sent.
+        idle_timeout: Seconds a text may go unanswered by a frame once audio has
+            started (a stall; not armed while no text is outstanding, so a
+            long LLM pause is fine), and between server messages once ``end``
+            is sent.
         protocol_version: Contract generation stated on the config message.
     """
 
@@ -429,6 +438,8 @@ def _fatal_error(data: dict[str, Any], *, heard: bool, attempts: _Attempts) -> A
     prose = data.get("error")
     message = prose[:_MAX_MESSAGE_CHARS] if isinstance(prose, str) else ""
     retryable = code in RETRYABLE_CODES and not heard
+    if code == "backend_error":
+        retryable = retryable and message.startswith(_BACKEND_BUSY_PREFIX)
     if retryable and code == "capacity_exceeded":
         retryable = attempts.capacity_left > 0
         attempts.capacity_left -= 1
@@ -471,9 +482,11 @@ class _Utterance:
         if self.end_sent or self.limit_reached:
             return self.last_message_at + opts.idle_timeout, "the next server message"
         if self.audio and self.last_text_at is not None:
-            # Speaking, more text may come: a stall is neither a frame nor a text.
-            last = max(self.last_message_at, self.last_text_at)
-            return last + opts.idle_timeout, "audio after the last frame"
+            # Speaking, more text may come. Only a text the server has not answered
+            # with a message since can stall; frames keep a long playout alive and
+            # a quiet input (an LLM pause) is not a fault. `end` bounds the rest.
+            if self.last_text_at > self.last_message_at:
+                return self.last_text_at + opts.idle_timeout, "audio after the last text"
         return None
 
 

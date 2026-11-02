@@ -2370,8 +2370,8 @@ class TestHotwordsPassThrough:
         assert stt._hotwords == ("Acme Corp", "Zed")
 
     def test_list_is_capped_at_the_gateway_limit(self):
-        stt = VoxistSTT(api_key="k", hotwords=[f"w{i}" for i in range(6000)])
-        assert len(stt._hotwords) == 5000
+        stt = VoxistSTT(api_key="k", hotwords=[f"w{i}" for i in range(1500)])
+        assert len(stt._hotwords) == 1000
 
     @pytest.mark.parametrize("bad", ["Acme", b"Acme", 5, [1], ["ok", None]])
     def test_malformed_list_fails_at_construction(self, bad):

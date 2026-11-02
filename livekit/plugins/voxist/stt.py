@@ -65,7 +65,9 @@ class InitializationState(Enum):
 #: Same bounds as the gateway's intake (session-hotwords.util.ts in asr-all):
 #: it drops over-long terms and truncates, so cleaning here changes nothing
 #: the server would not, but keeps an oversized frame off the wire.
-HOTWORDS_MAX_TERMS = 5000
+#: The gateway cap was lowered from 5000 to 1000 (asr-all vr-nmwj: hotword
+#: compile runs on the gateway's event loop); keep this equal to it.
+HOTWORDS_MAX_TERMS = 1000
 HOTWORDS_MAX_TERM_BYTES = 256
 HOTWORDS_MIN_SCORE = 0.5
 HOTWORDS_MAX_SCORE = 10.0
